@@ -63,7 +63,7 @@ Rectangle {
             Item {
                 id: locationPill
                 anchors.verticalCenter: parent.verticalCenter
-                width: parent.width - Theme.dp(40) - Theme.dp(40) - Theme.dp(Theme.spacingSm) * 2
+                width: parent.width - Theme.dp(40) - Theme.dp(40) - Theme.dp(Theme.spacingSm) * 2 - ((typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.isResourceRoot) ? Theme.dp(40) + Theme.dp(Theme.spacingSm) : 0)
                 height: Theme.dp(40)
 
                 Rectangle {
@@ -117,6 +117,25 @@ Rectangle {
                 MouseArea {
                     anchors.fill: parent
                     onClicked: root.pathSelected(root.currentPath)
+                }
+            }
+
+            IconButton {
+                id: playEngineBtn
+                visible: typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.isResourceRoot
+                anchors.verticalCenter: parent.verticalCenter
+                iconName: "play"
+                variant: "soft"
+                tint: "#10B981"
+                plate: Theme.alpha("#10B981", 0.18)
+                plateEdge: Theme.alpha("#10B981", 0.40)
+                buttonSize: Theme.dp(40)
+                iconSize: Theme.dp(20)
+                square: true
+                onClicked: {
+                    if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
+                        rubyFileModel.launchGame()
+                    }
                 }
             }
 

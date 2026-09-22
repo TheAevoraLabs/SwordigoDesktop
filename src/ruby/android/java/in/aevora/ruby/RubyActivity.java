@@ -780,4 +780,30 @@ public class RubyActivity extends QtActivity {
         } catch (Exception ignored) {}
         return false;
     }
+
+    public static void launchGameActivity(String resourceDir) {
+        launchGameActivity(resourceDir, null);
+    }
+
+    /**
+     * Launch the in-engine runner. When {@code bootScene} is non-null the engine skips the
+     * main menu and boots straight into {@code <bootScene>.scene} using its built-in test
+     * profile ("testplayer") — the scene name must be a basename WITHOUT the .scene
+     * extension, and it must resolve inside {@code resourceDir}.
+     */
+    public static void launchGameActivity(String resourceDir, String bootScene) {
+        if (sInstance == null) return;
+        sInstance.runOnUiThread(() -> {
+            try {
+                Intent intent = new Intent(sInstance, GameActivity.class);
+                intent.putExtra("resource_dir", resourceDir);
+                if (bootScene != null && !bootScene.isEmpty()) {
+                    intent.putExtra("boot_scene", bootScene);
+                }
+                sInstance.startActivity(intent);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to launch GameActivity", e);
+            }
+        });
+    }
 }

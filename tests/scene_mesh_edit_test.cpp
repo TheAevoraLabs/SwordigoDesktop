@@ -27,13 +27,117 @@
 #include "ruby/viewport/viewport_3d_widget.h"
 #include "tools/scene_workspace.h"   // swk::object_world_matrix / world_to_screen / ImVec2
 #include "tools/boulder.h"
+#include "platform/protobuf_reader.h"
+#include <map>
 
 namespace fs = std::filesystem;
 
+static int g_failures = 0;
+
+// ─────────────────────────────────────────────────────────────────────────
+// In-game ground-mesh texture chain.
+//
+// The Ruby editor draws ground textures from the BAKED MeshData Material
+// (MeshData field 10 → Material field 5 → Texture field 1), so a scene can
+// look perfectly textured in-editor while the real game shows nothing but
+// collision.  That is because the game does not trust the baked meshes for a
+// generator-driven object: Caver::GroundMeshGeneratorComponent::GenerateMesh
+// rebuilds them via
+//     GroundMeshGenerator::GenerateSurfaceMesh(int, Vector2 const*,
+//         float const*, float const*, Caver::TextureMapping const*)
+// which takes its texture from a TextureMapping component looked up by the
+// generator's SurfaceTextureMappingId (inner field 4) / FrontTextureMappingId
+// (inner field 3).  If either id is 0, dangling, or points at a TextureMapping
+// with an empty name, the object renders UNTEXTURED in-game while still
+// colliding (the GroundPolygon/CollisionShape components are separate and
+// keep working).  So the ids and their targets — not the baked material — are
+// what must survive an edit + save.
+// ─────────────────────────────────────────────────────────────────────────
+struct GroundTexChain {
+    int      generators = 0;
+    int      texture_mappings = 0;
+    uint32_t front_id = 0;      // GroundMeshGeneratorComponent.FrontTextureMappingId
+    uint32_t surface_id = 0;    // GroundMeshGeneratorComponent.SurfaceTextureMappingId
+    std::map<uint32_t, std::string> tm_names;   // component id → texture name
+};
+
+static GroundTexChain read_ground_tex_chain(const av::SceneObject& obj) {
+    GroundTexChain chain;
+    for (const auto& comp : obj.components) {
+        const int payload = comp.payload_field;
+        if (payload == 112 || comp.type_name == "GroundMeshGenerator") {
+            ++chain.generators;
+            proto::Reader wrapper(comp.raw_data);
+            proto::Field f;
+            while (wrapper.read_field(f)) {
+                if (f.field_number != 112 || f.wire_type != proto::WIRE_LEN) continue;
+                proto::Reader ggc(f.bytes_val);
+                proto::Field g;
+                while (ggc.read_field(g)) {
+                    if (g.field_number == 3) chain.front_id   = (uint32_t)g.varint_val;
+                    else if (g.field_number == 4) chain.surface_id = (uint32_t)g.varint_val;
+                }
+            }
+        } else if (payload == 113 || comp.type_name == "TextureMapping") {
+            ++chain.texture_mappings;
+            std::string name;
+            proto::Reader wrapper(comp.raw_data);
+            proto::Field f;
+            while (wrapper.read_field(f)) {
+                if (f.field_number != 113 || f.wire_type != proto::WIRE_LEN) continue;
+                proto::Reader tmc(f.bytes_val);
+                proto::Field g;
+                while (tmc.read_field(g)) {
+                    if (g.field_number == 1 && g.wire_type == proto::WIRE_LEN) name = g.bytes_val;
+                }
+            }
+            chain.tm_names[(uint32_t)comp.type_id] = name;
+        }
+    }
+    return chain;
+}
+
+// Assert the whole chain on one object; returns true when the object would be
+// textured in-game.
+static bool check_ground_tex_chain(const av::SceneObject& obj, const char* stage) {
+    const GroundTexChain c = read_ground_tex_chain(obj);
+    bool ok = true;
+    auto fail = [&](const char* what) {
+        std::printf("FAIL: [%s] %s\n", stage, what);
+        ++g_failures;
+        ok = false;
+    };
+    if (c.generators == 0) fail("no GroundMeshGenerator component — the game cannot rebuild the mesh");
+    if (c.texture_mappings < 2)
+        fail("fewer than two TextureMapping components (need surface + front)");
+    if (c.surface_id == 0)
+        fail("SurfaceTextureMappingId is 0 → the game draws the top untextured");
+    if (c.front_id == 0)
+        fail("FrontTextureMappingId is 0 → the game draws the cliff face untextured");
+
+    auto name_of = [&](uint32_t id) -> std::string {
+        auto it = c.tm_names.find(id);
+        return it == c.tm_names.end() ? std::string() : it->second;
+    };
+    if (c.surface_id != 0) {
+        const std::string n = name_of(c.surface_id);
+        if (n.empty())
+            fail("SurfaceTextureMappingId points at a missing or unnamed TextureMapping (dangling id)");
+        else
+            std::printf("[%s] surface tex: id=%u name=%s\n", stage, c.surface_id, n.c_str());
+    }
+    if (c.front_id != 0) {
+        const std::string n = name_of(c.front_id);
+        if (n.empty())
+            fail("FrontTextureMappingId points at a missing or unnamed TextureMapping (dangling id)");
+        else
+            std::printf("[%s] front tex: id=%u name=%s\n", stage, c.front_id, n.c_str());
+    }
+    return ok;
+}
+
 // Defined by ruby_gg's main.cpp in the app; needed by libswcore here.
 std::string g_instance_assets_dir = "assets";
-
-static int g_failures = 0;
 
 #define CHECK(cond, msg)                                                      \
     do {                                                                      \
@@ -197,6 +301,37 @@ int main(int argc, char** argv) {
         const double dx = new_poly[0];
         std::printf("vertex 0 after drag: x=%.1f (was 0)\n", dx);
         CHECK(std::fabs(dx) > 10.0, "dragging a vertex regenerated the ground polygon");
+    }
+
+    // ── The texture chain the GAME reads must survive the edit ──────────────
+    check_ground_tex_chain(edited, "after commit");
+    CHECK(!edited.ground_mesh_textures.empty(),
+          "baked ground mesh material kept its texture name (editor preview)");
+
+    // ── …and a save → reload round trip ────────────────────────────────────
+    {
+        av::SceneData to_save = after;
+        const std::string bytes = av::scene_serialize(to_save);
+        CHECK(!bytes.empty(), "scene_serialize produced bytes");
+        if (!bytes.empty()) {
+            const std::vector<uint8_t> buf(bytes.begin(), bytes.end());
+            av::SceneData reloaded;
+            try {
+                reloaded = av::scene_load_bytes(buf, src);
+            } catch (const std::exception& e) {
+                std::printf("FAIL: re-parse of saved scene threw: %s\n", e.what());
+                ++g_failures;
+            }
+            if (reloaded.objects.size() == after.objects.size()) {
+                check_ground_tex_chain(reloaded.objects[mesh_idx], "after save+reload");
+                CHECK(!reloaded.objects[mesh_idx].ground_mesh_textures.empty(),
+                      "saved file still carries the baked ground mesh material");
+            } else {
+                std::printf("FAIL: reloaded scene object count %zu != %zu\n",
+                            reloaded.objects.size(), after.objects.size());
+                ++g_failures;
+            }
+        }
     }
 
     std::fflush(stdout);

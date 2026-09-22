@@ -6040,9 +6040,29 @@ bool Viewport3DWidget::mesh_apply() {
     boulder::GroundMesh gm = m_mesh_params;
     gm.polygon = m_mesh_points;
     boulder::ensure_ccw(gm.polygon);
-    const std::string swdm = boulder::serialize_swdm(gm);
-    const std::string bin = boulder::generate_ground_mesh_object(
-        swdm, m_scene.objects[m_mesh_edit_object].name, m_mesh_z, &m_mesh_ids);
+    // Generator choice — boulderx::set_ground_generator() or
+    // RUBY_GROUND_GENERATOR=boulderx (boulder stays the default). boulderx is
+    // the faithful Caver port that also handles concave outlines, arcs and
+    // per-node depth. It declines requests it cannot reproduce exactly (dome
+    // hats today), and we fall straight back to boulder rather than emit an
+    // object with geometry missing.
+    std::string bin;
+    if (boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX) {
+        std::vector<std::pair<double, double>> xy;
+        xy.reserve(gm.polygon.size());
+        for (const auto& p : gm.polygon) xy.emplace_back(p.x, p.y);
+        const int ids6[6] = {m_mesh_ids.polygon_id, m_mesh_ids.mesh_id,
+                             m_mesh_ids.generator_id, m_mesh_ids.collision_id,
+                             m_mesh_ids.tm_surface_id, m_mesh_ids.tm_front_id};
+        bin = boulderx::generate_ground_mesh_object_flat(
+            xy, 1, std::fabs(gm.max_depth), gm.top_texture, gm.bottom_texture,
+            m_scene.objects[m_mesh_edit_object].name, !gm.hats.empty(), ids6);
+    }
+    if (bin.empty()) {
+        const std::string swdm = boulder::serialize_swdm(gm);
+        bin = boulder::generate_ground_mesh_object(
+            swdm, m_scene.objects[m_mesh_edit_object].name, m_mesh_z, &m_mesh_ids);
+    }
     if (bin.empty()) return false;
 
     std::vector<uint8_t> bytes(bin.begin(), bin.end());
@@ -6073,9 +6093,13 @@ bool Viewport3DWidget::mesh_apply() {
     for (auto& c : preserved) target.components.push_back(std::move(c));
 
     if (was_dim) {
+        // 559, NOT 253 — see the note in ruby_quick_viewport.cpp.  253 is
+        // FireEmitterComponent, so this probe was answering "does this object
+        // have a fire?" and skipping the DimensionObject re-add for anything
+        // that did.
         bool has_dim = false;
         for (const auto& c : target.components) {
-            if (c.type_name == "DimensionObject" || c.payload_field == 253) {
+            if (c.type_name == "DimensionObject" || c.payload_field == 559) {
                 has_dim = true;
                 break;
             }

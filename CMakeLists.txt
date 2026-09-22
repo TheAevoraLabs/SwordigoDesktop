@@ -216,6 +216,31 @@ if (BUILD_TESTING)
     target_link_libraries(scene_text_recovery_test PRIVATE filerift swpod OpenGL::GL)
     add_test(NAME scene_text_recovery_test COMMAND scene_text_recovery_test)
 
+    # Direct scene boot: the libc++ std::string contract the Ruby Touch runner relies on
+    # when it swaps CaverShell's boot-scene field in CaverShell::InitView.
+    #
+    # Built twice, once per engine ABI layout, because libc++'s inline short-string
+    # capacity is sizeof(__long) - 1 — 22 chars on arm64-v8a but only 10 on armeabi-v7a.
+    # A single hardcoded threshold corrupts the engine's own string on 32-bit builds, so
+    # the ILP32 target is a real regression guard, not a duplicate of the LP64 one.
+    foreach(_boot_layout IN ITEMS lp64 ilp32)
+        set(_boot_target scene_boot_string_${_boot_layout}_test)
+        set(_boot_defs STRING_SHORT_CAP=23)
+        if(_boot_layout STREQUAL "ilp32")
+            set(_boot_defs STRING_SHORT_CAP=11 TEST_ILP32_LAYOUT=1)
+        endif()
+        add_executable(${_boot_target}
+            tests/scene_boot_string_test.cpp
+            ${SRC_DIR}/ruby/android/runner/stdstring.c
+        )
+        target_include_directories(${_boot_target} PRIVATE
+            ${SRC_DIR}
+            ${SRC_DIR}/ruby/android/runner
+        )
+        target_compile_definitions(${_boot_target} PRIVATE ${_boot_defs})
+        add_test(NAME ${_boot_target} COMMAND ${_boot_target})
+    endforeach()
+
     # Scale-gizmo payload propagation (web editor `scaleObjectData` parity):
     # scaling an object must also scale LocalAABB + ShapeComponent geometry
     # (rect/circle/polygon) + CollisionShapeComponent depth extents, with the
@@ -521,13 +546,39 @@ if (BUILD_TESTING)
     set_tests_properties(ground_mesh_studio_test PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
-    # Zenith Mesh (BoulderX): concave Ear-Clipping triangulation, 3D variable Z,
-    # and .rbc MeshPen container test.
+    # GroundMesh CollisionShapeComponent wire format. Field NUMBERS and wire
+    # types are asserted against the decompiled engine, not just against
+    # boulder's own output: Ruby renders ground meshes from parsed vertex data,
+    # so a shape written at the wrong field numbers still draws correctly in the
+    # editor and only means something different to the game.
+    add_executable(boulder_collision_fields_test
+        tests/boulder_collision_fields_test.cpp)
+    target_include_directories(boulder_collision_fields_test PRIVATE
+        ${SRC_DIR}
+        ${SRC_DIR}/tools
+        ${SRC_DIR}/platform)
+    target_link_libraries(boulder_collision_fields_test PRIVATE filerift)
+    add_test(NAME boulder_collision_fields_test COMMAND boulder_collision_fields_test)
+
+    # BoulderX — the Caver-faithful ground generator. Behaviour suite covers the
+    # shape classes boulder cannot produce (concave outlines, arcs, per-node
+    # depth, HorizNoise relief); the parity suite pins the output against meshes
+    # the 1.4.13 engine itself baked into the shipped scenes.
+    # boulder.cpp is in this target on purpose: the .swdm dialect gate is a
+    # two-sided contract (a v1 sheet loads in BoulderX, a v2 sheet is refused by
+    # boulder) and neither half can be asserted without the other parser.
     add_executable(boulderx_test
         tests/boulderx_test.cpp
-        ${SRC_DIR}/tools/boulderx.cpp)
+        ${SRC_DIR}/tools/boulderx.cpp
+        ${SRC_DIR}/tools/boulder.cpp)
     target_include_directories(boulderx_test PRIVATE ${SRC_DIR})
     add_test(NAME boulderx_test COMMAND boulderx_test)
+
+    add_executable(boulderx_engine_parity_test
+        tests/boulderx_engine_parity_test.cpp
+        ${SRC_DIR}/tools/boulderx.cpp)
+    target_include_directories(boulderx_engine_parity_test PRIVATE ${SRC_DIR})
+    add_test(NAME boulderx_engine_parity_test COMMAND boulderx_engine_parity_test)
 
     # Title-bar window controls must render visibly (painted icons). This
     # guards the frameless window's Close/Min/Max buttons against font-glyph

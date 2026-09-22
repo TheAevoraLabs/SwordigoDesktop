@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="in.aevora.ruby"
-    android:versionCode="3"
-    android:versionName="1.2">
+    android:versionCode="4"
+    android:versionName="1.3">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
 
@@ -60,5 +60,19 @@
             <meta-data android:name="android.app.arguments" android:value=""/>
             <meta-data android:name="android.app.extract_android_style" android:value="minimal"/>
         </activity>
+
+        <activity
+            android:name="in.aevora.ruby.GameActivity"
+            android:label="Swordigo Engine"
+            android:process=":game"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:exported="false"
+            android:hardwareAccelerated="true" />
     </application>
+
+    <queries>
+        <package android:name="com.touchfoo.swordigo" />
+    </queries>
 </manifest>

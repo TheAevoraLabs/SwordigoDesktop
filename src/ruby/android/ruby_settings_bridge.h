@@ -20,6 +20,12 @@ class RubySettingsBridge : public QObject {
     Q_PROPERTY(bool syntaxHighlighting READ syntaxHighlighting WRITE setSyntaxHighlighting NOTIFY syntaxHighlightingChanged)
     Q_PROPERTY(int editorFontSize READ editorFontSize WRITE setEditorFontSize NOTIFY editorFontSizeChanged)
     Q_PROPERTY(bool hapticsEnabled READ hapticsEnabled WRITE setHapticsEnabled NOTIFY hapticsEnabledChanged)
+    // Ground-mesh generator choice for the in-scene mesh editor. Persisted, and
+    // pushed into boulderx straight away, so the picker in Settings changes the
+    // next regenerated mesh rather than the next launch. Values are the stable
+    // ids "boulder" and "boulderx"; anything else reads back as "boulder".
+    Q_PROPERTY(QString groundGenerator READ groundGenerator WRITE setGroundGenerator
+                   NOTIFY groundGeneratorChanged)
     Q_PROPERTY(int nameDatabaseCount READ nameDatabaseCount CONSTANT)
     Q_PROPERTY(QString appName READ appName CONSTANT)
     Q_PROPERTY(QString appVersion READ appVersion CONSTANT)
@@ -70,12 +76,15 @@ public:
     bool hapticsEnabled() const;
     void setHapticsEnabled(bool val);
 
+    QString groundGenerator() const;
+    void setGroundGenerator(const QString& id);
+
     int nameDatabaseCount() const;
     QString appName() const { return QStringLiteral("Ruby Touch (Ruby Mobile)"); }
 #ifdef RUBY_BUILD_VERSION
     QString appVersion() const { return QStringLiteral(RUBY_BUILD_VERSION); }
 #else
-    QString appVersion() const { return QStringLiteral("v1.2 (Ruby Mobile)"); }
+    QString appVersion() const { return QStringLiteral("v1.3 (Ruby Mobile)"); }
 #endif
 
     QString copyrightHolder() const { return QStringLiteral("MrSinup"); }
@@ -105,6 +114,7 @@ signals:
     void syntaxHighlightingChanged(bool val);
     void editorFontSizeChanged(int size);
     void hapticsEnabledChanged(bool val);
+    void groundGeneratorChanged(const QString& id);
     void customMeshPresetsChanged();
 };
 

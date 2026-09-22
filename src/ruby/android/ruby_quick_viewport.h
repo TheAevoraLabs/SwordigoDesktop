@@ -12,9 +12,12 @@
 #include <memory>
 #include <atomic>
 #include <unordered_map>
+#include <cmath>
+#include <cstdint>
 #include "tools/scene_loader.h"
 #include "tools/pod_loader.h"
 #include "tools/boulder.h"
+#include "tools/boulderx.h"   // boulderx::ground_generator() — generator choice
 #include "ruby/viewport/ruby_gizmo.h"
 #include "ruby/viewport/ruby_picking.h"
 
@@ -160,11 +163,19 @@ public:
     Q_PROPERTY(bool canMeshEdit READ canMeshEdit NOTIFY selectedObjectChanged)
     Q_PROPERTY(int selectedMeshVertex READ selectedMeshVertex NOTIFY selectedMeshVertexChanged)
     Q_PROPERTY(int meshVertexCount READ meshVertexCount NOTIFY meshEditVerticesChanged)
+    // Which generator actually produced the last regenerated ground mesh, and
+    // why it fell back if it did. boulderx declines meshes it cannot reproduce
+    // faithfully and the editor silently uses boulder instead, so without this
+    // the HUD would claim "BoulderX" for output boulder actually made.
+    Q_PROPERTY(QString groundGeneratorStatus READ groundGeneratorStatus
+                   NOTIFY groundGeneratorStatusChanged)
 
     bool meshEditActive() const { return m_meshEditActive; }
     bool canMeshEdit() const;
     int selectedMeshVertex() const { return m_selectedMeshVertex; }
     int meshVertexCount() const { return int(m_meshEditPoints.size()); }
+    QString groundGeneratorStatus() const { return m_groundGeneratorStatus; }
+    void setGroundGeneratorStatus(const QString& status);
 
     Q_INVOKABLE bool beginMeshEdit();
     Q_INVOKABLE bool applyMeshEdit();
@@ -178,6 +189,26 @@ public:
     Q_INVOKABLE void selectPrevMeshVertex();
     Q_INVOKABLE void nudgeSelectedMeshVertex(float dx, float dy);
     Q_INVOKABLE bool setGroundMeshTextures(const QString& topTexture, const QString& groundTexture, float textureScale = -1.0f);
+
+    // ── Terrain relief ──────────────────────────────────────────────────────
+    // A ground sheet is drafted in 2D, so Z cannot be drawn on it: every node
+    // would get the same depth and the mesh would read as a flat plate. These
+    // give the outline relief inside the object's own depth range, without
+    // changing its thickness. Returns false when there is no outline to work on.
+    //
+    // `seed` is reported back through groundReliefSeed() and makes the result
+    // reproducible — re-entering a seed you liked gives that mesh back.
+    Q_INVOKABLE bool randomiseGroundRelief(float frontMagnitude, float backMagnitude,
+                                           int seed = -1);
+    // Clears the per-node relief, returning to a uniform slab at the object's
+    // own depth. This is the state an object starts in when its Z cannot be
+    // recovered.
+    Q_INVOKABLE void clearGroundRelief();
+    Q_INVOKABLE bool hasGroundRelief() const { return !m_meshEditFrontZ.empty(); }
+    Q_INVOKABLE int groundReliefSeed() const { return int(m_meshEditReliefSeed); }
+    // Depth range the relief is drawn from, i.e. what the object already uses.
+    Q_INVOKABLE float groundReliefFrontMax() const { return float(m_meshEditMaxDepth); }
+    Q_INVOKABLE float groundReliefBackMax() const { return float(std::fabs(m_meshEditMinDepth)); }
     Q_INVOKABLE QString getGroundMeshTopTexture() const;
     Q_INVOKABLE QString getGroundMeshFrontTexture() const;
     Q_INVOKABLE float getGroundMeshTextureScale() const;
@@ -261,6 +292,8 @@ signals:
     void meshEditActiveChanged();
     void meshEditVerticesChanged();
     void selectedMeshVertexChanged();
+    void groundGeneratorStatusChanged();
+    void groundReliefChanged();
     void isSceneLoadingChanged();
     void loadingProgressChanged();
     void loadingStatusChanged();
@@ -298,6 +331,12 @@ private:
     bool meshRayObjectPlane(const float origin[3], const float dir[3], double& lx, double& ly) const;
     int meshHitTestVertex(const QPointF& px, float radiusPx = 40.0f) const;
     int meshHitTestEdge(const QPointF& px, double& hitLx, double& hitLy, float radiusPx = 30.0f) const;
+    // Regenerate the edited object's ground geometry through boulder and swap
+    // the result into the scene object.  Shared by the live drag preview and the
+    // commit so the two CANNOT drift apart — the preview used to be a reduced
+    // copy of the commit and left resolved_components, pos_z and the walkable
+    // depth range stale for the whole duration of a drag.
+    bool regenerateGroundMesh();
     bool liveMeshPreview();
 
     // ── Scene-change signalling to the render thread ─────────────────────────
@@ -320,6 +359,25 @@ private:
     bool m_meshEditActive = false;
     int m_meshEditObject = -1;
     int m_selectedMeshVertex = -1;
+    QString m_groundGeneratorStatus;
+    // Generator parameters recovered from the object being edited. These are
+    // what the engine actually builds terrain from, and dropping any of them is
+    // what made an edit both flatten the relief (noise/seed) and quietly change
+    // the object's structure (mesh type).
+    int      m_meshEditMeshType = 1;
+    double   m_meshEditNoise = 0.0;
+    uint32_t m_meshEditSeed = 1291618994u;
+    double   m_meshEditTextureScale = 250.0;
+    double   m_meshEditMinDepth = -45.0;
+    double   m_meshEditMaxDepth = 45.0;
+    // Per-node relief. Empty means "uniform slab", which is what an edit does
+    // when the object's Z cannot be recovered — never a silent flatten.
+    std::vector<double> m_meshEditFrontZ;
+    std::vector<double> m_meshEditBackZ;
+    uint32_t m_meshEditReliefSeed = 0;
+    // Advances on each "randomise" so repeated taps give different terrain while
+    // an explicit seed stays reproducible.
+    uint32_t m_meshEditReliefCounter = 0;
     std::vector<boulder::PolygonPoint> m_meshEditPoints;
     boulder::GroundMesh m_meshEditParams;
     boulder::GroundComponentIds m_meshEditIds;

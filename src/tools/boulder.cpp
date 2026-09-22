@@ -1,4 +1,5 @@
 #include "tools/boulder.h"
+#include "tools/swdm_format.h"
 #include "platform/protobuf_reader.h"
 #include <sstream>
 #include <iostream>
@@ -467,7 +468,36 @@ static std::vector<uint8_t> generate_face_mesh(GroundMesh face) {
     return bits;
 }
 
+namespace {
+// Why the most recent parse produced nothing; see last_parse_error().
+std::string g_parse_error;
+}
+
+bool is_boulderx_swdm(const std::string& content) {
+    return swdm_format::is_boulderx_sheet(content);
+}
+
+const std::string& last_parse_error() { return g_parse_error; }
+void clear_parse_error() { g_parse_error.clear(); }
+
 static GroundMesh parse_gmesh(const std::string& content) {
+    g_parse_error.clear();
+
+    // A BoulderX sheet carries one depth PER NODE. This format has a single
+    // MinDepth/MaxDepth pair, so parsing one would quietly discard that relief
+    // and hand back a flat slab that still collides — the failure a modder sees
+    // as "the mesh edit stripped the Z". Refuse, with a reason the callers can
+    // show, and let BoulderX read it (it reads both dialects).
+    if (swdm_format::is_boulderx_sheet(content)) {
+        g_parse_error =
+            "this is a BoulderX sheet (.swdm format " +
+            std::to_string(swdm_format::kBoulderxVersion) +
+            "): it stores one depth per node, which Boulder's single-depth format "
+            "cannot represent. Switch the ground mesh generator to BoulderX to "
+            "open it.";
+        return GroundMesh{};
+    }
+
     GroundMesh gm;
     std::stringstream ss(content);
     std::string line;
@@ -560,6 +590,27 @@ static GroundMesh parse_gmesh(const std::string& content) {
         } else if (key == "RandomSeed") {
             line_ss >> gm.random_seed;
         }
+        // CollisionShape flags. These must round-trip through the .swdm text
+        // because generate_ground_mesh_object() re-parses the text that
+        // serialize_swdm() produced — an in-memory-only flag would be silently
+        // dropped by the very next call. Absent keys keep the terrain defaults
+        // (not collidable, not damageable, enabled), so existing .swdm files
+        // written before this existed are unaffected.
+        else if (key == "Collides") {
+            int v = 0; line_ss >> v; gm.collides = (v != 0);
+        } else if (key == "ReceivesDamage") {
+            int v = 0; line_ss >> v; gm.receives_damage = (v != 0);
+        } else if (key == "InflictsDamage") {
+            int v = 0; line_ss >> v; gm.inflicts_damage = (v != 0);
+        } else if (key == "SpecialType") {
+            // Presence of the key is what marks the enum as authored — 0 is a
+            // legitimate SpecialType, so it cannot double as "unset".
+            int v = 0; line_ss >> v;
+            gm.has_special_type = true;
+            gm.special_type = v;
+        } else if (key == "Enabled") {
+            int v = 1; line_ss >> v; gm.enabled = (v != 0);
+        }
     }
     
     return gm;
@@ -588,6 +639,15 @@ std::string serialize_swdm(const GroundMesh& gm) {
     ss << "HatWidthOffset2 " << norm.hat_width_offset_2 << "\n";
     ss << "TextureScale " << norm.texture_scale << "\n";
     ss << "RandomSeed " << norm.random_seed << "\n";
+    // Collision flags. Enabled is always written because 0 is meaningful;
+    // the breakable trio is written only when set, matching what the engine
+    // itself emits (it writes these only when true) and keeping plain terrain
+    // .swdm files byte-identical to before.
+    if (norm.collides)        ss << "Collides 1\n";
+    if (norm.receives_damage) ss << "ReceivesDamage 1\n";
+    if (norm.inflicts_damage) ss << "InflictsDamage 1\n";
+    if (norm.has_special_type) ss << "SpecialType " << norm.special_type << "\n";
+    ss << "Enabled " << (norm.enabled ? 1 : 0) << "\n";
     ss << "Hat[\n";
     for (const auto& h : norm.hats)
         ss << h.x << " " << h.y << " " << h.radius << " " << h.height << "\n";
@@ -754,6 +814,11 @@ std::string generate_ground_mesh(const std::string& gmesh_content) {
         "                    Closed : 1\n"
         "                }\n"
         "            }\n"
+        // Reference markup for a DEFAULT terrain shape: the shipped pattern is
+        // IsGround + depths + Enabled only.  The breakable-arrow trio
+        // (Collides : 1 / ReceivesDamage : 1 / SpecialType : 7) belongs on
+        // props and is opt-in via GroundMesh::collides / receives_damage /
+        // has_special_type — see boulder.h for the measurement behind that.
         "            CollisionShapeComponent{\n"
         "                IsGround : 1\n"
         "                MinDepth : %f\n"
@@ -935,7 +1000,13 @@ std::string generate_ground_mesh_object(const std::string& gmesh_content,
                                         double depth,
                                         const GroundComponentIds* ids) {
     GroundMesh gm = parse_gmesh(gmesh_content);
-    if (gm.polygon.size() < 3) return "";
+    if (gm.polygon.size() < 3) {
+        // parse_gmesh records the reason (a BoulderX sheet, malformed text, ...);
+        // a successful parse that simply had too few vertices needs one too, so
+        // callers never see an empty result with nothing to report.
+        if (g_parse_error.empty()) g_parse_error = "polygon has fewer than 3 points";
+        return "";
+    }
     ensure_ccw(gm.polygon);
     if (gm.min_depth > gm.max_depth) std::swap(gm.min_depth, gm.max_depth);
 
@@ -1022,11 +1093,22 @@ std::string generate_ground_mesh_object(const std::string& gmesh_content,
     // ── CollisionShape (ShapeComponent polygon + CollisionShapeComponent) ──
     proto::Writer shape;
     shape.write_nested_field(3, poly); // ShapeComponent.Polygon
+    // Field numbers are the ones the engine's own proto parser switches on
+    // (CollisionShapeComponent::MergePartialFromCodedStream @ 0x3EB32C) and
+    // the ones FileRift names — see the table in boulder.h.  Each field keeps
+    // its own wire type: 2/3/4/5/8/11 varint, 6/7 32-bit float.  Moving any of
+    // these (e.g. writing MinDepth at 5) silently produces a shape the game
+    // reads as something else entirely, which is what
+    // tests/boulder_collision_fields_test.cpp pins down.
     proto::Writer csc;
     csc.write_varint_field(2, 1);                    // IsGround
+    if (gm.collides)         csc.write_varint_field(3, 1); // Collides
+    if (gm.receives_damage)  csc.write_varint_field(4, 1); // ReceivesDamage
+    if (gm.inflicts_damage)  csc.write_varint_field(5, 1); // InflictsDamage
     csc.write_float_field(6, static_cast<float>(gm.min_depth)); // MinDepth
     csc.write_float_field(7, static_cast<float>(gm.max_depth)); // MaxDepth
-    csc.write_varint_field(11, 1);                   // Enabled
+    if (gm.has_special_type) csc.write_varint_field(8, static_cast<uint64_t>(gm.special_type)); // SpecialType
+    csc.write_varint_field(11, gm.enabled ? 1 : 0);  // Enabled
     proto::Writer comp_collision;
     comp_collision.write_string_field(1, "CollisionShape");
     comp_collision.write_varint_field(2, static_cast<uint64_t>(cid.collision_id));

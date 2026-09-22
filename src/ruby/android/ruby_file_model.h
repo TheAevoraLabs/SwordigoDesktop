@@ -49,6 +49,7 @@ class RubyFileModel : public QAbstractListModel {
     Q_PROPERTY(QString clipboardPath READ clipboardPath NOTIFY clipboardChanged)
     Q_PROPERTY(bool clipboardIsCut READ clipboardIsCut NOTIFY clipboardChanged)
     Q_PROPERTY(bool isLoading READ isLoading NOTIFY isLoadingChanged)
+    Q_PROPERTY(bool isResourceRoot READ isResourceRoot NOTIFY resourceRootChanged)
     Q_PROPERTY(QVariantList recentFiles READ recentFiles NOTIFY recentFilesChanged)
 
 public:
@@ -129,6 +130,20 @@ public:
     Q_INVOKABLE void addRecentFile(const QString& path);
     Q_INVOKABLE void clearRecentFiles();
 
+    // ── Direct Game Engine Launch ───────────────────────────────────────
+    bool isResourceRoot() const { return m_isResourceRoot; }
+    Q_INVOKABLE void launchGame();
+
+    // Boot the vanilla engine straight into a scene, skipping the main menu. The engine
+    // creates a throwaway "testplayer" profile whose current level is this scene, then
+    // loads it through its normal path (hero spawns at the scene's "spawn_default").
+    Q_INVOKABLE bool startSceneInGame(const QString& scenePath);
+
+    // True when a file can be used as a direct-boot target (i.e. a .scene).
+    Q_INVOKABLE bool canStartSceneInGame(const QString& scenePath) const;
+
+    static bool checkSwordigoResourceRoot(const QString& dirPath);
+
 signals:
     void currentPathChanged();
     void countChanged();
@@ -137,11 +152,15 @@ signals:
     void showHiddenChanged();
     void clipboardChanged();
     void isLoadingChanged();
+    void resourceRootChanged();
     void statusMessage(const QString& message);
     void recentFilesChanged();
 
 private:
     void reload();
+    // Nearest ancestor of `startDir` that looks like a Swordigo resource root, or an empty
+    // string. Used to hand GameActivity a resource directory the runner's VFS can serve.
+    static QString findResourceRootFor(const QString& startDir);
     static QString detectFileType(const QFileInfo& fi);
     static QString formatSize(qint64 bytes);
     static bool passesCategory(const QFileInfo& fi, const QString& cat);
@@ -164,6 +183,7 @@ private:
     QString m_clipboardPath;
     bool m_clipboardIsCut = false;
     bool m_isLoading = false;
+    bool m_isResourceRoot = false;
     std::atomic<uint64_t> m_scanGeneration{0};
 };
 

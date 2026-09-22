@@ -467,6 +467,18 @@ Item {
             MenuRow {
                 width: parent.width
                 visible: contextSheet.targetFileType === "scene"
+                iconName: "play"
+                accent: true
+                text: qsTr("Start Scene in Game")
+                onClicked: {
+                    contextSheet.close()
+                    rubyFileModel.startSceneInGame(contextSheet.targetFilePath)
+                }
+            }
+
+            MenuRow {
+                width: parent.width
+                visible: contextSheet.targetFileType === "scene"
                 iconName: "terminal"
                 text: qsTr("Extract Embedded Lua Script")
                 onClicked: {

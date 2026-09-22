@@ -358,6 +358,29 @@ Item {
                         }
                     }
                 }
+
+                // Which generator rebuilds a ground mesh when a mesh edit is
+                // committed. Applies to the next regeneration, not the next
+                // launch. BoulderX is Caver-faithful (concave outlines, arcs,
+                // per-node depth) but declines shapes it cannot yet reproduce —
+                // dome hats — and falls back to Boulder for those, which the
+                // mesh-edit HUD reports.
+                SettingRow {
+                    title: qsTr("Ground Mesh Generator")
+                    description: qsTr("Which generator rebuilds a ground mesh when you commit an edit. BoulderX is engine-faithful and falls back to Boulder for shapes it cannot yet reproduce.")
+                    leadingIcon: "cube"
+                    choiceOptions: [
+                        { value: "boulder", label: qsTr("Boulder") },
+                        { value: "boulderx", label: qsTr("BoulderX") }
+                    ]
+                    choiceValue: (typeof rubySettings !== "undefined" && rubySettings)
+                                 ? rubySettings.groundGenerator : "boulder"
+                    onChoiceSelected: (value) => {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.groundGenerator = value;
+                        }
+                    }
+                }
             }
 
             // ── Section 4: Modding Compiler & Pipeline ──────────────────────

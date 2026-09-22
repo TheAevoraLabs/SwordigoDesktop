@@ -160,6 +160,29 @@ if (ANDROID)
     )
     # Set Android package properties
     set_property(TARGET ruby PROPERTY QT_ANDROID_PACKAGE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+
+    # ── Swordigo In-Engine Runner (GlossHook VFS) ───────────────────────────
+    add_library(GlossHook SHARED IMPORTED)
+    set_target_properties(GlossHook PROPERTIES
+        IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/libGlossHook.so"
+    )
+
+    set(RUBY_RUNNER_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_vfs.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_scene.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_jni.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/runner/stdstring.c
+    )
+    add_library(ruby_runner SHARED ${RUBY_RUNNER_SOURCES})
+    target_include_directories(ruby_runner PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/runner
+    )
+    target_link_libraries(ruby_runner PRIVATE
+        GlossHook
+        ZLIB::ZLIB
+        android
+        log
+    )
 else()
     find_package(OpenGL REQUIRED)
     target_link_libraries(ruby PRIVATE OpenGL::GL)

@@ -11,13 +11,16 @@ Item {
     property string text: ""
     property bool danger: false
     property bool trailingChevron: false
+    // Emphasise a row as the sheet's primary action (e.g. "Start Scene in Game").
+    property bool accent: false
 
     signal clicked()
 
     height: Theme.dp(48)
     opacity: enabled ? 1.0 : 0.35
 
-    readonly property color tone: root.danger ? Theme.colorErrorBright : Theme.textPrimary
+    readonly property color tone: root.danger ? Theme.colorErrorBright
+                              : (root.accent ? Theme.accentInk : Theme.textPrimary)
 
     Rectangle {
         anchors.fill: parent

@@ -34,6 +34,7 @@ namespace fs = std::filesystem;
 #include "tools/scene_loader.h"
 #include "tools/av_renderer.h"
 #include "tools/boulder.h"
+#include "tools/boulderx.h"   // boulderx::ground_generator() — generator choice
 #include "ruby/viewport/camera_bounds_gizmo.h"
 #include "ruby/render/glb_model.h"
 

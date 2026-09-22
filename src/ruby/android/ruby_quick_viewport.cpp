@@ -402,6 +402,7 @@ public:
             m_geomRevision  = vp->m_sceneGeometryRevision.load(std::memory_order_acquire);
             m_scenePath = vp->m_filePath.toStdString();
             m_sceneGroundGpuValid = false;
+            m_boundsValid = false;
             m_preloadedPods = std::move(vp->m_preloadedPods);
             m_predecodedImages = std::move(vp->m_predecodedImages);
             vp->m_sceneLoadedFlag = false;
@@ -413,10 +414,13 @@ public:
             if (rev != m_sceneRevision) {
                 m_sceneRevision = rev;
                 m_sceneObjects = vp->m_scene.objects;
+                m_boundsValid = false;
             }
         }
 
         // Ground meshes only need re-uploading when geometry actually changed,
+        // and the cull bounds derive from that same geometry, so both are
+        // invalidated together by the revision checks below.
         // not when an object was merely moved.  Keeping these two revisions
         // apart is what stops a nudge from destroying and rebuilding every
         // terrain buffer in the level.
@@ -424,6 +428,7 @@ public:
         if (grev != m_geomRevision) {
             m_geomRevision = grev;
             m_sceneGroundGpuValid = false;
+            m_boundsValid = false;
         }
     }
 
@@ -504,22 +509,23 @@ public:
                     const auto& obj = m_sceneObjects[i];
                     if (obj.hidden) continue;
 
-                    // Distance culling / LOD check
-                    float dx = obj.pos_x - camPos.x();
-                    float dy = obj.pos_y - camPos.y();
-                    float dz = obj.pos_z - camPos.z();
-                    float distSq = dx * dx + dy * dy + dz * dz;
-                    if (distSq > 225000000.0f) { // 15,000 units max draw radius
-                        continue;
-                    }
+                    // Bounds-driven culling. m_bounds is rebuilt only when the
+                    // scene (or its geometry) changes, so a still scene pays
+                    // nothing per frame.
+                    if (!m_boundsValid || m_bounds.size() != m_sceneObjects.size())
+                        rebuild_scene_bounds();
 
-                    float maxScale = std::max({std::abs(obj.scale_x), std::abs(obj.scale_y), std::abs(obj.scale_z), 1.0f}) * std::abs(obj.template_scaling);
-                    float bRadius = (!obj.ground_meshes.empty()) ? (1500.0f * maxScale) : (350.0f * maxScale);
-
-                    // Frustum Culling
-                    if (!frustum.isSphereVisible(obj.pos_x, obj.pos_y, obj.pos_z, bRadius)) {
-                        continue;
+                    const BoundsEntry be = (i < m_bounds.size()) ? m_bounds[i] : BoundsEntry{};
+                    if (be.known) {
+                        // Distance cull measured to the NEAREST point of the
+                        // object's bounds, not to its origin — a 4000-unit
+                        // terrain is "here" even when its origin is 4000 away.
+                        const float distToBounds = (be.center - camPos).length() - be.radius;
+                        if (distToBounds > 15000.0f) continue;   // max draw radius
+                        if (!frustum.isSphereVisible(be.center.x(), be.center.y(), be.center.z(), be.radius))
+                            continue;
                     }
+                    // else: extent unknown → draw it. Never cull what we cannot measure.
 
                     bool drawn = false;
 
@@ -578,6 +584,9 @@ public:
                                     m_podTexCache[sp] = load_pod_textures(sp, m, roots);
                                     m_podGpuCache[sp] = upload_pod_gpu(m);
                                     m_scenePodCache[sp] = std::move(m);
+                                    // This instance's extent is only now knowable,
+                                    // so its cull bounds get a second, exact pass.
+                                    m_boundsValid = false;
                                 }
                             }
                             auto itM = m_scenePodCache.find(sp);
@@ -818,31 +827,182 @@ private:
         return textures;
     }
 
-    void upload_ground_meshes_gpu(const std::vector<fs::path>& roots) {
-        for (auto& ggpu : m_sceneGroundGpu) {
-            for (auto& g : ggpu.meshes) g.destroy(this);
+    // ── Per-object world-space bounds for culling ──────────────────────────
+    //
+    // The cull test used to use a fixed guess — 1500 * scale for ground
+    // objects, 350 * scale for everything else — centred on the object's
+    // ORIGIN.  That is wrong for an editor-generated ground mesh, which is
+    // authored with Position = (0,0) and its polygon in absolute world
+    // coordinates: the sphere sat at the world origin while the geometry
+    // spanned thousands of units.  The terrain therefore disappeared once the
+    // camera travelled far enough away and NEVER came back, because no camera
+    // position brings the object's origin back in front of the near plane.
+    // The same thing happens to any large hand-made mesh.
+    //
+    // Bounds now come from real geometry: the union of the parsed ground-mesh
+    // AABBs (PODMesh carries min/max straight from the vertex stream), then the
+    // model's own AABB once its POD is resident, then the object's authored
+    // LocalAabb.  An object whose extent is genuinely unknown is NEVER culled —
+    // dropping something we cannot measure is what makes meshes vanish for good.
+    struct BoundsEntry {
+        QVector3D center;
+        float radius = 0.0f;
+        bool known = false;
+    };
+
+    static bool decode_local_aabb(const av::SceneObject& obj, float out[4]) {
+        if (obj.local_aabb.empty()) return false;
+        float vals[4] = {0, 0, 0, 0};
+        int found = 0;
+        try {
+            proto::Reader reader(obj.local_aabb);
+            proto::Field f;
+            while (reader.read_field(f)) {
+                if (f.wire_type != proto::WIRE_I32 || f.field_number < 1 || f.field_number > 4) continue;
+                vals[f.field_number - 1] = f.float_val;
+                if (++found == 4) break;
+            }
+        } catch (...) { return false; }
+        if (found < 4) return false;
+        out[0] = vals[0]; out[1] = vals[1]; out[2] = vals[2]; out[3] = vals[3];
+        return true;
+    }
+
+    void invalidate_scene_bounds() { m_boundsValid = false; }
+
+    void rebuild_scene_bounds() {
+        m_bounds.assign(m_sceneObjects.size(), BoundsEntry{});
+        for (size_t i = 0; i < m_sceneObjects.size(); ++i) {
+            const auto& obj = m_sceneObjects[i];
+            float lmin[3] = { 1e30f,  1e30f,  1e30f };
+            float lmax[3] = {-1e30f, -1e30f, -1e30f };
+            bool have = false;
+            auto include = [&](float x, float y, float z) {
+                lmin[0] = std::min(lmin[0], x); lmax[0] = std::max(lmax[0], x);
+                lmin[1] = std::min(lmin[1], y); lmax[1] = std::max(lmax[1], y);
+                lmin[2] = std::min(lmin[2], z); lmax[2] = std::max(lmax[2], z);
+            };
+            auto include_mesh = [&](const av::PODMesh& m) {
+                if (m.min_x > m.max_x || m.min_y > m.max_y || m.min_z > m.max_z) return;
+                have = true;
+                include(m.min_x, m.min_y, m.min_z);
+                include(m.max_x, m.max_y, m.max_z);
+            };
+
+            for (const auto& gm : obj.ground_meshes) include_mesh(gm);
+
+            // A POD instance's extent is only knowable once the model is
+            // resident.  Until then fall through to the authored LocalAabb —
+            // and if there is none, leave the object uncullable rather than
+            // guessing it away.
+            const std::string modelName = !obj.mesh_name.empty() ? obj.mesh_name : obj.template_name;
+            if (!modelName.empty()) {
+                const std::string sp = resolve_pod_cached(modelName);
+                if (!sp.empty()) {
+                    auto it = m_scenePodCache.find(sp);
+                    if (it != m_scenePodCache.end())
+                        for (const auto& m : it->second.meshes) include_mesh(m);
+                }
+            }
+
+            if (!have) {
+                float rect[4];
+                if (decode_local_aabb(obj, rect) && rect[2] > 0.0f && rect[3] > 0.0f) {
+                    have = true;
+                    include(rect[0], rect[1], obj.pos_z);
+                    include(rect[0] + rect[2], rect[1] + rect[3], obj.pos_z);
+                }
+            }
+            if (!have) continue;   // unknown extent → never culled
+
+            float mat[16];
+            if (!obj.ground_meshes.empty()) calc_object_world_matrix(obj, mat);
+            else                            calc_object_render_matrix(obj, mat);
+            QMatrix4x4 wm;
+            std::memcpy(wm.data(), mat, 16 * sizeof(float));
+
+            QVector3D mn(1e30f, 1e30f, 1e30f), mx(-1e30f, -1e30f, -1e30f);
+            for (int c = 0; c < 8; ++c) {
+                const QVector3D local((c & 1) ? lmax[0] : lmin[0],
+                                      (c & 2) ? lmax[1] : lmin[1],
+                                      (c & 4) ? lmax[2] : lmin[2]);
+                const QVector3D p = wm.map(local);
+                mn.setX(std::min(mn.x(), p.x())); mx.setX(std::max(mx.x(), p.x()));
+                mn.setY(std::min(mn.y(), p.y())); mx.setY(std::max(mx.y(), p.y()));
+                mn.setZ(std::min(mn.z(), p.z())); mx.setZ(std::max(mx.z(), p.z()));
+            }
+
+            auto& e = m_bounds[i];
+            e.known  = true;
+            e.center = (mn + mx) * 0.5f;
+            e.radius = (mx - mn).length() * 0.5f + 1.0f;
         }
-        m_sceneGroundGpu.clear();
-        m_sceneGroundGpu.resize(m_sceneObjects.size());
+        m_boundsValid = true;
+    }
+
+    void upload_ground_meshes_gpu(const std::vector<fs::path>& roots) {
+        const bool size_mismatch = (m_sceneGroundGpu.size() != m_sceneObjects.size());
+        if (size_mismatch) {
+            for (auto& ggpu : m_sceneGroundGpu) {
+                for (auto& g : ggpu.meshes) g.destroy(this);
+            }
+            m_sceneGroundGpu.clear();
+            m_sceneGroundGpu.resize(m_sceneObjects.size());
+        }
 
         fs::path scPath(m_scenePath);
         for (size_t oi = 0; oi < m_sceneObjects.size(); ++oi) {
             const auto& obj = m_sceneObjects[oi];
             if (obj.ground_meshes.empty()) continue;
             auto& ggpu = m_sceneGroundGpu[oi];
+
+            // When actively editing a mesh and this is NOT the edited object, skip rebuilding!
+            if (!size_mismatch && m_meshEditActive && m_meshEditObject >= 0 &&
+                int(oi) != m_meshEditObject && !ggpu.meshes.empty()) {
+                continue;
+            }
+
+            for (auto& g : ggpu.meshes) g.destroy(this);
+            ggpu.meshes.clear();
             ggpu.meshes.reserve(obj.ground_meshes.size());
             for (const auto& gm : obj.ground_meshes) {
                 ggpu.meshes.push_back(upload_mesh_gpu(gm));
             }
-            ggpu.textures.resize(obj.ground_meshes.size(), 0);
+
+            // The texture slots are POSITIONAL: slot i belongs to
+            // ground_meshes[i]. They therefore have to be cleared whenever the
+            // mesh list is rebuilt, not merely resized to match.
+            //
+            // Reconciling the size only (resize) left a stale GLuint at every
+            // index, and the `!= 0` guard below then skipped re-resolution for
+            // it. So once a regeneration changed the mesh count or their order —
+            // which every mesh edit does — each mesh inherited whatever texture
+            // previously happened to occupy its index. The ground got
+            // progressively more wrong with each edit while the *saved* scene
+            // stayed correct, which is exactly the "textures go weird every time
+            // I edit, but normal again after save + reload" symptom.
+            ggpu.textures.assign(obj.ground_meshes.size(), 0);
+
             for (size_t ti = 0; ti < obj.ground_mesh_textures.size() && ti < ggpu.textures.size(); ++ti) {
+                if (ggpu.textures[ti] != 0) continue; // Skip if already loaded
                 const std::string& tex_name = obj.ground_mesh_textures[ti];
                 if (tex_name.empty()) continue;
+
+                auto it = m_texCache.find(tex_name);
+                if (it != m_texCache.end()) {
+                    ggpu.textures[ti] = it->second;
+                    continue;
+                }
+
                 auto cands = av::assets::texture_candidates(scPath, tex_name, roots);
                 for (const auto& cand : cands) {
                     if (fs::exists(cand)) {
                         GLuint t = load_texture_any(cand.string());
-                        if (t) { ggpu.textures[ti] = t; break; }
+                        if (t) {
+                            ggpu.textures[ti] = t;
+                            m_texCache[tex_name] = t;
+                            break;
+                        }
                     }
                 }
             }
@@ -1380,6 +1540,10 @@ private:
     std::vector<av::SceneObject> m_sceneObjects;
     std::vector<GroundMeshGpu> m_sceneGroundGpu;
     bool m_sceneGroundGpuValid = false;
+    // World-space cull bounds per object; rebuilt only on a scene or geometry
+    // revision change (see rebuild_scene_bounds).
+    std::vector<BoundsEntry> m_bounds;
+    bool m_boundsValid = false;
     GLuint m_bgTex = 0;
 
     bool m_hasModel = false;
@@ -2383,6 +2547,14 @@ void RubyQuickViewport::meshImport(int idx) {
     float hat_offset_1 = 5.0f;
     float hat_offset_2 = 5.0f;
     uint32_t random_seed = 1291618994u;
+    // Both of these were read from the generator component and then dropped, so
+    // every edit rebuilt the object with mesh type 1 and zero noise regardless
+    // of what it had. Mesh type 1 adds the rounded rim, so a MeshType 0 sheet
+    // gained geometry it never had; and zero noise is one of the two reasons the
+    // regenerated relief did not match the original.
+    int mesh_type = 1;
+    double horiz_noise = 0.0;
+    double texture_scale = 250.0;
 
     // Pass 1: Extract GroundPolygon, GroundMesh, GroundMeshGenerator, CollisionShape
     for (const auto& comp : comps) {
@@ -2440,6 +2612,8 @@ void RubyQuickViewport::meshImport(int idx) {
                         if (g.field_number == 3) front_tm_id = static_cast<uint32_t>(g.varint_val);
                         else if (g.field_number == 4) surface_tm_id = static_cast<uint32_t>(g.varint_val);
                         else if (g.field_number == 5) random_seed = static_cast<uint32_t>(g.varint_val);
+                        else if (g.field_number == 6 && g.wire_type == proto::WIRE_I32) horiz_noise = g.float_val;
+                        else if (g.field_number == 7 && g.wire_type == proto::WIRE_VARINT) mesh_type = int(g.varint_val);
                         else if (g.field_number == 8 && g.wire_type == proto::WIRE_I32) surface_width = g.float_val;
                         else if (g.field_number == 9 && g.wire_type == proto::WIRE_I32) hat_height = g.float_val;
                         else if (g.field_number == 10 && g.wire_type == proto::WIRE_I32) hat_offset_1 = g.float_val;
@@ -2530,9 +2704,13 @@ void RubyQuickViewport::meshImport(int idx) {
         }
     }
 
-    if (m_meshEditPoints.size() < 3) {
-        m_meshEditPoints = {{-100.0, -50.0}, {100.0, -50.0}, {100.0, 50.0}, {-100.0, 50.0}};
-    }
+    // No fabricated fallback outline here.  There used to be one — a canned
+    // 200x100 rectangle — which meant that arming Mesh Edit on a ground object
+    // whose polygon could not be recovered and then committing silently REPLACED
+    // the object's real ground geometry with that rectangle: the mesh still
+    // collided, but the original terrain was gone for good.  Desktop Ruby bails
+    // instead (mesh_import returns early), so mobile does too: begin_mesh_edit
+    // refuses below and the object is left untouched.
 
     if (!have_depth) {
         float dmin = 1e30f, dmax = -1e30f;
@@ -2553,6 +2731,24 @@ void RubyQuickViewport::meshImport(int idx) {
     m_meshEditParams.hat_height = hat_height;
     m_meshEditParams.hat_width_offset_1 = hat_offset_1;
     m_meshEditParams.hat_width_offset_2 = hat_offset_2;
+
+    // Remember what the object was actually built from. Without these the
+    // regeneration is a different object with the same outline.
+    m_meshEditMeshType = mesh_type;
+    m_meshEditNoise = horiz_noise;
+    m_meshEditSeed = random_seed;
+    m_meshEditTextureScale = texture_scale;
+    m_meshEditMinDepth = min_depth;
+    m_meshEditMaxDepth = max_depth;
+    // Relief starts clean: a fresh import is a uniform slab at the object's own
+    // depth, and relief is something the modder asks for. Carving recovered
+    // per-node depths back out of the baked cap would need a node-to-vertex
+    // correspondence the format does not guarantee, and guessing it is how you
+    // silently deform terrain. The engine's own mechanism — HorizNoise over the
+    // per-node depths — is carried through instead.
+    m_meshEditFrontZ.clear();
+    m_meshEditBackZ.clear();
+    m_meshEditReliefSeed = 0;
     m_meshEditParams.texture_scale = scale_from_tm;
     m_meshEditParams.random_seed = random_seed;
     m_meshEditIds = target_ids;
@@ -2617,56 +2813,157 @@ bool RubyQuickViewport::beginMeshEdit() {
     return true;
 }
 
-bool RubyQuickViewport::liveMeshPreview() {
-    if (!m_meshEditActive || m_meshEditObject < 0 || m_meshEditObject >= int(m_scene.objects.size())) return false;
-    if (m_meshEditPoints.size() < 3) return false;
-
-    boulder::GroundMesh gm = m_meshEditParams;
-    gm.polygon = m_meshEditPoints;
-    boulder::ensure_ccw(gm.polygon);
-
-    const std::string swdm = boulder::serialize_swdm(gm);
-    const std::string bin = boulder::generate_ground_mesh_object(
-        swdm, m_scene.objects[m_meshEditObject].name, m_meshEditZ, &m_meshEditIds);
-    if (bin.empty()) return false;
-
-    std::vector<uint8_t> bytes(bin.begin(), bin.end());
-    av::SceneData parsed;
-    try {
-        parsed = av::scene_load_bytes(bytes, m_filePath.toStdString());
-    } catch (...) {
-        return false;
-    }
-    if (parsed.objects.empty()) return false;
-
-    auto& target = m_scene.objects[m_meshEditObject];
-    auto fresh = std::move(parsed.objects[0]);
-
-    target.ground_meshes = std::move(fresh.ground_meshes);
-    if (!fresh.ground_mesh_textures.empty()) {
-        target.ground_mesh_textures = std::move(fresh.ground_mesh_textures);
-    }
-    target.ground_polygon_points.clear();
-    for (const auto& pt : gm.polygon) {
-        target.ground_polygon_points.push_back(float(pt.x));
-        target.ground_polygon_points.push_back(float(pt.y));
-    }
-    av::scene_mark_ground_mesh_dirty(m_scene, m_meshEditObject);
-    touch_scene(/*geometry_changed=*/true);
-    return true;
+// Regenerate the edited object through boulder (the real backend) and swap the
+// result into the target object.
+//
+void RubyQuickViewport::setGroundGeneratorStatus(const QString& status) {
+    if (m_groundGeneratorStatus == status) return;
+    m_groundGeneratorStatus = status;
+    emit groundGeneratorStatusChanged();
 }
 
-bool RubyQuickViewport::applyMeshEdit() {
-    if (!m_meshEditActive || m_meshEditObject < 0 || m_meshEditObject >= int(m_scene.objects.size())) return false;
+bool RubyQuickViewport::randomiseGroundRelief(float frontMagnitude, float backMagnitude,
+                                              int seed) {
+    if (!m_meshEditActive || m_meshEditPoints.size() < 3) return false;
+
+    // The range defaults to the object's own depth, so "randomise" reshapes the
+    // terrain without changing how thick it is. A caller can override either
+    // side to sculpt thicker or thinner relief deliberately.
+    double fmax = frontMagnitude > 0.0f ? double(frontMagnitude)
+                                        : std::fabs(double(m_meshEditMaxDepth));
+    double bmax = backMagnitude > 0.0f ? double(backMagnitude)
+                                       : std::fabs(double(m_meshEditMinDepth));
+    if (!(fmax > 0.0)) fmax = 45.0;
+    if (!(bmax > 0.0)) bmax = 45.0;
+
+    // seed < 0 means "pick one". Derived from the object's own seed so the result
+    // is not blindly random, and reported back through groundReliefSeed() so the
+    // modder can re-enter a seed whose terrain they liked.
+    uint32_t s = seed < 0
+                     ? (m_meshEditSeed * 1664525u +
+                        (++m_meshEditReliefCounter) * 1013904223u)
+                     : uint32_t(seed);
+    if (s == 0) s = 1u;
+
+    std::vector<boulderx::Node> outline;
+    outline.reserve(m_meshEditPoints.size());
+    for (const auto& p : m_meshEditPoints)
+        outline.push_back({p.x, p.y, fmax, -bmax});
+    boulderx::randomise_node_depths(outline, fmax, bmax, s);
+
+    // randomise_node_depths works in the outline's own order and nothing is
+    // reordered in between, so the depths copy straight back.
+    m_meshEditFrontZ.resize(outline.size());
+    m_meshEditBackZ.resize(outline.size());
+    for (size_t i = 0; i < outline.size(); ++i) {
+        m_meshEditFrontZ[i] = outline[i].front_depth;
+        m_meshEditBackZ[i] = outline[i].back_depth;
+    }
+    m_meshEditReliefSeed = s;
+    emit groundReliefChanged();
+
+    // Route through the same regeneration the live drag and the commit use, so
+    // what you see while sculpting is what gets committed.
+    return liveMeshPreview();
+}
+
+void RubyQuickViewport::clearGroundRelief() {
+    if (m_meshEditFrontZ.empty() && m_meshEditBackZ.empty()) return;
+    m_meshEditFrontZ.clear();
+    m_meshEditBackZ.clear();
+    m_meshEditReliefSeed = 0;
+    emit groundReliefChanged();
+    if (m_meshEditActive) liveMeshPreview();
+}
+
+// This is the ONE place that knows how to turn an edited polygon into scene
+// state, and both the live drag preview and the commit go through it.  The
+// preview used to carry its own reduced copy that only replaced ground_meshes,
+// ground_mesh_textures and ground_polygon_points — leaving resolved_components,
+// pos_z and ground_polygon_min_depth/max_depth stale for the whole duration of a
+// drag, so the inspector and the walkable-depth helpers disagreed with what was
+// on screen until you pressed commit.
+bool RubyQuickViewport::regenerateGroundMesh() {
+    if (m_meshEditObject < 0 || m_meshEditObject >= int(m_scene.objects.size())) return false;
     if (m_meshEditPoints.size() < 3) return false;
 
     boulder::GroundMesh gm = m_meshEditParams;
     gm.polygon = m_meshEditPoints;
     boulder::ensure_ccw(gm.polygon);
 
-    const std::string swdm = boulder::serialize_swdm(gm);
-    const std::string bin = boulder::generate_ground_mesh_object(
-        swdm, m_scene.objects[m_meshEditObject].name, m_meshEditZ, &m_meshEditIds);
+    // Generator choice: boulder by default, boulderx when the user picks it in
+    // Settings (see boulderx::ground_generator()). boulderx declines what it
+    // cannot reproduce exactly — currently dome hats — and we fall back rather
+    // than drop it.
+    std::string bin;
+    const bool want_boulderx =
+        boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX;
+    if (want_boulderx) {
+        // A per-node outline, not a uniform slab, and built from
+        // m_meshEditPoints rather than gm.polygon: boulder::ensure_ccw may have
+        // reversed gm.polygon, and pairing depths with the wrong node would
+        // shear the terrain. Carrying x/y/depth together in one Node means the
+        // winding fix cannot desynchronise them.
+        std::vector<boulderx::Node> outline;
+        outline.reserve(m_meshEditPoints.size());
+        const bool have_relief = m_meshEditFrontZ.size() == m_meshEditPoints.size() &&
+                                 m_meshEditBackZ.size() == m_meshEditPoints.size();
+        for (size_t i = 0; i < m_meshEditPoints.size(); ++i) {
+            boulderx::Node n;
+            n.x = m_meshEditPoints[i].x;
+            n.y = m_meshEditPoints[i].y;
+            // A modder's relief if they asked for one, otherwise the object's own
+            // depth — so the mesh keeps the thickness it arrived with.
+            n.front_depth = have_relief ? m_meshEditFrontZ[i] : double(gm.max_depth);
+            n.back_depth = have_relief ? m_meshEditBackZ[i] : double(gm.min_depth);
+            outline.push_back(n);
+        }
+        boulderx::ensure_ccw(outline);
+
+        // Everything meshImport recovered goes back in. Previously only the mesh
+        // type (hardcoded to 1) and one scalar depth were passed, so an edit
+        // turned a MeshType 0 sheet into a rimmed one and rebuilt the relief
+        // from zero noise — i.e. it changed the object's structure and flattened
+        // its terrain, regardless of what the object was.
+        boulderx::Params params;
+        params.mesh_type = m_meshEditMeshType;
+        params.horiz_noise = m_meshEditNoise;
+        params.random_seed = m_meshEditSeed;
+        params.texture_scale = m_meshEditTextureScale;
+        params.surface_width = gm.surface_width;
+        params.hat_height = gm.hat_height;
+        params.hat_width_offset_1 = gm.hat_width_offset_1;
+        params.hat_width_offset_2 = gm.hat_width_offset_2;
+        params.surface_texture = gm.top_texture;
+        params.front_texture = gm.bottom_texture;
+
+        const int ids6[6] = {m_meshEditIds.polygon_id, m_meshEditIds.mesh_id,
+                             m_meshEditIds.generator_id, m_meshEditIds.collision_id,
+                             m_meshEditIds.tm_surface_id, m_meshEditIds.tm_front_id};
+        bin = boulderx::generate_ground_mesh_object_nodes(
+            outline, params, m_scene.objects[m_meshEditObject].name, !gm.hats.empty(), ids6);
+    }
+    if (bin.empty()) {
+        const std::string swdm = boulder::serialize_swdm(gm);
+        bin = boulder::generate_ground_mesh_object(
+            swdm, m_scene.objects[m_meshEditObject].name, m_meshEditZ, &m_meshEditIds);
+    }
+
+    // Report which generator actually produced this mesh. The reason is only
+    // consulted when boulderx was asked for: it survives from an earlier edit
+    // otherwise, and showing it would attribute a decline to a run that never
+    // requested boulderx. A refusal that reaches the user must be the refusal
+    // that just happened.
+    if (!want_boulderx) {
+        setGroundGeneratorStatus(QStringLiteral("Boulder"));
+    } else if (!boulderx::last_decline_reason().empty()) {
+        setGroundGeneratorStatus(
+            QStringLiteral("Boulder · BoulderX declined: %1")
+                .arg(QString::fromStdString(boulderx::last_decline_reason())));
+    } else {
+        setGroundGeneratorStatus(QStringLiteral("BoulderX"));
+    }
+
     if (bin.empty()) return false;
 
     std::vector<uint8_t> bytes(bin.begin(), bin.end());
@@ -2699,9 +2996,18 @@ bool RubyQuickViewport::applyMeshEdit() {
     for (auto& c : preserved) target.components.push_back(std::move(c));
 
     if (was_dim) {
+        // 559, NOT 253.  Verified against the decompiled extension table in
+        // Caver::Proto::protobuf_AddDesc_Scene_2eproto (libswordigo arm64 1.4.13,
+        // sub_41A8DC):
+        //     DimensionObjectComponent::extension = 559
+        //     FireEmitterComponent::extension      = 253
+        // 253 was detecting a FIRE EMITTER, so an object that carried one was
+        // treated as "already has a DimensionObject" and the re-add below was
+        // skipped.  is_dimension_object itself is set from the ClassName (see
+        // scene_loader), which is why the flag and this probe disagreed.
         bool has_dim = false;
         for (const auto& c : target.components) {
-            if (c.type_name == "DimensionObject" || c.payload_field == 253) {
+            if (c.type_name == "DimensionObject" || c.payload_field == 559) {
                 has_dim = true;
                 break;
             }
@@ -2731,6 +3037,10 @@ bool RubyQuickViewport::applyMeshEdit() {
         target.ground_mesh_textures = std::move(fresh.ground_mesh_textures);
     }
 
+    // scene_refresh does NOT re-derive the GroundPolygon fields, so write the
+    // regenerated outline here — otherwise re-entering Mesh Edit after an apply
+    // would import a stale polygon, and the helpers that read
+    // ground_polygon_points would see outdated walkable data.
     target.ground_polygon_points.clear();
     for (const auto& pt : gm.polygon) {
         target.ground_polygon_points.push_back(float(pt.x));
@@ -2738,10 +3048,27 @@ bool RubyQuickViewport::applyMeshEdit() {
     }
     target.ground_polygon_min_depth = float(gm.min_depth);
     target.ground_polygon_max_depth = float(gm.max_depth);
-    target.ground_polygon_collides = true;
-    target.ground_polygon_unsafe = false;
+    // Collides / Unsafe / Friction are the object's own walkability metadata, not
+    // geometry, and scene_refresh does not re-derive them — so they are left
+    // exactly as they were. These two lines used to force collides=true /
+    // unsafe=false, which silently turned a decorative or unsafe ground sheet
+    // into solid walkable floor the moment you edited its outline.
 
     av::scene_mark_ground_mesh_dirty(m_scene, m_meshEditObject);
+    return true;
+}
+
+bool RubyQuickViewport::liveMeshPreview() {
+    if (!m_meshEditActive) return false;
+    if (!regenerateGroundMesh()) return false;
+    touch_scene(/*geometry_changed=*/true);
+    return true;
+}
+
+bool RubyQuickViewport::applyMeshEdit() {
+    if (!m_meshEditActive) return false;
+    if (!regenerateGroundMesh()) return false;
+
     markDirty(true);
 
     m_meshEditActive = false;
@@ -3360,6 +3687,20 @@ void RubyQuickViewport::insertMeshVertex(int edgeIndex, float worldX, float worl
         pt.y = (m_meshEditPoints[i0].y + m_meshEditPoints[i1].y) * 0.5;
     }
     m_meshEditPoints.insert(m_meshEditPoints.begin() + i0 + 1, pt);
+
+    // Per-node relief is indexed in parallel with the outline, so an insert has
+    // to be mirrored or the two fall out of step — and a desync silently drops
+    // the modder's terrain back to a flat slab. The new node inherits its
+    // predecessor's depth, which is also what reads best: a vertex added to an
+    // edge continues that edge rather than denting it.
+    if (!m_meshEditFrontZ.empty() &&
+        m_meshEditFrontZ.size() == m_meshEditPoints.size() - 1 &&
+        m_meshEditBackZ.size() == m_meshEditPoints.size() - 1 &&
+        i0 < int(m_meshEditFrontZ.size())) {
+        m_meshEditFrontZ.insert(m_meshEditFrontZ.begin() + i0 + 1, m_meshEditFrontZ[i0]);
+        m_meshEditBackZ.insert(m_meshEditBackZ.begin() + i0 + 1, m_meshEditBackZ[i0]);
+    }
+
     m_selectedMeshVertex = i0 + 1;
     m_meshDirty = true;
     liveMeshPreview();
@@ -3372,6 +3713,15 @@ void RubyQuickViewport::deleteMeshVertex(int index) {
     if (!m_meshEditActive || m_meshEditPoints.size() <= 3) return;
     if (index < 0 || index >= int(m_meshEditPoints.size())) return;
     m_meshEditPoints.erase(m_meshEditPoints.begin() + index);
+
+    // Mirror the erase for per-node relief, for the same reason as the insert.
+    if (!m_meshEditFrontZ.empty() &&
+        m_meshEditFrontZ.size() == m_meshEditPoints.size() + 1 &&
+        m_meshEditBackZ.size() == m_meshEditPoints.size() + 1) {
+        m_meshEditFrontZ.erase(m_meshEditFrontZ.begin() + index);
+        m_meshEditBackZ.erase(m_meshEditBackZ.begin() + index);
+    }
+
     if (m_selectedMeshVertex >= int(m_meshEditPoints.size())) {
         m_selectedMeshVertex = int(m_meshEditPoints.size()) - 1;
     }
@@ -3648,6 +3998,7 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
                 m_meshDragging = false;
                 m_meshDragPoint = -1;
                 liveMeshPreview();
+                emit meshEditVerticesChanged();
                 update();
             }
             m_meshPanning = false;
@@ -3752,13 +4103,6 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
                     m_meshEditPoints[m_meshDragPoint].x = lx + m_meshDragOffX;
                     m_meshEditPoints[m_meshDragPoint].y = ly + m_meshDragOffY;
                     m_meshDirty = true;
-                    emit meshEditVerticesChanged();
-
-                    qint64 now = QDateTime::currentMSecsSinceEpoch();
-                    if (now - m_lastMeshPreviewMs >= 60) {
-                        m_lastMeshPreviewMs = now;
-                        liveMeshPreview();
-                    }
                     update();
                 }
                 event->accept();
@@ -3921,13 +4265,6 @@ void RubyQuickViewport::mouseMoveEvent(QMouseEvent* event) {
                 m_meshEditPoints[m_meshDragPoint].x = lx + m_meshDragOffX;
                 m_meshEditPoints[m_meshDragPoint].y = ly + m_meshDragOffY;
                 m_meshDirty = true;
-                emit meshEditVerticesChanged();
-
-                qint64 now = QDateTime::currentMSecsSinceEpoch();
-                if (now - m_lastMeshPreviewMs >= 60) {
-                    m_lastMeshPreviewMs = now;
-                    liveMeshPreview();
-                }
                 update();
             }
             event->accept();

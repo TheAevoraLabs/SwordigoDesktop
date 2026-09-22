@@ -95,6 +95,10 @@ Item {
     }
 
     function requestExit() {
+        if (viewportItem.meshEditActive) {
+            viewportItem.discardMeshEdit()
+            return true
+        }
         if (viewportItem.dirty) {
             unsavedExitDialog.open()
             return true
@@ -240,8 +244,10 @@ Item {
     GlassmorphicOverlay {
         id: meshEditToolbar
         anchors.top: root.width > root.height ? parent.top : leftHud.bottom
-        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.right: root.width > root.height ? parent.right : undefined
+        anchors.horizontalCenter: root.width > root.height ? undefined : parent.horizontalCenter
         anchors.topMargin: root.width > root.height ? Theme.dp(6) : Theme.dp(8)
+        anchors.rightMargin: root.width > root.height ? Theme.dp(6) : 0
         height: Theme.dp(40)
         width: meshToolbarRow.implicitWidth + Theme.dp(20)
         z: 30
@@ -273,6 +279,64 @@ Item {
                     onClicked: {
                         if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
                         viewportItem.discardMeshEdit()
+                    }
+                }
+            }
+
+            // Divider
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: 1
+                height: Theme.dp(18)
+                color: Theme.borderSubtle
+            }
+
+            // Terrain relief. The sheet is drafted in 2D, so Z cannot be drawn on
+            // it — every node would otherwise share one depth and the mesh would
+            // read as a flat plate. This gives each node its own depth inside the
+            // object's own range, without changing its thickness. Tap again for a
+            // different shape; long-press to flatten it back.
+            Rectangle {
+                id: reliefButton
+                anchors.verticalCenter: parent.verticalCenter
+                height: Theme.dp(28)
+                width: reliefRow.implicitWidth + Theme.dp(12)
+                radius: Theme.radiusSm
+                color: Theme.alpha(viewportItem.hasGroundRelief()
+                                   ? Theme.accentEnd : Theme.surface2, 0.9)
+                border.color: viewportItem.hasGroundRelief()
+                              ? Theme.accentEnd : Theme.borderSubtle
+                border.width: 1
+
+                Row {
+                    id: reliefRow
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(3)
+                    Icon {
+                        name: "layers"
+                        size: Theme.dp(13)
+                        color: viewportItem.hasGroundRelief()
+                               ? Theme.textPrimary : Theme.textSecondary
+                    }
+                    Text {
+                        text: viewportItem.hasGroundRelief()
+                              ? qsTr("Z %1").arg(viewportItem.groundReliefSeed())
+                              : qsTr("Relief")
+                        font.pixelSize: Theme.dp(11)
+                        font.weight: Font.Medium
+                        color: Theme.textPrimary
+                    }
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onPressAndHold: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
+                        viewportItem.clearGroundRelief()
+                    }
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
+                        viewportItem.randomiseGroundRelief(-1, -1, -1)
                     }
                 }
             }
@@ -499,13 +563,24 @@ Item {
                     text: root.isModel
                           ? qsTr("%1 meshes · %2 v").arg(viewportItem.meshCount).arg(viewportItem.vertexCount)
                           : (viewportItem.meshEditActive
-                             ? qsTr("Mesh Edit (%1 v)").arg(viewportItem.meshVertexCount)
+                             // Name the generator that actually produced the current
+                             // mesh. BoulderX declines shapes it cannot reproduce
+                             // faithfully and the editor then uses Boulder, so a
+                             // fallback shown as plain success is indistinguishable
+                             // from BoulderX having worked. The reason is front-loaded
+                             // ("declined: …") so elision cannot hide the fact.
+                             ? (viewportItem.groundGeneratorStatus.length > 0
+                                ? qsTr("Mesh Edit (%1 v) · %2")
+                                      .arg(viewportItem.meshVertexCount)
+                                      .arg(viewportItem.groundGeneratorStatus)
+                                : qsTr("Mesh Edit (%1 v)").arg(viewportItem.meshVertexCount))
                              : qsTr("%1 objects · %2").arg(viewportItem.objectCount)
                                                     .arg(viewportItem.gizmoMode === 0
                                                          ? qsTr("view")
                                                          : root.gizmoModes[viewportItem.gizmoMode].name.toLowerCase()))
                     font.pixelSize: Theme.dp(Theme.fontXs)
                     color: viewportItem.meshEditActive ? Theme.colorWarning : Theme.textMuted
+                    elide: Text.ElideRight
                 }
             }
         }
@@ -524,6 +599,7 @@ Item {
         border.color: root.controlsVisible ? Theme.borderSubtle : Theme.accentInk
         border.width: 1
         z: 30
+        visible: root.controlsVisible && !viewportItem.meshEditActive
 
         Row {
             anchors.centerIn: parent
@@ -561,8 +637,8 @@ Item {
         height: Theme.dp(40)
         width: rightHudRow.implicitWidth + Theme.dp(16)
         z: 12
-        visible: root.controlsVisible
-        opacity: root.controlsVisible ? 1.0 : 0.0
+        visible: root.controlsVisible && !viewportItem.meshEditActive
+        opacity: (root.controlsVisible && !viewportItem.meshEditActive) ? 1.0 : 0.0
 
         Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
 

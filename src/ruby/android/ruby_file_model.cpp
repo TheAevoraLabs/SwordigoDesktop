@@ -12,6 +12,10 @@
 #include "platform/pvr_loader.h"
 #include "tools/filerift.h"
 #include <algorithm>
+#include <QDebug>
+#if defined(Q_OS_ANDROID)
+#  include <QJniObject>
+#endif
 
 
 namespace ruby::android {
@@ -607,13 +611,15 @@ void RubyFileModel::reload() {
             return sortAscending ? less : !less;
         });
 
+        bool isRes = checkSwordigoResourceRoot(targetDir.absolutePath());
+
         for (const auto& item : items) {
             if (item.isDir) ++dCount; else ++fCount;
         }
 
         if (m_scanGeneration.load() != gen) return;
 
-        QMetaObject::invokeMethod(this, [this, gen, items = std::move(items), dCount, fCount]() mutable {
+        QMetaObject::invokeMethod(this, [this, gen, items = std::move(items), dCount, fCount, isRes]() mutable {
             if (m_scanGeneration.load() != gen) return;
             beginResetModel();
             m_items = std::move(items);
@@ -621,10 +627,124 @@ void RubyFileModel::reload() {
             m_fileCount = fCount;
             endResetModel();
             m_isLoading = false;
+            bool resChanged = (m_isResourceRoot != isRes);
+            m_isResourceRoot = isRes;
             emit isLoadingChanged();
             emit countChanged();
+            if (resChanged) emit resourceRootChanged();
         }, Qt::QueuedConnection);
     });
+}
+
+bool RubyFileModel::checkSwordigoResourceRoot(const QString& dirPath) {
+    if (dirPath.isEmpty()) return false;
+    static const QStringList signatures = {
+        QStringLiteral("hiro.POD"),
+        QStringLiteral("hiro_run.POD"),
+        QStringLiteral("hero.scene"),
+        QStringLiteral("swordigo_title_2x.pvr"),
+        QStringLiteral("worldsen.scl")
+    };
+    int hits = 0;
+    for (const QString& sig : signatures) {
+        if (QFile::exists(dirPath + QLatin1Char('/') + sig)) {
+            hits++;
+        }
+    }
+    if (hits < 3) {
+        QString sub = dirPath + QStringLiteral("/resources");
+        int subHits = 0;
+        for (const QString& sig : signatures) {
+            if (QFile::exists(sub + QLatin1Char('/') + sig)) {
+                subHits++;
+            }
+        }
+        if (subHits >= 3) return true;
+    }
+    return (hits >= 3);
+}
+
+void RubyFileModel::launchGame() {
+    QString resDir = m_currentDir.absolutePath();
+    if (!QFile::exists(resDir + QStringLiteral("/hiro.POD")) &&
+        QFile::exists(resDir + QStringLiteral("/resources/hiro.POD"))) {
+        resDir = resDir + QStringLiteral("/resources");
+    }
+
+#if defined(Q_OS_ANDROID)
+    QJniObject jPath = QJniObject::fromString(resDir);
+    QJniObject::callStaticMethod<void>(
+        "in/aevora/ruby/RubyActivity",
+        "launchGameActivity",
+        "(Ljava/lang/String;)V",
+        jPath.object<jstring>()
+    );
+#else
+    qDebug() << "[RubyFileModel] launchGame for" << resDir;
+    emit statusMessage(QStringLiteral("Launching game with resources: ") + resDir);
+#endif
+}
+
+QString RubyFileModel::findResourceRootFor(const QString& startDir) {
+    QDir dir(startDir);
+    // Walk up a few levels: mod folders are usually either the resource root itself, a
+    // sibling of it, or nested one level inside the assets tree.
+    for (int i = 0; i < 4 && dir.exists(); ++i) {
+        const QString here = dir.absolutePath();
+        if (checkSwordigoResourceRoot(here)) {
+            if (!QFile::exists(here + QStringLiteral("/hiro.POD")) &&
+                QFile::exists(here + QStringLiteral("/resources/hiro.POD"))) {
+                return here + QStringLiteral("/resources");
+            }
+            return here;
+        }
+        if (!dir.cdUp()) break;
+    }
+    return QString();
+}
+
+bool RubyFileModel::canStartSceneInGame(const QString& scenePath) const {
+    QFileInfo fi(scenePath);
+    return fi.isFile() && fi.suffix().compare(QStringLiteral("scene"), Qt::CaseInsensitive) == 0;
+}
+
+bool RubyFileModel::startSceneInGame(const QString& scenePath) {
+    QFileInfo fi(scenePath);
+    if (!canStartSceneInGame(scenePath)) {
+        emit statusMessage(QStringLiteral("Not a scene file: ") + scenePath);
+        return false;
+    }
+
+    // The engine appends ".scene" to whatever we hand it, so strip the extension here.
+    const QString sceneName = fi.completeBaseName();
+    if (sceneName.isEmpty()) {
+        emit statusMessage(QStringLiteral("Scene has no usable name: ") + scenePath);
+        return false;
+    }
+
+    // Prefer the nearest real resource root so the scene's assets resolve; otherwise hand
+    // over the scene's own directory and let the runner's VFS serve the scene from disk
+    // while everything else falls back to the vanilla APK assets.
+    QString resDir = findResourceRootFor(fi.absolutePath());
+    if (resDir.isEmpty()) resDir = fi.absolutePath();
+
+#if defined(Q_OS_ANDROID)
+    QJniObject jRes = QJniObject::fromString(resDir);
+    QJniObject jScene = QJniObject::fromString(sceneName);
+    QJniObject::callStaticMethod<void>(
+        "in/aevora/ruby/RubyActivity",
+        "launchGameActivity",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        jRes.object<jstring>(),
+        jScene.object<jstring>()
+    );
+    emit statusMessage(QStringLiteral("Booting ") + sceneName + QStringLiteral(" from ") + resDir);
+#else
+    qDebug() << "[RubyFileModel] startSceneInGame" << sceneName << "from" << resDir;
+    emit statusMessage(QStringLiteral("Direct scene boot requires Android (scene: ")
+                       + sceneName + QLatin1Char(')'));
+#endif
+    return true;
 }
 
 QString RubyFileModel::detectFileType(const QFileInfo& fi) {
