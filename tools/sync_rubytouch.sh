@@ -193,6 +193,10 @@ local.properties
 .DS_Store
 __pycache__/
 *.pyc
+
+# Agent instructions & internal AI rules
+.agents/
+.agent/
 IGNORE_EOF
 
 # 6. Create Fastlane metadata for F-Droid and store distribution
