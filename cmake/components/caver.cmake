@@ -16,6 +16,12 @@
 #   behaviour.cpp          — the recovered component behaviours (controllers,
 #                            physics, animation, health/damage, triggers, doors,
 #                            collectables, spells/projectiles, emitters).
+#   level_mechanics.cpp    — DoorController and ElevatorController, transcribed
+#                            from their own functions. They live apart from
+#                            behaviour.cpp because neither is a rate or a lerp:
+#                            the door is an animation seek plus a collision
+#                            toggle, and the elevator is a velocity-driven state
+#                            machine that integrates the owner's position itself.
 #   visual.cpp             — components → draw items (data only; renders nowhere).
 #   program_host.cpp       — the real Lua 5.1 VM: loads Program.Bytes exactly as
 #                            the engine does and binds the engine API surface the
@@ -35,6 +41,13 @@ swordigo_library(caver
     ${SRC_DIR}/ruby/caver/runtime.cpp
     ${SRC_DIR}/ruby/caver/collision.cpp
     ${SRC_DIR}/ruby/caver/behaviour.cpp
+    ${SRC_DIR}/ruby/caver/level_mechanics.cpp
+    ${SRC_DIR}/ruby/caver/program_state.cpp
+    ${SRC_DIR}/ruby/caver/frame_runner.cpp
+    ${SRC_DIR}/ruby/caver/render_passes.cpp
+    ${SRC_DIR}/ruby/caver/anim_bones.cpp
+    ${SRC_DIR}/ruby/caver/char_anim.cpp
+    ${SRC_DIR}/ruby/caver/char_controller.cpp
     ${SRC_DIR}/ruby/caver/visual.cpp
     ${SRC_DIR}/ruby/caver/program_host.cpp
     ${SRC_DIR}/ruby/caver/engine.cpp

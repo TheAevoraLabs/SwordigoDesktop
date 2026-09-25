@@ -55,6 +55,10 @@ public class RubyActivity extends QtActivity {
     private static final String TAG = "RubyActivity";
     private static final int REQUEST_MANAGE_STORAGE = 1001;
     private static final int REQUEST_LEGACY_STORAGE = 1002;
+    private static final int REQUEST_PICK_FOLDER = 2001;
+    private static final int REQUEST_PICK_FILE = 2002;
+    private static final int REQUEST_CODE_EDITOR = 2003;
+    private static String sPendingPickerTag = "";
 
     private static RubyActivity sInstance = null;
     private static String sPendingFilePath = null;
@@ -63,6 +67,7 @@ public class RubyActivity extends QtActivity {
 
     // Native C++ callbacks
     public static native void nativeOnFileOpened(String filePath);
+    public static native void nativeOnPickerResult(String tag, String path, boolean isFolder);
     public static native void nativeOnStoragePermissionGranted(boolean granted);
     public static native void nativeUpdateWindowInsets(int top, int bottom, int left, int right);
 
@@ -540,6 +545,30 @@ public class RubyActivity extends QtActivity {
                 Log.i(TAG, "MANAGE_EXTERNAL_STORAGE result: " + granted);
                 nativeOnStoragePermissionGranted(granted);
             }
+        } else if (requestCode == REQUEST_PICK_FOLDER) {
+            if (resultCode == Activity.RESULT_OK && data != null && data.getData() != null) {
+                String path = getPathFromTreeUri(this, data.getData());
+                if (path != null && !path.isEmpty()) {
+                    Log.i(TAG, "Picked folder: " + path + " (tag=" + sPendingPickerTag + ")");
+                    nativeOnPickerResult(sPendingPickerTag, path, true);
+                }
+            }
+        } else if (requestCode == REQUEST_PICK_FILE) {
+            if (resultCode == Activity.RESULT_OK && data != null && data.getData() != null) {
+                String path = resolveUriToFilePath(data.getData());
+                if (path != null && !path.isEmpty()) {
+                    Log.i(TAG, "Picked file: " + path + " (tag=" + sPendingPickerTag + ")");
+                    nativeOnPickerResult(sPendingPickerTag, path, false);
+                }
+            }
+        } else if (requestCode == REQUEST_CODE_EDITOR) {
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                String action = data.getStringExtra("action");
+                String filePath = data.getStringExtra("file_path");
+                if ("open_visual".equals(action) && filePath != null && !filePath.isEmpty()) {
+                    nativeOnFileOpened(filePath);
+                }
+            }
         }
     }
 
@@ -578,12 +607,36 @@ public class RubyActivity extends QtActivity {
     /**
      * Resolves file:// or content:// URIs to accessible local filesystem paths.
      */
-    private String resolveUriToFilePath(Uri uri) {
+    public String resolveUriToFilePath(Uri uri) {
+        if (uri == null) return null;
         if ("file".equalsIgnoreCase(uri.getScheme())) {
             return uri.getPath();
         }
 
         if ("content".equalsIgnoreCase(uri.getScheme())) {
+            // Check DocumentContract for primary: or raw: doc ID
+            try {
+                if (android.provider.DocumentsContract.isDocumentUri(this, uri)) {
+                    String docId = android.provider.DocumentsContract.getDocumentId(uri);
+                    if (docId != null) {
+                        if (docId.startsWith("primary:")) {
+                            String rel = docId.substring("primary:".length());
+                            return Environment.getExternalStorageDirectory().getAbsolutePath() + "/" + rel;
+                        } else if (docId.startsWith("raw:")) {
+                            return docId.substring("raw:".length());
+                        } else if (docId.contains(":")) {
+                            String[] split = docId.split(":");
+                            String type = split[0];
+                            String rel = split.length > 1 ? split[1] : "";
+                            File candidate = new File("/storage/" + type + "/" + rel);
+                            if (candidate.exists()) {
+                                return candidate.getAbsolutePath();
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+
             Cursor cursor = null;
             try {
                 String[] projection = {"_data"};
@@ -805,5 +858,79 @@ public class RubyActivity extends QtActivity {
                 Log.e(TAG, "Failed to launch GameActivity", e);
             }
         });
+    }
+
+    public void pickFolder(final String tag) {
+        sPendingPickerTag = tag;
+        runOnUiThread(() -> {
+            try {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                startActivityForResult(intent, REQUEST_PICK_FOLDER);
+            } catch (Exception e) {
+                Log.e(TAG, "pickFolder failed: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    public void pickFile(final String tag, final String filterType) {
+        sPendingPickerTag = tag;
+        runOnUiThread(() -> {
+            try {
+                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                intent.setType("*/*");
+                if ("models".equalsIgnoreCase(filterType) || "3d".equalsIgnoreCase(filterType)) {
+                    String[] mimes = {
+                        "model/gltf-binary",
+                        "model/gltf+json",
+                        "application/octet-stream",
+                        "*/*"
+                    };
+                    intent.putExtra(Intent.EXTRA_MIME_TYPES, mimes);
+                }
+                startActivityForResult(intent, REQUEST_PICK_FILE);
+            } catch (Exception e) {
+                Log.e(TAG, "pickFile failed: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    public static void openCodeEditor(final String filePath) {
+        if (sInstance == null) return;
+        sInstance.runOnUiThread(() -> {
+            try {
+                Intent intent = new Intent(sInstance, CodeEditorActivity.class);
+                intent.putExtra("file_path", filePath);
+                sInstance.startActivityForResult(intent, REQUEST_CODE_EDITOR);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to launch CodeEditorActivity: " + e.getMessage(), e);
+            }
+        });
+    }
+
+    public static String getPathFromTreeUri(Context context, Uri treeUri) {
+        if (treeUri == null) return null;
+        try {
+            String docId = android.provider.DocumentsContract.getTreeDocumentId(treeUri);
+            if (docId != null) {
+                String[] split = docId.split(":");
+                String type = split[0];
+                String relativePath = split.length > 1 ? split[1] : "";
+                if ("primary".equalsIgnoreCase(type)) {
+                    return Environment.getExternalStorageDirectory().getAbsolutePath() + "/" + relativePath;
+                } else {
+                    File candidate = new File("/storage/" + type + "/" + relativePath);
+                    if (candidate.exists()) {
+                        return candidate.getAbsolutePath();
+                    }
+                    return "/storage/" + type + "/" + relativePath;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "getPathFromTreeUri error: " + e.getMessage());
+        }
+        return treeUri.getPath();
     }
 }

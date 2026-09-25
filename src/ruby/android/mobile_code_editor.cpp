@@ -144,15 +144,31 @@ bool MobileCodeEditor::load_file(const QString& file_path) {
     f.close();
 
     // Check if FileRift transcoding is needed for binary .scene/.scl
-    if (is_scl_or_scene && !bytes.startsWith("syntax =") && !bytes.startsWith("scl ") && !bytes.startsWith("scene ")) {
+    bool is_already_text = bytes.startsWith("## FileRift") ||
+                           bytes.startsWith("syntax =") ||
+                           bytes.startsWith("scl ") ||
+                           bytes.startsWith("scene ") ||
+                           bytes.startsWith("Object{");
+
+    if (is_scl_or_scene) {
         const std::string schema_type = (ext == QStringLiteral("scene")) ? "scene" : "scl";
-        std::string decoded_text = filerift::decode_protobuf(std::string(bytes.constData(), bytes.size()), schema_type);
-        if (!decoded_text.empty()) {
-            m_text_edit->setPlainText(QString::fromStdString(decoded_text));
+        if (is_already_text) {
+            m_text_edit->setPlainText(QString::fromUtf8(bytes));
             m_is_filerift_transcoded = true;
         } else {
-            m_text_edit->setPlainText(QString::fromUtf8(bytes));
-            m_is_filerift_transcoded = false;
+            try {
+                std::string decoded_text = filerift::decode_protobuf(std::string(bytes.constData(), bytes.size()), schema_type);
+                if (!decoded_text.empty()) {
+                    m_text_edit->setPlainText(QString::fromStdString(decoded_text));
+                    m_is_filerift_transcoded = true;
+                } else {
+                    m_text_edit->setPlainText(QString::fromUtf8(bytes));
+                    m_is_filerift_transcoded = false;
+                }
+            } catch (...) {
+                m_text_edit->setPlainText(QString::fromUtf8(bytes));
+                m_is_filerift_transcoded = false;
+            }
         }
     } else {
         m_text_edit->setPlainText(QString::fromUtf8(bytes));
@@ -180,13 +196,19 @@ bool MobileCodeEditor::save_file() {
         // Encode FileRift markup back to binary
         QFileInfo fi(m_file_path);
         const std::string schema_type = (fi.suffix().toLower() == QStringLiteral("scene")) ? "scene" : "scl";
-        std::string binary_str = filerift::recode_markup(text.toStdString(), schema_type);
-        if (binary_str.empty()) {
-            emit statusMessage(QStringLiteral("FileRift encode error!"));
+        try {
+            std::string binary_str = filerift::recode_markup(text.toStdString(), schema_type);
+            if (binary_str.empty()) {
+                emit statusMessage(QStringLiteral("FileRift encode error: syntax error in markup!"));
+                save_file.cancelWriting();
+                return false;
+            }
+            save_file.write(binary_str.data(), binary_str.size());
+        } catch (const std::exception& e) {
+            emit statusMessage(QStringLiteral("FileRift syntax error: ") + QString::fromUtf8(e.what()));
             save_file.cancelWriting();
             return false;
         }
-        save_file.write(binary_str.data(), binary_str.size());
     } else {
         save_file.write(text.toUtf8());
     }

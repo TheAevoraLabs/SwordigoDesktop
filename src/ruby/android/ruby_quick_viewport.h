@@ -18,6 +18,7 @@
 #include "tools/pod_loader.h"
 #include "tools/boulder.h"
 #include "tools/boulderx.h"   // boulderx::ground_generator() — generator choice
+#include "tools/roller.h"     // zypher::generate_terrain_object() — Gen 3 modern generator
 #include "ruby/viewport/ruby_gizmo.h"
 #include "ruby/viewport/ruby_picking.h"
 
@@ -200,11 +201,20 @@ public:
     // reproducible — re-entering a seed you liked gives that mesh back.
     Q_INVOKABLE bool randomiseGroundRelief(float frontMagnitude, float backMagnitude,
                                            int seed = -1);
-    // Clears the per-node relief, returning to a uniform slab at the object's
-    // own depth. This is the state an object starts in when its Z cannot be
-    // recovered.
+    // Puts the per-node depth back to the object's OWN baked depths — what the
+    // import recovered — rather than flattening the sheet. Flattening is what
+    // "clear" used to mean, and on an object with real relief that is a
+    // destructive edit disguised as a reset. Only an object whose vanilla mesh
+    // is already a uniform slab ends up flat.
     Q_INVOKABLE void clearGroundRelief();
+    // True when the outline carries per-node depth at all (recovered vanilla
+    // relief, or sculpted).
     Q_INVOKABLE bool hasGroundRelief() const { return !m_meshEditFrontZ.empty(); }
+    // True when that depth is the object's own, recovered from the mesh it
+    // shipped with, rather than something randomiseGroundRelief() made.
+    Q_INVOKABLE bool hasVanillaRelief() const {
+        return !m_meshEditFrontZ.empty() && m_meshEditReliefSeed == 0;
+    }
     Q_INVOKABLE int groundReliefSeed() const { return int(m_meshEditReliefSeed); }
     // Depth range the relief is drawn from, i.e. what the object already uses.
     Q_INVOKABLE float groundReliefFrontMax() const { return float(m_meshEditMaxDepth); }
@@ -246,6 +256,16 @@ public:
     Q_INVOKABLE int pickObjectAt(float x, float y);
     Q_INVOKABLE QVariantMap getCameraState() const;
     Q_INVOKABLE void setCameraState(const QVariantMap& state);
+
+    // ── Asset & Archetype Library Discovery ─────────────────────────────────
+    Q_INVOKABLE QVariantList getAvailableLibraries();
+    Q_INVOKABLE QVariantList getTemplatesInLibrary(const QString& sclPathOrName);
+    Q_INVOKABLE QVariantList getAvailableModels();
+
+    // ── Object Import & Placement ───────────────────────────────────────────
+    Q_INVOKABLE int importModelObject(const QString& podPathOrStem);
+    Q_INVOKABLE int importTemplateObject(const QString& sclPathOrName, const QString& templateName);
+    Q_INVOKABLE int importPrimitiveObject(const QString& typeName);
 
     int cameraMode() const { return m_cameraMode; }
     bool isGameView() const { return m_cameraMode == CameraModeGameView; }
@@ -330,6 +350,11 @@ private:
     bool meshScreenRay(const QPointF& px, float origin[3], float dir[3]) const;
     bool meshRayObjectPlane(const float origin[3], const float dir[3], double& lx, double& ly) const;
     int meshHitTestVertex(const QPointF& px, float radiusPx = 40.0f) const;
+    // World-space AABB of a local-space box after `matrix`, the same 8-corner
+    // transform the renderer's cull bounds use. Shared by picking so an object
+    // is tested against its oriented extent rather than an axis-aligned guess.
+    static bool world_box_of(const float matrix[16], const float local_min[3],
+                             const float local_max[3], float out_min[3], float out_max[3]);
     int meshHitTestEdge(const QPointF& px, double& hitLx, double& hitLy, float radiusPx = 30.0f) const;
     // Regenerate the edited object's ground geometry through boulder and swap
     // the result into the scene object.  Shared by the live drag preview and the
@@ -370,10 +395,16 @@ private:
     double   m_meshEditTextureScale = 250.0;
     double   m_meshEditMinDepth = -45.0;
     double   m_meshEditMaxDepth = 45.0;
-    // Per-node relief. Empty means "uniform slab", which is what an edit does
-    // when the object's Z cannot be recovered — never a silent flatten.
+    // Per-node depth for the outline currently being edited. Empty means
+    // "uniform slab", which is what an edit uses when the object's Z cannot be
+    // recovered — never a silent flatten.
     std::vector<double> m_meshEditFrontZ;
     std::vector<double> m_meshEditBackZ;
+    // The same arrays as they came out of the object's own baked mesh (see
+    // meshImport). clearGroundRelief() restores THESE, so a reset cannot become
+    // a flatten.
+    std::vector<double> m_meshEditVanillaFrontZ;
+    std::vector<double> m_meshEditVanillaBackZ;
     uint32_t m_meshEditReliefSeed = 0;
     // Advances on each "randomise" so repeated taps give different terrain while
     // an explicit seed stays reproducible.
@@ -425,6 +456,24 @@ private:
     std::atomic<uint64_t> m_sceneLoadGen{0};
     std::unordered_map<std::string, av::PODModel> m_preloadedPods;
     std::unordered_map<std::string, QImage> m_predecodedImages;
+
+    // Per-POD local-space AABB, recorded while the scene's models are parsed on
+    // the background loader thread.
+    //
+    // Touch picking needs a model's real extent to be usable at all: the old
+    // picker measured every object against a box of `scale * template_scaling *
+    // 1.5` clamped to 40 units, which for a level-sized or authored-large object
+    // is unrelated to what is on screen, so a tap had to land within 140 px of
+    // the object's ORIGIN to select it. The parsed PODModel already carries the
+    // union AABB (pod_loader.h `min_x..max_z`), and the parse happens anyway —
+    // this just keeps it, instead of moving the model into the renderer and
+    // losing every trace of its size.
+    struct PodLocalBounds {
+        float min[3] = { 0.0f, 0.0f, 0.0f };
+        float max[3] = { 0.0f, 0.0f, 0.0f };
+    };
+    std::unordered_map<std::string, PodLocalBounds> m_podLocalBounds;
+    std::unordered_map<std::string, std::vector<av::SclTemplateEntry>> m_sclTemplateCache;
 
     // Snapshot Undo/Redo stack (whole-scene diffing)
     std::vector<std::vector<uint8_t>> m_undoSnapshots;

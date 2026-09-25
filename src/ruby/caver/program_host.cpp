@@ -17,6 +17,7 @@ extern "C" {
 
 #include "ruby/caver/behaviour.h"
 #include "ruby/caver/library_manager.h"
+#include "ruby/caver/program_state.h"
 #include "ruby/caver/runtime.h"
 
 namespace caver {
@@ -149,11 +150,17 @@ struct ProgramHost::Instance {
     std::string field;            // "Program", "OnKill", "OnCollide" …
     std::string owner_class;      // component class that owns the field
     int  thread = LUA_NOREF;      // coroutine ref in the registry
-    bool keep_active = false;     // stays loaded; restarted when it returns
+    bool keep_active = false;     // started with its object (Program.SetKeepActive)
     bool one_shot = false;        // handler: runs only when fired
     bool started = false;
     bool finished = false;
-    double wait_until = -1.0;
+    // Recovered ProgramState state (program_state.h): +84 m_wait_remaining and
+    // +80 m_status. Program.Wait is a C function that *stores* the duration and
+    // yields no values; ProgramState::Update counts it down by the speed-scaled
+    // dt. The port used to read the duration back off the yielded stack, which
+    // ProgramState::Wait (0x5457AC) makes impossible.
+    float wait_remaining = 0.0f;
+    bool  waiting = false;
     uint64_t runs = 0;
 };
 
@@ -266,8 +273,11 @@ bool ProgramHost::init(std::string* error) {
     lua_newtable(L_);
     push_fn(L_, [](lua_State* L) -> int {
         const double t = lua_isnumber(L, 1) ? lua_tonumber(L, 1) : 0.0;
-        lua_pushnumber(L, t);
-        return lua_yield(L, 1);
+        // Caver::ProgramState::Wait (0x5457AC) stores the duration and sets
+        // status Waiting; the yield carries nothing. Resuming is the scheduler's
+        // job (ProgramState::Update 0x545480), not the returned value's.
+        if (g_host) g_host->set_wait(t);
+        return lua_yield(L, 0);
     }); lua_setfield(L_, -2, "Wait");
     push_fn(L_, [](lua_State* L) -> int {
         const int n = lua_gettop(L);
@@ -827,8 +837,24 @@ void ProgramHost::update_object(RuntimeScene& scene, RuntimeObject& object, floa
     for (size_t i = 0; i < count; ++i) {
         Instance* instance = instances_[i];
         if (instance->object != identifier) continue;
-        if (instance->finished || instance->one_shot) continue;
-        if (instance->wait_until > 0.0 && clock_ < instance->wait_until) continue;
+        // A one-shot handler is only skipped while it has never started; a handler
+        // that suspended on Program.Wait has a live coroutine the scheduler owns.
+        if (instance->finished || (instance->one_shot && !instance->started)) continue;
+
+        // ProgramState::Update 0x545480: a waiting state is revived by its own
+        // countdown — `remaining -= scaled; if (remaining < 0.0f) resume` — where
+        // the step is the frame dt scaled by the owner's speed multiplier and then
+        // by the state's time scale. The port compared an absolute clock deadline
+        // instead, which ignores slow-motion and hitstop entirely.
+        //
+        // The owner multiplier is 1.0 here: RuntimeObject has no recovered
+        // `SceneObject::updateSpeedMultiplier` equivalent yet (see the status
+        // doc), and inventing one would be worse than naming the gap.
+        if (instance->waiting) {
+            const float scaled = caver::prog::Scheduler::scaled_dt(dt, 1.0f, 1.0f);
+            if (!caver::prog::Scheduler::tick_wait(instance->wait_remaining, scaled)) continue;
+            instance->waiting = false;
+        }
 
         RuntimeObject* live = scene.object(identifier);
         if (!live) break;
@@ -865,21 +891,28 @@ void ProgramHost::resume(RuntimeScene& scene, RuntimeObject& object, Instance& i
         return;
     }
 
-    instance.wait_until = -1.0;
+    // The wait that brought us here is spent (ProgramState::Update sets status
+    // Running before resuming); Program.Wait inside the resume may set a new one.
+    instance.waiting = false;
+    instance.wait_remaining = 0.0f;
     const int status = lua_resume(thread, 0);
-    if (status == 0) {
-        if (lua_gettop(thread) == 0) {
-            // Returned. `keep_active` scripts loop again next frame.
-            instance.started = false;
-            if (!instance.keep_active) instance.finished = true;
+
+    // ProgramState::Resume 0x545624 / Update 0x545480: the result must be exactly
+    // LUA_YIELD(1). Anything else — a clean return included — sets the abort flag
+    // and the state is unlinked. A keep-alive script therefore has to loop; it is
+    // never restarted on return.
+    if (caver::prog::resume_outcome(status) == caver::prog::ResumeOutcome::Aborted) {
+        if (status != LUA_YIELD && status != 0) {
+            const char* message = lua_tostring(thread, -1);
+            report(object, instance.field, message ? message : "runtime error");
         }
-    } else if (status == LUA_YIELD) {
-        const double wait = lua_isnumber(thread, -1) ? lua_tonumber(thread, -1) : 0.0;
-        lua_pop(thread, 1);
-        instance.wait_until = clock_ + std::max(0.0, wait);
-    } else {
-        const char* message = lua_tostring(thread, -1);
-        report(object, instance.field, message ? message : "runtime error");
+        instance.finished = true;
+    } else if (!instance.waiting) {
+        // Yielded with no Program.Wait behind it. The engine leaves such a state
+        // Running, and Update only ever resumes a Waiting one — so there would be
+        // no wait left to wake it. Reported instead of hanging silently.
+        report(object, instance.field,
+               "yielded outside Program.Wait — the scheduler has no wait to resume from");
         instance.finished = true;
     }
     lua_pop(L_, 1);
@@ -902,10 +935,32 @@ void ProgramHost::run_handler(RuntimeScene& scene, RuntimeObject& object, Instan
     if (load_program(program->field_name, program->source, program->bytecode)) {
         lua_xmove(L_, thread, 1);
         push_object(thread, &object);
-        if (lua_resume(thread, 1) != 0 && lua_status(thread) != LUA_YIELD) {
+        instance.waiting = false;
+        instance.wait_remaining = 0.0f;
+        const int status = lua_resume(thread, 1);
+        if (status == LUA_YIELD) {
+            if (instance.waiting) {
+                // The handler suspended on Program.Wait, so under the recovered
+                // rule (ProgramState::Update 0x545480 revives only a Waiting
+                // state) the coroutine still has a future. Hand it to the
+                // scheduler and keep the registry ref alive; unref-ing here is
+                // what used to make a waiting handler vanish.
+                instance.thread = ref;
+                instance.started = true;
+                instance.finished = false;
+                ++instance.runs;
+                g_self = nullptr;
+                return;
+            }
+            report(object, instance.field,
+                   "handler yielded outside Program.Wait — no wait to resume from");
+        } else if (status != 0) {
             const char* message = lua_tostring(thread, -1);
             report(object, instance.field, message ? message : "handler error");
         }
+        // A handler that returned or errored is done: the engine aborts (and so
+        // unlinks) the state on any non-yield resume result.
+        instance.finished = true;
     }
     luaL_unref(L_, LUA_REGISTRYINDEX, ref);
     ++instance.runs;
@@ -985,6 +1040,13 @@ void ProgramHost::begin_cast(RuntimeObject& caster) {
 
 void ProgramHost::set_keep_active(bool keep) {
     if (current_) current_->keep_active = keep;
+}
+
+// Caver::ProgramState::Wait (0x5457AC), reached from the Program.Wait C function.
+void ProgramHost::set_wait(double seconds) {
+    if (!current_) return;
+    current_->wait_remaining = static_cast<float>(seconds);
+    current_->waiting = true;
 }
 
 void ProgramHost::execute_named(RuntimeObject* object, const std::string& name) {

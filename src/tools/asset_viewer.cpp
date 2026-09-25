@@ -7541,7 +7541,12 @@ static void obj_browser_add(ViewerState& st, const std::string& path, bool is_po
         if (!f) return;
         std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         boulder::GroundMesh gm = boulder::parse_ground_mesh(content);
-        if (gm.polygon.size() < 3) { st.status_msg = "Invalid .swdm file."; return; }
+        if (gm.polygon.size() < 3) {
+            const std::string why = boulder::last_parse_error();
+            st.status_msg = why.empty() ? std::string("Invalid .swdm file.")
+                                        : ("Cannot add " + fs::path(path).filename().string() + ": " + why);
+            return;
+        }
         gm_push_undo(st);
         st.gm_points = gm.polygon;
         st.gm_hats = gm.hats;
@@ -8521,7 +8526,13 @@ static void draw_ground_mesh_generator(ViewerState& st) {
                     st.gm_canvas_framed = false;
                     st.status_msg = "Loaded " + std::string(load_buf);
                 } else {
-                    st.status_msg = "Invalid .swdm file.";
+                    // A BoulderX sheet (v2, one depth per node) is valid but not
+                    // representable in this single-depth sketcher. boulder says
+                    // exactly that, so the message says it too instead of
+                    // calling the file invalid.
+                    const std::string why = boulder::last_parse_error();
+                    st.status_msg = why.empty() ? std::string("Invalid .swdm file.")
+                                                : ("Cannot load " + std::string(load_buf) + ": " + why);
                 }
             } else {
                 st.status_msg = "Cannot open " + std::string(load_buf);
@@ -9511,7 +9522,11 @@ __attribute__((unused)) static void draw_ground_mesh_generator_disabled(ViewerSt
                     st.gm_canvas_framed = false;   // reframe on the loaded sketch
                     st.status_msg = "Loaded " + std::string(load_buf);
                 } else {
-                    st.status_msg = "Invalid .swdm file.";
+                    // Same rule as the other "Load .swdm" popup: a v2 sheet is
+                    // valid, just not representable here, and the reason says so.
+                    const std::string why = boulder::last_parse_error();
+                    st.status_msg = why.empty() ? std::string("Invalid .swdm file.")
+                                                : ("Cannot load " + std::string(load_buf) + ": " + why);
                 }
             } else {
                 st.status_msg = "Cannot open " + std::string(load_buf);

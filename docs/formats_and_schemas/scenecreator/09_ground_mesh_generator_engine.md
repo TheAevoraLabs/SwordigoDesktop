@@ -21,13 +21,14 @@ GenerateMesh()
  │                      TextureMapping const*)       @0x1F7420 / @0x2B9A48
  │    — plain surface (MeshType 0) or:
  ├─ GenerateSurfaceMeshWithRoundHat(f,f,f,f)         @0x1F8340 / @0x2BB010
- │    — surface with round-hat domes (MeshType 1)
+ │    — surface with a rounded rim (MeshType 1; see §4)
  │     ├─ InsertRoundHatVertices(Vector2, f, f, Vector3, Vector3, f)  @0x1FDEB0 / @0x2BA45C
  │     ├─ InsertCapForRoundHat(bool, Vector2, f, f, Vector3, Vector3, f) @0x1FF330 / @0x2BA724
  │     └─ Polygon::VertexAtIndexIsConvexCCW(int)     @0x1F9E50
  │         Vector2::Normalize / Vector3::Normalize / sqrtf
  ├─ GeneratePlainSurfaceWithHatGaps(float)           @0x1FE290 / @0x2BAC60
- │    — surface with gaps where hats sit (used with InsertPlainSurfaceVertices @0x202930)
+ │    — the same surface as separate runs, with gaps where it meets the rim's
+ │      inner wall (InsertPlainSurfaceVertices @0x202930; see §4)
  └─ GenerateFrontMesh()                              @0x1FD800 / @0x2BB564
       ├─ TriangulatePolygon(Vector2 const*, int, ushort*)  @0x1F5150 / @0x2C1CC4
       │    (ear-clipping triangulation of the source polygon)
@@ -45,8 +46,8 @@ Everything is emitted through `Caver::MeshBuilder`:
 | Function | Job |
 |----------|-----|
 | `GenerateSurfaceMesh` | Builds the flat **top surface** mesh of the ground polygon (the walkable area) at constant depth, textured with the surface `TextureMapping`. |
-| `GenerateSurfaceMeshWithRoundHat` | Same surface, but `InsertRoundHatVertices` stamps a ring of dome vertices for each round hat and `InsertCapForRoundHat` closes the dome top; `VertexAtIndexIsConvexCCW` decides where hats are inset. |
-| `GeneratePlainSurfaceWithHatGaps` | Plain surface with *gaps* where hats will sit (alternative hat handling). |
+| `GenerateSurfaceMeshWithRoundHat` | Same surface, but with a rounded **rim**: `InsertRoundHatVertices` sweeps the rim's cross-section at each outline node and `InsertCapForRoundHat` closes the sweep at its seam; `VertexAtIndexIsConvexCCW` decides where the rim's corner is pushed out. |
+| `GeneratePlainSurfaceWithHatGaps` | The plain surface emitted as *separate runs* with gaps at the creases, so it does not wrap around the rim's inner wall. See §4. |
 | `GenerateFrontMesh` | **Front face**: ear-clips the polygon (`TriangulatePolygon`) and extrudes each triangle to the front depth band, textured with the front `TextureMapping` — this is the vertical strip the player sees. |
 | `InitializeMeshBuilder` | Prepares the builder; `AddVertex`/`AddFace` accumulate; `GenerateMesh()` materializes the `Caver::Mesh`. |
 | `TextureMapping::TexCoordForPosition` | Computes the UV for a world-space vertex — **UVs are derived from world position**, which is why `TextureMapping.Scale` (250) controls texel density. |
@@ -108,18 +109,62 @@ Indices: `ValueType 4` (uint16), `Stride 2`.
 
 ---
 
-## 4. Round hats (the domes)
+## 4. "Round hats" are the RIM, not domes — corrected
+
+> **Correction (measured, not inferred).** An earlier revision of this document
+> read "round hat" as a *dome standing on the surface* and cited `HatHeight 30-40`
+> and a "60-radius / 25-height dome" as examples. Both readings are wrong. The
+> shipped data settles it: across all **2,538 ground objects** in the 202 decoded
+> scenes, the largest amount any baked vertex rises above its own polygon's top
+> edge is **2.04 units**, and every one of those **154** vertices (in 43 submeshes)
+> sits **exactly 3.000** from a **convex** node — which is the rim's corner shift
+> (`VertexAtIndexIsConvexCCW` plus a hard-coded `3.0` in
+> `GenerateSurfaceMeshWithRoundHat`). A `HatHeight` dome would rise 20-40. So
+> `HatHeight` is a *rim* depth (the generator field's own name for it), and
+> `MeshType 1` means "this slab has a rounded rim". Reproduce the measurement with
+> `.scratch/ground_dome_probe.py`.
+>
+> (The rim does put vertices outside a polygon's *bounding box* in general — an
+> inward profile offset at an obtuse corner moves along the axis the box measures.
+> 7,466 of the 18,357 out-of-box vertices in the corpus are the 3.000 shift; the
+> rest are those inward offsets, and none of them rises above the top edge.)
+
+So `InsertRoundHatVertices` / `InsertCapForRoundHat` build the **brim** of a
+MeshType 1 slab, and there is no dome anywhere in the engine's ground pipeline.
 
 `InsertRoundHatVertices(Vector2 center, float a3, float a4, Vector3 u, Vector3 v, float a7)`
-builds a dome on the surface:
-- A **profile ring** of vertices standing on the top surface plane (`base + 0.05`
-  to avoid z-fighting — same trick in boulder).
-- The dome spans the full Min..Max depth like the surface, so it reads as a
-  rounded bump the hero can walk over.
-- `InsertCapForRoundHat` closes the top of the dome.
+sweeps the rim's cross-section:
+- One **profile ring** per outline node, standing ON the surface plane
+  (`+0.05` to avoid z-fighting — the same trick boulder uses).
+- The rim spans the slab's depth and bevels outward past the front/back planes,
+  which is what makes the terrain read as a rounded plate rather than a cut block.
+- `InsertCapForRoundHat` adds the two closing vertices and the six faces that
+  close the sweep at its seam — it calls `InsertRoundHatVertices` first and then
+  stitches the ring it just added.
 
-Real examples: `plains_part1` ground objects use `HatHeight 30-40`; `new_level.scene`
-uses a 60-radius / 25-height dome.
+A **dome** as an authoring feature is boulder's own (`src/tools/boulder.{h,cpp}`,
+`Hat` + `generate_hat_mesh`), written into `.swdm` sheets as a `Hat[` block. It has
+no engine counterpart, so nothing can be ported for it; BoulderX reproduces
+boulder's geometry instead (see doc 13 §4).
+
+### The three planes the rim is built from
+
+Every z the rim emits is an **offset from that node's plain plane** (the array
+`GenerateMesh` computes — §1.1 of doc 13):
+
+```
+plain[i]        = +-(SurfaceWidth/2 + HorizNoise * (frand() - 0.5))   the ribbon and the cap
+rim outer       = plain[i] +- HatWidthOffset1                        on the node's own XY
+rim bevel       = plain[i] +- (HatWidthOffset1 + HatWidthOffset2)    at 0.4*HatHeight inward
+rim inner wall  = plain[i] +- (HatWidthOffset1 + 0.1)                at HatHeight inward
+```
+
+Read that as a warning rather than a formula: because the outer pair already
+carries `HatWidthOffset1`, a per-node depth **recovered from the bake** at a rim
+node is `HatWidthOffset1` too far out, and feeding it back makes the rim add the
+offset twice. That is exactly what happened — a `±100` sheet regenerated at
+`[-105, 100]`. The per-node array must come from the law, not the bake; doc 13 §4b
+has the measurement and the fix.
 
 ---
 

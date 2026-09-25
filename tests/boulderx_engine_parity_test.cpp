@@ -13,6 +13,19 @@
 //   * 1,770 of them (70%) are CONCAVE
 //   * 2,070 (81%) are MeshType 1 (rounded rim), 468 are MeshType 0
 //
+// Two measurements from the same corpus that decide what is NOT tested here:
+//   * the largest amount any baked vertex rises above its own polygon's top edge
+//     is 2.04 units, and all 154 such vertices (43 submeshes) lie exactly 3.000
+//     from a convex node — the rim's corner shift, which boulderx does not
+//     implement yet. See doc 13 §7 item 1; the shift's direction is not
+//     recoverable from the shipped data alone, so no fixture asserts it.
+//     .scratch/ground_dome_probe.py is the measurement.
+//   * no ground object anywhere carries a dome. "Round hat" names the RIM, not a
+//     dome (doc 09 §4), so there is no shipped mesh to pin boulder's dome against;
+//     boulderx_test [14] pins boulder's own geometry instead. Keeping the
+//     measured absence here matters, because the obvious-looking alternative is to
+//     hunt for a fixture that does not exist.
+//
 // Where boulderx deliberately differs from the engine it is marked DEVIATION
 // and explained — never silently.
 // ============================================================================
@@ -132,14 +145,27 @@ static void fixture_beyond_graveyard_obj12() {
     check_near(lo, -110.0, 1e-3, "rim bevel reaches -110 (engine z [-110,110])");
     check_near(hi, 110.0, 1e-3, "rim bevel reaches +110 (engine z [-110,110])");
 
-    // DEVIATION: the engine writes 20 rim vertices / 14 faces for this object —
-    // it emits ring vertices only where Polygon::VertexAtIndexIsConvexCCW holds
-    // and re-uses them across samples, so its count is not a function of the
-    // node count. We sweep the cross-section at every node (6*4 = 24 vertices,
-    // 24 quads-triangles). Same cross-section geometry, same z envelope, denser
-    // tessellation; the parity test pins the geometry, not the engine's vertex
-    // elision.
-    check(mesh.surfaces[0].vertices.size() == 24, "rim: 6 profile points per node (DEVIATION)");
+    // The rim lands where the engine puts it: on every node with an edge normal
+    // within 45 degrees of +Y, and a run spans consecutive such nodes. For this
+    // quad that is node 2 (out_normal (0.01, 1.00)) and node 3, whose INCOMING
+    // edge (node 2 -> node 3) also faces +Y. This object's own bake confirms the
+    // pair — it carries rings at node 2 AND node 3 (see the deviation note below
+    // for the vertex-count difference) — so the rim is two 6-vertex
+    // cross-sections with a band swept between them.
+    check(mesh.surfaces[0].vertices.size() == 12,
+          "rim: two 6-vertex cross-sections, one per +Y-facing node");
+    check(!mesh.surfaces[0].indices.empty(),
+          "and a band, because the two rim nodes are adjacent in the ring");
+
+    // DEVIATION, and it is a real one: the shipped bake for this object carries
+    // 20 rim vertices in 14 faces, because the engine's walk does not stop at the
+    // last +Y-facing node — it emits one more ring past the run's end. Measured
+    // there: rings at node 2 AND node 3, 10 vertices each (6 profile points plus
+    // the band's landing points, whose u differs). The rule above reproduces the
+    // node-level decision on ~96% of 378 nodes over 12 cave objects and exactly
+    // on most whole objects, but the run's last ring is still unpinned; the
+    // difference is one cross-section at the run's tail, not the cross-section's
+    // geometry or the wrapping the rim used to do.
 
     const std::string bytes =
         boulderx::generate_ground_mesh_object(doc.outline, doc.params, "obj12");

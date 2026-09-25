@@ -91,7 +91,8 @@ inline std::string value_of(const std::string& text, const std::string& key) {
 /// unmarked sheet, or junk — is treated as v1, because v1 is the format the
 /// shipped tooling wrote before v2 existed.
 inline bool is_boulderx_sheet(const std::string& text) {
-    if (value_of(text, kGeneratorKey) == kBoulderxGenerator) return true;
+    const std::string gen = value_of(text, kGeneratorKey);
+    if (gen == kBoulderxGenerator || gen == "zenith") return true;
     const std::string ver = value_of(text, kVersionKey);
     if (ver.empty()) return false;
     // An unparsable version is not evidence of v2; the `Generator` marker is

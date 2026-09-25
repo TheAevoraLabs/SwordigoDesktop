@@ -22,8 +22,13 @@
 // unsupported archetype degrades to standing still rather than to nonsense.
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include "ruby/caver/char_anim.h"         // ClipBinding: the recovered controller rig
+#include "ruby/caver/char_controller.h"   // CharController: the recovered driver
+#include "ruby/caver/level_mechanics.h"   // DoorController / ElevatorController
 
 namespace caver {
 
@@ -120,6 +125,12 @@ struct HealthState {
     bool  is_ground = false;
     bool  shape_enabled = true;
     float reenable_timer = 0.0f;      // CollisionShape.SetEnabled(false) then true
+    // `DoorControllerComponent::Open()` calls `SetEnabled(false)` on every
+    // CollisionShape on the object and `Close()` re-enables them, so a door takes
+    // its own collision away while it is open. This is a lasting override, not an
+    // authored value: without it the next `tick_collision_shape` would recompute
+    // `shape_enabled` from the payload and put the collision straight back.
+    bool  shape_forced_off = false;
 };
 
 // Triggers: PressureTriggerComponent, TouchableComponent, PortalComponent,
@@ -133,13 +144,22 @@ struct TriggerState {
     float touch_radius = 0.0f;
     bool  touched = false;
 
-    // Door / elevator / breakable motion.
+    // Door / elevator / breakable motion. Both controllers are the recovered ones
+    // (see level_mechanics.h); the fields beside them are what the render side and
+    // the rest of the tick need, not a second source of truth.
     bool  open = false;
     float open_amount = 0.0f;      // 0 = closed, 1 = open (render side)
-    int   mode = 0;                // ElevatorController.Mode
+    int   mode = 0;                // ElevatorController.Mode, internal 0..2
     float elevation[3] = {0, 0, 0};// ElevatorController travel axis/axis-limit
     float travel = 0.0f;
     float travel_dir = 0.0f;
+    mechanics::DoorController      door;
+    mechanics::DoorSound           door_sound = mechanics::DoorSound::None;
+    mechanics::ElevatorController  lift;
+    bool  lift_prepared = false;   // Prepare() ran against a real shape
+    // True on the frames the elevator is driving its own object's position and
+    // velocity, so the physics step does not integrate the same velocity again.
+    bool  lift_driving = false;
 
     int   hits_taken = 0;
     int   hits_to_break = 0;
@@ -245,6 +265,16 @@ struct BehaviourState {
     CharAnimState char_anim;
     // Every KeyframeAnimation clip on the object, by name.
     std::vector<AnimClip> anim_clips;
+    // The recovered controller tree (char_anim.h) and the driver that decides
+    // which transition to fire (char_controller.h). Held out-of-line because the
+    // rig owns six nodes plus a blend tree and RuntimeObject is copied for
+    // snapshots; absent rigs are the "no CharAnimControllerComponent" case.
+    //
+    // This supersedes the hand-rolled clip choice that used to live in
+    // tick_char_animation: the clip is now whatever the engine's own three-node
+    // tree lands on, driven by the engine's own thresholds.
+    std::shared_ptr<canim::ClipBinding> anim_rig;
+    cchar::CharController char_driver;
 
     // ── physics / damage ───────────────────────────────────────────────────
     PhysicsState physics;

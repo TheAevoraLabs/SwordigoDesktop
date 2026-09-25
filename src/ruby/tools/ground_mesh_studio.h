@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
 class QLineEdit;
@@ -133,6 +134,15 @@ private slots:
     void load_from_text();
     void clear_canvas();
     void undo_canvas();
+    // Terrain relief: the canvas is 2D, so a node's depth cannot be drawn on it.
+    // Randomise gives every node its own depth inside the +/-Z fields below
+    // (boulderx::randomise_node_depths — the same generator the in-scene mesh
+    // editor uses), Clear puts the sheet back to a uniform slab.
+    void randomise_relief();
+    void clear_relief();
+    // Drops per-node relief whose vertex no longer exists, so an edit to the ring
+    // cannot pair a depth with the wrong node.
+    void sync_relief_to_polygon();
 
 
 private:
@@ -148,7 +158,19 @@ private:
     QDoubleSpinBox* m_pos_y = nullptr;     // object Position.Y
     QLineEdit*      m_name = nullptr;      // object Identifier
     QPlainTextEdit* m_points_editor = nullptr;
+    // Which generator this sheet is authored for. BoulderX writes format v2
+    // (per-node depth); Boulder writes v1, which both generators can read.
+    QComboBox*      m_generator = nullptr;
+    QDoubleSpinBox* m_relief_front = nullptr;   // max +Z magnitude for relief
+    QDoubleSpinBox* m_relief_back = nullptr;    // max -Z magnitude for relief
+    QLabel*         m_relief_status = nullptr;
+    /// Per-node relief, parallel to the canvas polygon. Empty means "uniform
+    /// slab at Min/Max depth", which is what a sheet has until you sculpt it.
+    QVector<double> m_front_z;
+    QVector<double> m_back_z;
+    uint32_t        m_relief_seed = 0;
     bool m_syncing = false;
+    bool m_relief_syncing = false;
 };
 
 } // namespace ruby::tools

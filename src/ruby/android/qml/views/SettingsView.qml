@@ -362,17 +362,21 @@ Item {
                 // Which generator rebuilds a ground mesh when a mesh edit is
                 // committed. Applies to the next regeneration, not the next
                 // launch. BoulderX is Caver-faithful (concave outlines, arcs,
-                // per-node depth) but declines shapes it cannot yet reproduce —
-                // dome hats — and falls back to Boulder for those, which the
-                // mesh-edit HUD reports.
+                // per-node depth, and boulder's dome hats) and falls back to
+                // Boulder only for a shape it cannot build at all — a degenerate
+                // outline, or one that does not triangulate — which the mesh-edit
+                // HUD reports.
                 SettingRow {
                     title: qsTr("Ground Mesh Generator")
-                    description: qsTr("Which generator rebuilds a ground mesh when you commit an edit. BoulderX is engine-faithful and falls back to Boulder for shapes it cannot yet reproduce.")
+                    description: qsTr("Which generator rebuilds a ground mesh when you commit an edit. Zypher (Gen 3) is the modern 3D procedural engine; Zenith is 2011 engine-faithful; Boulder is the legacy flat slab.")
                     leadingIcon: "cube"
                     choiceOptions: [
                         { value: "boulder", label: qsTr("Boulder") },
-                        { value: "boulderx", label: qsTr("BoulderX") }
+                        { value: "boulderx", label: qsTr("Zenith") },
+                        { value: "zypher", label: qsTr("Zypher (Gen 3)") }
                     ]
+                    // Falls back to the same generator boulderx::ground_generator()
+                    // defaults to, so a missing bridge cannot report the other one.
                     choiceValue: (typeof rubySettings !== "undefined" && rubySettings)
                                  ? rubySettings.groundGenerator : "boulder"
                     onChoiceSelected: (value) => {
@@ -498,7 +502,7 @@ Item {
                         }
 
                         Text {
-                            text: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.appVersion : "v1.1"
+                            text: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.appVersion : "v1.4"
                             font.pixelSize: Theme.dp(11)
                             color: Theme.textMuted
                         }

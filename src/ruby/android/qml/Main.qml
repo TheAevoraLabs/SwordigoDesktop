@@ -195,23 +195,33 @@ ApplicationWindow {
         var t = (fileType || "").toLowerCase()
         if (t === "scene") {
             mainStack.push(sceneViewComponent, { scenePath: path, isModel: false })
+        } else if (t === "scl" || t === "code") {
+            if (typeof androidContext !== "undefined" && androidContext && androidContext.supported) {
+                androidContext.openCodeEditor(path)
+            } else {
+                mainStack.push(codeViewComponent, { filePath: path })
+            }
         } else if (t === "texture") {
             mainStack.push(textureViewComponent, { filePath: path })
         } else if (t === "audio") {
             mainStack.push(audioViewComponent, { filePath: path })
-        } else if (t === "code") {
-            mainStack.push(codeViewComponent, { filePath: path })
         } else if (t === "model") {
             mainStack.push(sceneViewComponent, { scenePath: path, isModel: true })
         } else {
-            mainStack.push(codeViewComponent, { filePath: path })
+            if (typeof androidContext !== "undefined" && androidContext && androidContext.supported) {
+                androidContext.openCodeEditor(path)
+            } else {
+                mainStack.push(codeViewComponent, { filePath: path })
+            }
         }
     }
 
     function openFileByExtension(path) {
         var low = path.toLowerCase()
-        if (low.endsWith(".scl") || low.endsWith(".scene")) {
+        if (low.endsWith(".scene")) {
             openFileByType(path, "scene")
+        } else if (low.endsWith(".scl")) {
+            openFileByType(path, "scl")
         } else if (low.endsWith(".pvr") || low.endsWith(".tex") || low.endsWith(".png") || low.endsWith(".jpg")) {
             openFileByType(path, "texture")
         } else if (low.endsWith(".wav") || low.endsWith(".ogg") || low.endsWith(".mp3")) {
@@ -235,7 +245,11 @@ ApplicationWindow {
         SceneViewportView {
             onBackRequested: mainStack.pop()
             onOpenScriptRequested: (path) => {
-                mainStack.push(codeViewComponent, { filePath: path, fromVisual: true })
+                if (typeof androidContext !== "undefined" && androidContext && androidContext.supported) {
+                    androidContext.openCodeEditor(path)
+                } else {
+                    mainStack.push(codeViewComponent, { filePath: path, fromVisual: true })
+                }
             }
         }
     }

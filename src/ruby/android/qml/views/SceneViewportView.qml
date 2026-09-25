@@ -206,11 +206,21 @@ Item {
         onSceneLoaded: loadingDismissTimer.restart()
         onModelLoaded: loadingDismissTimer.restart()
 
+        // Single tap selects, exactly like a desktop click
+        // (Viewport3DWidget picks on click). Long press still selects and
+        // additionally names what was picked, which is useful for the small
+        // logic markers that carry no geometry of their own.
         TapHandler {
             id: viewportTap
             enabled: !viewportItem.meshEditActive
             gesturePolicy: TapHandler.WithinBounds
             longPressThreshold: 0.4
+            onTapped: {
+                var pt = viewportTap.point.position
+                var hit = viewportItem.pickObjectAt(pt.x, pt.y)
+                if (hit >= 0 && typeof screenOrientation !== "undefined" && screenOrientation)
+                    screenOrientation.vibrateTouch(18)
+            }
             onLongPressed: {
                 var pt = viewportTap.point.position
                 var hit = viewportItem.pickObjectAt(pt.x, pt.y)
@@ -295,7 +305,8 @@ Item {
             // it — every node would otherwise share one depth and the mesh would
             // read as a flat plate. This gives each node its own depth inside the
             // object's own range, without changing its thickness. Tap again for a
-            // different shape; long-press to flatten it back.
+            // different shape; long-press to go back to the object's OWN depths
+            // (the Z it shipped with, which the import recovers) — not to flat.
             Rectangle {
                 id: reliefButton
                 anchors.verticalCenter: parent.verticalCenter
@@ -319,8 +330,13 @@ Item {
                                ? Theme.textPrimary : Theme.textSecondary
                     }
                     Text {
+                        // "Vanilla Z" is the object's own per-node depth, recovered
+                        // from its baked mesh and carried through the edit; the seed
+                        // shows only once it has been replaced by a randomisation.
                         text: viewportItem.hasGroundRelief()
-                              ? qsTr("Z %1").arg(viewportItem.groundReliefSeed())
+                              ? (viewportItem.groundReliefSeed() > 0
+                                 ? qsTr("Z %1").arg(viewportItem.groundReliefSeed())
+                                 : qsTr("Vanilla Z"))
                               : qsTr("Relief")
                         font.pixelSize: Theme.dp(11)
                         font.weight: Font.Medium
@@ -936,6 +952,32 @@ Item {
                 onClicked: {
                     if (typeof screenOrientation !== "undefined" && screenOrientation)
                         screenOrientation.vibrateTouch(15)
+                    placeObjectDialog.openDialog()
+                }
+            }
+        }
+
+        Rectangle {
+            visible: viewportItem.selectedObject >= 0
+            width: Theme.dp(44)
+            height: Theme.dp(24)
+            radius: Theme.radiusSm
+            color: Theme.alpha(Theme.surface2, 0.85)
+            border.color: Theme.borderSubtle
+            border.width: 1
+
+            Text {
+                anchors.centerIn: parent
+                text: qsTr("Clone")
+                font.pixelSize: Theme.dp(10)
+                font.weight: Font.DemiBold
+                color: Theme.textPrimary
+            }
+            MouseArea {
+                anchors.fill: parent
+                onClicked: {
+                    if (typeof screenOrientation !== "undefined" && screenOrientation)
+                        screenOrientation.vibrateTouch(15)
                     viewportItem.placeCurrentObject()
                 }
             }
@@ -1524,8 +1566,10 @@ Item {
         onObjectVisibilityToggled: (i) => viewportItem.toggleObjectVisibility(i)
         onObjectFocusRequested: (i) => viewportItem.focusObject(i)
         onObjectDeleteRequested: (i) => viewportItem.deleteObject(i)
-        onObjectDuplicateRequested: (i) => viewportItem.duplicateObject(i)
-        onAddObjectRequested: viewportItem.addObject()
+        onAddObjectRequested: {
+            root.outlinerOpen = false
+            placeObjectDialog.openDialog()
+        }
     }
 
     // Scrim behind whichever dock is open, so the 3D scene stays visible but
@@ -1642,6 +1686,17 @@ Item {
                 onClicked: {
                     viewportItem.focusObject(viewportItem.selectedObject)
                     viewportMenu.close()
+                }
+            }
+
+            MenuRow {
+                width: parent.width
+                visible: !root.isModel
+                iconName: "plus"
+                text: qsTr("Place / Import object...")
+                onClicked: {
+                    viewportMenu.close()
+                    placeObjectDialog.openDialog()
                 }
             }
 
@@ -1977,6 +2032,20 @@ Item {
                     }
                 }
             }
+        }
+    }
+
+    // ── Place / Import Object Dialog ─────────────────────────────────────────
+    PlaceObjectDialog {
+        id: placeObjectDialog
+        viewportItem: viewportItem
+        onObjectImported: (name, type) => {
+            if (typeof screenOrientation !== "undefined" && screenOrientation)
+                screenOrientation.vibrateTouch(25)
+            if (viewportItem.selectedObject >= 0) {
+                viewportItem.focusObject(viewportItem.selectedObject)
+            }
+            root.showToast(qsTr("Placed %1 (%2)").arg(name).arg(type), false)
         }
     }
 

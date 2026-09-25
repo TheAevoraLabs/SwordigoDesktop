@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="in.aevora.ruby"
-    android:versionCode="4"
-    android:versionName="1.3">
+    android:versionCode="5"
+    android:versionName="1.4">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
 
@@ -69,6 +69,16 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
             android:exported="false"
+            android:hardwareAccelerated="true" />
+
+        <activity
+            android:name="in.aevora.ruby.CodeEditorActivity"
+            android:label="Ruby Code Studio"
+            android:screenOrientation="unspecified"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboard|keyboardHidden"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@android:style/Theme.NoTitleBar"
+            android:exported="true"
             android:hardwareAccelerated="true" />
     </application>
 

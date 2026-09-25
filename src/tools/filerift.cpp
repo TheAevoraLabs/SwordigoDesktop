@@ -1511,10 +1511,42 @@ static std::string recode_message(const std::vector<MarkupToken>& tokens, size_t
             } else throw std::runtime_error("FileRift line " + std::to_string(tag_token.line) + ": missing closing brace for " + tagname);
             writer.write_bytes_field(f_num, sub_bytes);
         } else if (!val_tok.empty() && (val_tok.front() == '\'' || val_tok.front() == '"')) {
-            if (w_type != proto::WIRE_LEN)
-                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": tag '" + tagname + "' does not accept a string");
             std::string unescaped = unescape_bytes(val_tok);
-            writer.write_bytes_field(f_num, unescaped);
+            if (w_type == proto::WIRE_LEN) {
+                writer.write_bytes_field(f_num, unescaped);
+            } else if (w_type == proto::WIRE_VARINT) {
+                // If a varint field was decoded as string (e.g. wire type LEN in binary) or given string digits
+                if (unescaped.empty()) {
+                    writer.write_varint_field(f_num, 0);
+                } else if (std::all_of(unescaped.begin(), unescaped.end(), [](char c) { return std::isdigit(static_cast<unsigned char>(c)); })) {
+                    writer.write_varint_field(f_num, std::stoull(unescaped));
+                } else {
+                    // Fallback to writing as bytes so data is preserved without throwing
+                    writer.write_bytes_field(f_num, unescaped);
+                }
+            } else if (w_type == proto::WIRE_I32) {
+                if (unescaped.empty()) {
+                    writer.write_float_field(f_num, 0.0f);
+                } else {
+                    try {
+                        writer.write_float_field(f_num, std::stof(unescaped));
+                    } catch (...) {
+                        writer.write_bytes_field(f_num, unescaped);
+                    }
+                }
+            } else if (w_type == proto::WIRE_I64) {
+                if (unescaped.empty()) {
+                    writer.write_double_field(f_num, 0.0);
+                } else {
+                    try {
+                        writer.write_double_field(f_num, std::stod(unescaped));
+                    } catch (...) {
+                        writer.write_bytes_field(f_num, unescaped);
+                    }
+                }
+            } else {
+                writer.write_bytes_field(f_num, unescaped);
+            }
             idx++;
         } else if (val_tok == "$") {
             if (w_type != proto::WIRE_LEN)
@@ -1555,7 +1587,8 @@ static std::string recode_message(const std::vector<MarkupToken>& tokens, size_t
             } else if (w_type == proto::WIRE_I64) {
                 writer.write_double_field(f_num, parse_real(val_token));
             } else {
-                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": expected quoted string for " + tagname);
+                // If schema says WIRE_LEN but a bare number was passed, write it as a string
+                writer.write_bytes_field(f_num, val_tok);
             }
             idx++;
         }

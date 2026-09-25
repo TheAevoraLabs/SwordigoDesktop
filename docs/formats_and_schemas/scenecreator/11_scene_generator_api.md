@@ -36,7 +36,10 @@ struct Hat {
     float height = 40.0f;          // game default range: 20–40
 };
 ```
-Maps to `Caver::InsertRoundHatVertices` / `InsertCapForRoundHat`.
+An authoring-side dome (see doc 12 §4): it is emitted as an extra `SurfaceMesh`
+by boulder and by BoulderX. It does **not** map to `Caver::InsertRoundHatVertices`
+/ `InsertCapForRoundHat` — those are the rounded rim of a MeshType 1 slab
+(doc 09 §4).
 
 ### `Water` — fluid sheet (WaterMeshComponent)
 ```cpp

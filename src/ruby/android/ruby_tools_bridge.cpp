@@ -6,12 +6,20 @@
 #include "tools/fbx_import.h"
 #include "tools/obj_loader.h"
 #include "tools/boulder.h"
+#include "tools/boulderx.h"
+#include "tools/swdm_format.h"
+#include "tools/scene_creator.h"
+#include "tools/scene_generator.h"
+#include "tools/scene_generator_v2.h"
+#include "tools/scene_generator_v2_3d.h"
+#include "tools/scene_generator_v3.h"
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
 #include <QThread>
 #include <algorithm>
+#include <cmath>
 
 namespace ruby::android {
 
@@ -367,6 +375,356 @@ bool RubyToolsBridge::exportSwdm(const QString& filePath, const QVariantList& po
     m_lastStatus = QStringLiteral("Exported Ground Mesh to %1").arg(filePath);
     emit statusChanged();
     return true;
+}
+
+namespace {
+
+// `points` entries are {x, y} with optional per-node {front, back} depths.
+// Missing depths fall back to the sheet's scalar pair, which is how a sheet that
+// was never given relief (or a legacy file) becomes a uniform slab.
+std::vector<boulderx::Node> outline_from_points(const QVariantList& points,
+                                                double scalar_front, double scalar_back) {
+    std::vector<boulderx::Node> outline;
+    outline.reserve(points.size());
+    for (const auto& item : points) {
+        const QVariantMap map = item.toMap();
+        boulderx::Node n;
+        n.x = map.value(QStringLiteral("x"), 0.0).toDouble();
+        n.y = map.value(QStringLiteral("y"), 0.0).toDouble();
+        n.front_depth = map.contains(QStringLiteral("front"))
+                            ? map.value(QStringLiteral("front")).toDouble()
+                            : scalar_front;
+        n.back_depth = map.contains(QStringLiteral("back"))
+                           ? map.value(QStringLiteral("back")).toDouble()
+                           : scalar_back;
+        outline.push_back(n);
+    }
+    return outline;
+}
+
+bool outline_has_relief(const std::vector<boulderx::Node>& outline) {
+    if (outline.empty()) return false;
+    for (const auto& n : outline) {
+        if (std::fabs(n.front_depth - outline[0].front_depth) > 1e-6 ||
+            std::fabs(n.back_depth - outline[0].back_depth) > 1e-6)
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
+QVariantMap RubyToolsBridge::exportGroundMeshSheet(const QVariantMap& sheet) {
+    QVariantMap res;
+    res[QStringLiteral("ok")] = false;
+    res[QStringLiteral("path")] = sheet.value(QStringLiteral("path"));
+    res[QStringLiteral("generator")] = QStringLiteral("boulder");
+
+    const QVariantList points = sheet.value(QStringLiteral("points")).toList();
+    if (points.size() < 3) {
+        res[QStringLiteral("message")] = QStringLiteral("A sheet needs at least 3 vertices");
+        return res;
+    }
+
+    const double min_depth = sheet.value(QStringLiteral("minDepth"), -45.0).toDouble();
+    const double max_depth = sheet.value(QStringLiteral("maxDepth"), 45.0).toDouble();
+    const double front = std::max(min_depth, max_depth);
+    const double back = std::min(min_depth, max_depth);
+    const std::string top_tex =
+        sheet.value(QStringLiteral("topTexture"), "fire_grass").toString().toStdString();
+    const std::string front_tex =
+        sheet.value(QStringLiteral("frontTexture"), "graveyard_ground").toString().toStdString();
+    const std::string identifier =
+        sheet.value(QStringLiteral("identifier"), "ground").toString().toStdString();
+
+    const std::vector<boulderx::Node> outline = outline_from_points(points, front, back);
+    const bool relief = outline_has_relief(outline);
+    const bool want_boulderx =
+        sheet.value(QStringLiteral("generator"), QStringLiteral("boulder")).toString()
+            == QStringLiteral("boulderx") ||
+        boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX;
+
+    // Dome hats are not drawable on a 2D canvas, so the list the sheet came in
+    // with is carried straight back out. Dropping it would delete domes from a
+    // level the moment someone opened and re-exported its ground sheet — the
+    // silent-loss failure mode this format's dialect gate exists to prevent.
+    std::vector<boulderx::Hat> hats;
+    const QVariantList dome_hats = sheet.value(QStringLiteral("domeHats")).toList();
+    for (const QVariant& entry : dome_hats) {
+        const QVariantMap hm = entry.toMap();
+        boulderx::Hat h;
+        h.x = hm.value(QStringLiteral("x")).toDouble();
+        h.y = hm.value(QStringLiteral("y")).toDouble();
+        h.radius = hm.value(QStringLiteral("radius"), 60.0).toDouble();
+        h.height = hm.value(QStringLiteral("height"), 40.0).toDouble();
+        if (h.radius > 0.0 && h.height > 0.0) hats.push_back(h);   // degenerate: no geometry
+    }
+
+    // Dialect: per-node depth can only be written by boulderx (v2). A uniform
+    // sheet in Boulder mode stays v1 so every generator and every other tool can
+    // still read it.
+    std::string text;
+    const bool write_v2 = relief || want_boulderx;
+    if (write_v2) {
+        boulderx::SwdmDocument doc;
+        doc.identifier = identifier;
+        doc.outline = outline;
+        doc.hats = hats;
+        doc.params.mesh_type = sheet.value(QStringLiteral("meshType"), 1).toInt();
+        doc.params.surface_width = sheet.value(QStringLiteral("surfaceWidth"), 80.0).toDouble();
+        doc.params.horiz_noise = sheet.value(QStringLiteral("horizNoise"), 0.0).toDouble();
+        doc.params.random_seed = uint32_t(
+            sheet.value(QStringLiteral("randomSeed"), 1291618994).toUInt());
+        doc.params.surface_texture = top_tex;
+        doc.params.front_texture = front_tex;
+        text = boulderx::serialize_swdm(doc);
+        res[QStringLiteral("generator")] = QStringLiteral("boulderx");
+    } else {
+        boulder::GroundMesh gm;
+        for (const auto& p : outline) gm.polygon.push_back({p.x, p.y});
+        boulder::ensure_ccw(gm.polygon);
+        gm.min_depth = back;
+        gm.max_depth = front;
+        gm.surface_width = sheet.value(QStringLiteral("surfaceWidth"), 80.0).toDouble();
+        gm.top_texture = top_tex;
+        gm.bottom_texture = front_tex;
+        gm.z = sheet.value(QStringLiteral("z"), 0.0).toDouble();
+        for (const auto& h : hats) gm.hats.push_back({h.x, h.y, h.radius, h.height});
+        text = boulder::serialize_swdm(gm);
+    }
+
+    const QString path = sheet.value(QStringLiteral("path")).toString();
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        res[QStringLiteral("message")] =
+            QStringLiteral("Could not write %1").arg(path);
+        m_lastStatus = res[QStringLiteral("message")].toString();
+        emit statusChanged();
+        return res;
+    }
+    file.write(text.c_str(), qint64(text.size()));
+    file.close();
+
+    res[QStringLiteral("ok")] = true;
+    res[QStringLiteral("message")] = write_v2
+        ? QStringLiteral("Exported Zenith sheet (per-node Z) → %1").arg(path)
+        : QStringLiteral("Exported sheet → %1").arg(path);
+    m_lastStatus = res[QStringLiteral("message")].toString();
+    emit statusChanged();
+    return res;
+}
+
+QVariantMap RubyToolsBridge::importGroundMeshSheet(const QString& filePath) {
+    QVariantMap res;
+    res[QStringLiteral("ok")] = false;
+    res[QStringLiteral("dialect")] = QStringLiteral("boulder");
+
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        res[QStringLiteral("message")] = QStringLiteral("Cannot open %1").arg(filePath);
+        return res;
+    }
+    const QByteArray raw = file.readAll();
+    file.close();
+    const std::string text(raw.constData(), size_t(raw.size()));
+
+    // boulderx::parse_swdm reads BOTH dialects, so an older boulder sheet opens
+    // here (upgraded to a uniform slab) and a BoulderX sheet keeps its relief.
+    boulderx::SwdmDocument doc;
+    if (!boulderx::parse_swdm(text, doc)) {
+        res[QStringLiteral("message")] = QStringLiteral("Not a usable ground mesh sheet: %1")
+                                             .arg(filePath);
+        return res;
+    }
+
+    QVariantList points;
+    for (const auto& n : doc.outline) {
+        QVariantMap p;
+        p[QStringLiteral("x")] = n.x;
+        p[QStringLiteral("y")] = n.y;
+        p[QStringLiteral("front")] = n.front_depth;
+        p[QStringLiteral("back")] = n.back_depth;
+        points.append(p);
+    }
+
+    double front = doc.outline.front().front_depth;
+    double back = doc.outline.front().back_depth;
+    for (const auto& n : doc.outline) {
+        front = std::max(front, n.front_depth);
+        back = std::min(back, n.back_depth);
+    }
+
+    res[QStringLiteral("ok")] = true;
+    res[QStringLiteral("dialect")] = doc.from_boulder_dialect ? QStringLiteral("boulder")
+                                                             : QStringLiteral("boulderx");
+    res[QStringLiteral("points")] = points;
+    res[QStringLiteral("minDepth")] = back;
+    res[QStringLiteral("maxDepth")] = front;
+    res[QStringLiteral("surfaceWidth")] = doc.params.surface_width;
+    res[QStringLiteral("meshType")] = doc.params.mesh_type;
+    res[QStringLiteral("randomSeed")] = double(doc.params.random_seed);
+    QVariantList dome_hats;
+    for (const auto& h : doc.hats) {
+        QVariantMap hm;
+        hm[QStringLiteral("x")] = h.x;
+        hm[QStringLiteral("y")] = h.y;
+        hm[QStringLiteral("radius")] = h.radius;
+        hm[QStringLiteral("height")] = h.height;
+        dome_hats.append(hm);
+    }
+    res[QStringLiteral("domeHats")] = dome_hats;
+    res[QStringLiteral("hasDomeHats")] = !doc.hats.empty();
+    res[QStringLiteral("domeHatCount")] = int(doc.hats.size());
+    res[QStringLiteral("topTexture")] = QString::fromStdString(doc.params.surface_texture);
+    res[QStringLiteral("frontTexture")] = QString::fromStdString(doc.params.front_texture);
+    res[QStringLiteral("identifier")] = QString::fromStdString(doc.identifier);
+    res[QStringLiteral("message")] = doc.from_boulder_dialect
+        ? QStringLiteral("Loaded a Boulder sheet (uniform Z) → %1").arg(filePath)
+        : QStringLiteral("Loaded a Zenith sheet (per-node Z) → %1").arg(filePath);
+    if (!doc.hats.empty()) {
+        res[QStringLiteral("message")] = res[QStringLiteral("message")].toString() +
+            QStringLiteral(" — %1 dome hat(s) preserved").arg(doc.hats.size());
+    }
+    return res;
+}
+
+QVariantList RubyToolsBridge::randomiseTerrainRelief(const QVariantList& points,
+                                                    double frontMax, double backMax,
+                                                    int seed) {
+    std::vector<boulderx::Node> outline = outline_from_points(points, frontMax, -std::fabs(backMax));
+
+    // The seed comes from the UI so the number it displays is the one that
+    // reproduces this terrain; the generator is deterministic in it.
+    boulderx::randomise_node_depths(outline, std::fabs(frontMax), std::fabs(backMax),
+                                    seed > 0 ? uint32_t(seed) : 1u);
+
+    QVariantList out;
+    for (const auto& n : outline) {
+        QVariantMap p;
+        p[QStringLiteral("x")] = n.x;
+        p[QStringLiteral("y")] = n.y;
+        p[QStringLiteral("front")] = n.front_depth;
+        p[QStringLiteral("back")] = n.back_depth;
+        out.append(p);
+    }
+    return out;
+}
+
+QVariantMap RubyToolsBridge::generateScene(const QVariantMap& options) {
+    QVariantMap res;
+    res[QStringLiteral("ok")] = false;
+
+    int family = options.value(QStringLiteral("family"), 3).toInt();
+    QString outPath = options.value(QStringLiteral("outputPath")).toString().trimmed();
+    QString sceneName = options.value(QStringLiteral("sceneName"), QStringLiteral("procedural")).toString().trimmed();
+    if (sceneName.isEmpty()) sceneName = QStringLiteral("procedural");
+
+    if (outPath.isEmpty()) {
+        outPath = QStringLiteral("/storage/emulated/0/") + sceneName + QStringLiteral(".scene");
+    } else if (!outPath.endsWith(QStringLiteral(".scene"))) {
+        outPath += QStringLiteral("/") + sceneName + QStringLiteral(".scene");
+    }
+
+    if (family == 0) {
+        // Scene Creator
+        scenecreate::Options o;
+        o.output_path = outPath.toStdString();
+        o.level_name = sceneName.toStdString();
+        o.scene_template = static_cast<scenecreate::SceneTemplate>(options.value(QStringLiteral("templateIndex"), 1).toInt());
+        o.ground_top_texture = options.value(QStringLiteral("groundTopTexture"), QStringLiteral("fire_grass")).toString().toStdString();
+        o.ground_side_texture = options.value(QStringLiteral("groundSideTexture"), QStringLiteral("graveyard_ground")).toString().toStdString();
+        o.background = options.value(QStringLiteral("background"), QStringLiteral("")).toString().toStdString();
+        o.platform_width = float(options.value(QStringLiteral("width"), 320.0).toDouble());
+        o.platform_height = float(options.value(QStringLiteral("height"), 48.0).toDouble());
+        o.platform_depth = float(options.value(QStringLiteral("depth"), 90.0).toDouble());
+        o.spawn_x = float(options.value(QStringLiteral("spawnX"), 0.0).toDouble());
+        o.spawn_y = float(options.value(QStringLiteral("spawnY"), 56.0).toDouble());
+
+        scenecreate::Result r;
+        std::string err;
+        bool ok = scenecreate::create(o, r, err);
+        if (!ok) {
+            m_lastStatus = QStringLiteral("Scene Creator failed: ") + QString::fromStdString(err);
+            emit statusChanged();
+            res[QStringLiteral("error")] = QString::fromStdString(err);
+            return res;
+        }
+        m_lastStatus = QStringLiteral("Scene Creator wrote %1 objects -> %2")
+            .arg(r.object_count).arg(outPath);
+        emit statusChanged();
+        res[QStringLiteral("ok")] = true;
+        res[QStringLiteral("outputPath")] = outPath;
+        res[QStringLiteral("objects")] = r.object_count;
+        return res;
+    }
+
+    // Procedural generators (V1, V2, V3, V3-DB, V2-3D)
+    sgen::TerrainOptions o;
+    o.biome = static_cast<sgen::Biome>(options.value(QStringLiteral("biome"), 0).toInt());
+    o.seed = uint32_t(options.value(QStringLiteral("seed"), 12345).toUInt());
+    o.scene_name = sceneName.toStdString();
+    o.width = float(options.value(QStringLiteral("width"), 2400.0).toDouble());
+    o.height = float(options.value(QStringLiteral("height"), 900.0).toDouble());
+    o.platform_count = options.value(QStringLiteral("platformCount"), 6).toInt();
+    o.octaves = options.value(QStringLiteral("octaves"), 4).toInt();
+    o.roughness = float(options.value(QStringLiteral("roughness"), 1.0).toDouble());
+    o.deco_density = float(options.value(QStringLiteral("decoDensity"), 1.0).toDouble());
+    o.add_water = options.value(QStringLiteral("addWater"), true).toBool();
+    o.spill_torches = options.value(QStringLiteral("spillTorches"), true).toBool();
+    o.mountains = options.value(QStringLiteral("mountains"), false).toBool();
+    o.islands = options.value(QStringLiteral("islands"), false).toBool();
+    o.add_portal = options.value(QStringLiteral("addPortal"), false).toBool();
+    o.portal_destination = options.value(QStringLiteral("portalDestination"), QStringLiteral("next_level")).toString().toStdString();
+
+    sgen::Result r;
+    if (family == 1) {
+        r = sgen::generate_biome_scene(o);
+    } else if (family == 2) {
+        sgen::v2::TerrainOptionsV2 x;
+        static_cast<sgen::TerrainOptions&>(x) = o;
+        x.bg_layers = options.value(QStringLiteral("bgLayers"), 2).toInt();
+        x.add_overhangs = options.value(QStringLiteral("addOverhangs"), false).toBool();
+        x.add_terracing = options.value(QStringLiteral("addTerracing"), false).toBool();
+        r = sgen::v2::generate_biome_scene_v2(x);
+    } else if (family == 3 || family == 4) {
+        r = sgen::v3::generate_biome_scene_v3(o);
+    } else {
+        sgen::v2_3d::TerrainOptions3D x;
+        static_cast<sgen::TerrainOptions&>(x) = o;
+        x.blocky = options.value(QStringLiteral("blocky"), false).toBool();
+        x.add_caves = options.value(QStringLiteral("addCaves"), true).toBool();
+        x.sky_islands = options.value(QStringLiteral("skyIslands"), true).toBool();
+        r = sgen::v2_3d::generate_biome_scene_v2_3d(x);
+    }
+
+    if (!r.ok()) {
+        m_lastStatus = QStringLiteral("Generation failed: ") + QString::fromStdString(r.error);
+        emit statusChanged();
+        res[QStringLiteral("error")] = QString::fromStdString(r.error);
+        return res;
+    }
+
+    QFileInfo fi(outPath);
+    fi.dir().mkpath(QStringLiteral("."));
+    QFile f(outPath);
+    if (!f.open(QIODevice::WriteOnly)) {
+        m_lastStatus = QStringLiteral("Could not write ") + outPath;
+        emit statusChanged();
+        res[QStringLiteral("error")] = QStringLiteral("Failed to open file for writing");
+        return res;
+    }
+    f.write(r.scene_bytes.data(), qint64(r.scene_bytes.size()));
+    f.close();
+
+    m_lastStatus = QStringLiteral("Generated %1 objects (%2 KB) -> %3")
+        .arg(int(r.objects)).arg(int(r.scene_bytes.size() / 1024)).arg(outPath);
+    emit statusChanged();
+
+    res[QStringLiteral("ok")] = true;
+    res[QStringLiteral("outputPath")] = outPath;
+    res[QStringLiteral("objects")] = int(r.objects);
+    res[QStringLiteral("bytes")] = int(r.scene_bytes.size());
+    return res;
 }
 
 } // namespace ruby::android

@@ -750,7 +750,8 @@ bool RubyFileModel::startSceneInGame(const QString& scenePath) {
 QString RubyFileModel::detectFileType(const QFileInfo& fi) {
     if (fi.isDir()) return QStringLiteral("dir");
     QString ext = fi.suffix().toLower();
-    if (ext == QStringLiteral("scl") || ext == QStringLiteral("scene")) return QStringLiteral("scene");
+    if (ext == QStringLiteral("scene")) return QStringLiteral("scene");
+    if (ext == QStringLiteral("scl"))   return QStringLiteral("scl");
     if (ext == QStringLiteral("pod") || ext == QStringLiteral("glb") || ext == QStringLiteral("fbx") || ext == QStringLiteral("obj")) return QStringLiteral("model");
     if (ext == QStringLiteral("pvr") || ext == QStringLiteral("tex") || ext == QStringLiteral("png") || ext == QStringLiteral("jpg") || ext == QStringLiteral("jpeg")) return QStringLiteral("texture");
     if (ext == QStringLiteral("wav") || ext == QStringLiteral("ogg") || ext == QStringLiteral("mp3")) return QStringLiteral("audio");

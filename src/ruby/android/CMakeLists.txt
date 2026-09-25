@@ -63,6 +63,7 @@ set(RUBY_MOBILE_SOURCES
     ${SRC_DIR}/tools/filerift.cpp
     ${SRC_DIR}/tools/boulder.cpp
     ${SRC_DIR}/tools/boulderx.cpp
+    ${SRC_DIR}/tools/roller.cpp
     ${SRC_DIR}/tools/rubymesh.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/av_math_stubs.cpp
     ${SRC_DIR}/tools/scene_asset_resolver.cpp
@@ -74,6 +75,11 @@ set(RUBY_MOBILE_SOURCES
     ${SRC_DIR}/tools/scene_lua.cpp
     ${SRC_DIR}/tools/scene_game.cpp
     ${SRC_DIR}/tools/scene_creator.cpp
+    ${SRC_DIR}/tools/scene_generator.cpp
+    ${SRC_DIR}/tools/scene_generator_v2.cpp
+    ${SRC_DIR}/tools/scene_generator_v2_3d.cpp
+    ${SRC_DIR}/tools/scene_generator_v3.cpp
+    ${SRC_DIR}/tools/scene_v3_db.cpp
     ${SRC_DIR}/tools/scene_program.cpp
     ${SRC_DIR}/tools/obj_loader.cpp
     ${SRC_DIR}/tools/ani_loader.cpp

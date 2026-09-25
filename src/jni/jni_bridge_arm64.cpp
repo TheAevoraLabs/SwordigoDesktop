@@ -17,6 +17,7 @@ extern "C" uint64_t sre_resolve_address(const char* symbol);
 extern "C" const char* sre_resolve_symbol(uint64_t addr);
 
 #include "jni/gl_render_state.h"  // GL state handshake — bridge writes, FBO reads
+#include "platform/ffp_forward.h"  // forward per-fragment lighting for the fixed-function (api==0) path
 #include "platform/i_emulator_arm64.h"
 #include "platform/emulator_arm64.h"  // For backward compat — EmulatorArm64 inherits IEmulatorArm64
 #include "platform/io_thread.h"
@@ -6034,6 +6035,10 @@ static void bridge_glFogf(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glFogf(pname, param);
+    // ── Forward-lighting handshake ────────────────────────────────────────
+    // Binding a shader bypasses GL_FOG entirely, so the guest's fog must be
+    // reproduced by the shader. Mirror the parameters here.
+    ffp::note_fogf(pname, param);
 }
 
 static void bridge_glFogfv(void* emu_ptr) {
@@ -6051,10 +6056,14 @@ static void bridge_glFogfv(void* emu_ptr) {
         return;
     }
 #endif
-    if (g_display_active && params_ptr != 0) {
+    if (params_ptr != 0) {
         float params[4];
         memcpy(params, memory + params_ptr, 16);
-        glFogfv(pname, params);
+        if (g_display_active) glFogfv(pname, params);
+        // A translated draw never goes through GL_FOG (it is replaced by our
+        // shader), so the fog state has to reach the layer regardless of
+        // whether a real GL context is presenting.
+        ffp::note_fogfv(pname, params);
     }
 }
 
@@ -6069,6 +6078,7 @@ static void bridge_glFogi(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glFogi(pname, param);
+    ffp::note_fogi(pname, param);
 }
 // --- Lighting ---
 static void bridge_glLightf(void* emu_ptr) {
@@ -6091,6 +6101,11 @@ static void bridge_glLightf(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glLightf(light, pname, param);
+    // ── Translation-layer handshake: attenuation + spotlight scalars ────────
+    // Caver::LightComponent::Enable sets the linear attenuation term from the
+    // component's range, and the shader needs the whole triple.
+    if (light >= GL_LIGHT0 && light <= GL_LIGHT7)
+        ffp::note_lightf((int)(light - GL_LIGHT0), pname, param);
 }
 
 static void bridge_glLightfv(void* emu_ptr) {
@@ -6119,22 +6134,29 @@ static void bridge_glLightfv(void* emu_ptr) {
         return;
     }
 #endif
-    if (g_display_active && params_ptr != 0) {
-        float params[4];
-        memcpy(params, memory + params_ptr, 16);
-        glLightfv(light, pname, params);
+    if (params_ptr == 0) return;
+    float params[4];
+    memcpy(params, memory + params_ptr, 16);
+    if (g_display_active) glLightfv(light, pname, params);
 
-        // ── Handshake: capture light state for FBO shaders ────────────────
-        int li = (int)(light - GL_LIGHT0);
-        if (li >= 0 && li < 8) {
-            switch (pname) {
-                case GL_POSITION: memcpy(g_frame_lights[li].position, params, 16); break;
-                case GL_AMBIENT:  memcpy(g_frame_lights[li].ambient,  params, 16); break;
-                case GL_DIFFUSE:  memcpy(g_frame_lights[li].diffuse,  params, 16); break;
-                case GL_SPECULAR: memcpy(g_frame_lights[li].specular, params, 16); break;
-                default: break;
-            }
-        }
+    int li = (int)(light - GL_LIGHT0);
+    if (li < 0 || li >= 8) return;
+
+    // ── Translation-layer handshake ───────────────────────────────────────
+    // GL_POSITION and GL_SPOT_DIRECTION are transformed into EYE space with the
+    // modelview that is current *now* — which is exactly what the
+    // fixed-function pipeline lights with, so the transcoder can reproduce it.
+    ffp::note_lightfv(li, pname, params);
+
+    // Mirror the same values into the FBO postfx handshake.
+    switch (pname) {
+        case GL_POSITION:
+            if (g_display_active) glGetLightfv(light, GL_POSITION, g_frame_lights[li].position);
+            break;
+        case GL_AMBIENT:  memcpy(g_frame_lights[li].ambient,  params, 16); break;
+        case GL_DIFFUSE:  memcpy(g_frame_lights[li].diffuse,  params, 16); break;
+        case GL_SPECULAR: memcpy(g_frame_lights[li].specular, params, 16); break;
+        default: break;
     }
 }
 
@@ -6150,6 +6172,7 @@ static void bridge_glLightModelf(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glLightModelf(pname, param);
+    ffp::note_light_model_f(pname, param);
 }
 
 static void bridge_glLightModelfv(void* emu_ptr) {
@@ -6167,14 +6190,15 @@ static void bridge_glLightModelfv(void* emu_ptr) {
         return;
     }
 #endif
-    if (g_display_active && params_ptr != 0) {
+    if (params_ptr != 0) {
         float params[4];
         memcpy(params, memory + params_ptr, 16);
-        glLightModelfv(pname, params);
+        if (g_display_active) glLightModelfv(pname, params);
 
         // ── Handshake: capture global ambient for FBO shaders ─────────────
         if (pname == GL_LIGHT_MODEL_AMBIENT)
             memcpy(g_frame_light_model_ambient, params, 16);
+        ffp::note_light_model_fv(pname, params);
     }
 }
 
@@ -6192,6 +6216,7 @@ static void bridge_glMaterialf(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glMaterialf(face, pname, param);
+    ffp::note_materialf(face, pname, param);
 }
 
 static void bridge_glMaterialfv(void* emu_ptr) {
@@ -6221,23 +6246,45 @@ static void bridge_glMaterialfv(void* emu_ptr) {
         return;
     }
 #endif
-    if (g_display_active && params_ptr != 0) {
+    if (params_ptr == 0) return;
+    {
         float params[4];
         memcpy(params, memory + params_ptr, 16);
-        glMaterialfv(face, pname, params);
+        if (g_display_active) glMaterialfv(face, pname, params);
 
         // ── Handshake: capture material state for FBO shaders ─────────────
-        // We track front-face materials only (Swordigo uses GL_FRONT).
+        // We track front-face materials only (Swordigo uses GL_FRONT /
+        // GL_FRONT_AND_BACK).
         if (face == GL_FRONT || face == GL_FRONT_AND_BACK) {
             switch (pname) {
                 case GL_AMBIENT:  memcpy(g_frame_material.ambient,  params, 16); break;
                 case GL_DIFFUSE:  memcpy(g_frame_material.diffuse,  params, 16); break;
                 case GL_SPECULAR: memcpy(g_frame_material.specular, params, 16); break;
                 case GL_EMISSION: memcpy(g_frame_material.emission, params, 16); break;
+                // GroundMeshComponent::Draw (arm64_13 0x3A5294) sets
+                // GL_AMBIENT_AND_DIFFUSE, which the per-face switch above drops
+                // — a forward shader would light terrain with a stale material.
+                case GL_AMBIENT_AND_DIFFUSE:
+                    memcpy(g_frame_material.ambient,  params, 16);
+                    memcpy(g_frame_material.diffuse,  params, 16);
+                    break;
                 default: break;
             }
         }
+        // Mirror into the forward-light ng pass (same rules, GL defaults for
+        // fields the guest never sets).
+        ffp::note_materialfv(face, pname, params);
     }
+}
+
+// glColorMaterial(GLenum face, GLenum mode) — selects which material fields
+// track the current colour while GL_COLOR_MATERIAL is enabled.
+static void bridge_glColorMaterial(void* emu_ptr) {
+    IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
+    GLenum face = (GLenum)emu->get_reg(0);
+    GLenum mode = (GLenum)emu->get_reg(1);
+    if (g_display_active) glColorMaterial(face, mode);
+    ffp::note_color_material_mode(face, mode);
 }
 
 // --- Vertex Color ---
@@ -6257,6 +6304,8 @@ static void bridge_glColor4ub(void* emu_ptr) {
     // ── Handshake: track current color (normalised) ───────────────────────
     g_current_color[0] = r / 255.0f; g_current_color[1] = g / 255.0f;
     g_current_color[2] = b / 255.0f; g_current_color[3] = a / 255.0f;
+    ffp::note_color4(g_current_color[0], g_current_color[1],
+                     g_current_color[2], g_current_color[3]);
 }
 
 // --- Texture Environment ---
@@ -6274,6 +6323,11 @@ static void bridge_glTexEnvi(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glTexEnvi(target, pname, param);
+    // ── Forward-lighting handshake: texture env combine mode ──────────────
+    if (pname == GL_TEXTURE_ENV_MODE) {
+        g_frame_texenv_mode = param;
+        ffp::note_texenv(pname, param, nullptr);
+    }
 }
 
 static void bridge_glTexEnvfv(void* emu_ptr) {
@@ -6293,10 +6347,11 @@ static void bridge_glTexEnvfv(void* emu_ptr) {
         return;
     }
 #endif
-    if (g_display_active && params_ptr != 0) {
+    if (params_ptr != 0) {
         float params[4];
         memcpy(params, memory + params_ptr, 16);
-        glTexEnvfv(target, pname, params);
+        if (g_display_active) glTexEnvfv(target, pname, params);
+        ffp::note_texenv(pname, 0, params);   // GL_TEXTURE_ENV_COLOR
     }
 }
 
@@ -6337,6 +6392,7 @@ static void bridge_glPointSize(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glPointSize(size);
+    ffp::note_point_size(size);
 }
 
 // --- Stencil (needed for shadows/water reflections) ---
@@ -6484,6 +6540,7 @@ static void bridge_gl_matrix_mode(void* emu_ptr) {
     IEmulatorArm64* emu = (IEmulatorArm64*)emu_ptr;
     g_frame_stats.matrix_ops++;
     g_current_matrix_mode = (GLenum)emu->get_reg(0);
+    ffp::note_matrix_mode((int)emu->get_reg(0));
     GL_DIAG("glMatrixMode(0x%x) %s", emu->get_reg(0), emu->get_reg(0)==0x1701?"PROJECTION":emu->get_reg(0)==0x1700?"MODELVIEW":"OTHER");
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
@@ -6507,6 +6564,7 @@ static void bridge_gl_load_identity(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glLoadIdentity();
+    ffp::note_load_identity();
 
     // ── Handshake: reset matrix shadow to identity ─────────────────────────
     static const float kIdentity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
@@ -6630,6 +6688,8 @@ static void bridge_gl_load_matrixf(void* emu_ptr) {
     if (g_display_active) {
         glLoadMatrixf(m);
     }
+    // Forward renderer shadow: explicit MVP/MV uniforms instead of compat built-ins.
+    ffp::note_load_matrix(0, m);
 
     // ── Handshake: shadow the matrix for FBO shaders ──────────────────────
     // We only capture after the GL call so skipped (zero/NaN) matrices are
@@ -6680,7 +6740,8 @@ static void bridge_gl_mult_matrixf(void* emu_ptr) {
 
     if (g_display_active) {
         glMultMatrixf(m);
-        
+        ffp::note_mult_matrix(0, m);
+
         // Shadow matrix updates
         if (g_current_matrix_mode == GL_MODELVIEW) {
             glGetFloatv(GL_MODELVIEW_MATRIX, g_current_modelview);
@@ -6705,6 +6766,7 @@ static void bridge_gl_push_matrix(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glPushMatrix();
+    ffp::note_push_matrix();
 }
 
 static void bridge_gl_pop_matrix(void* emu_ptr) {
@@ -6720,7 +6782,8 @@ static void bridge_gl_pop_matrix(void* emu_ptr) {
 #endif
     if (g_display_active) {
         glPopMatrix();
-        
+        ffp::note_pop_matrix();
+
         // Shadow matrix updates
         if (g_current_matrix_mode == GL_MODELVIEW) {
             glGetFloatv(GL_MODELVIEW_MATRIX, g_current_modelview);
@@ -6763,6 +6826,7 @@ static void bridge_gl_orthof(void* emu_ptr) {
     if (g_display_active) {
         glOrtho(l, r_, b, t, n, f);
     }
+    ffp::note_ortho(l, r_, b, t, n, f);
     g_current_projection_is_ortho = true;
 }
 
@@ -6781,6 +6845,7 @@ static void bridge_gl_translatef(void* emu_ptr) {
     if (g_display_active) {
         glTranslatef(x, y, z);
     }
+    ffp::note_translate(x, y, z);
 }
 
 static void bridge_gl_rotatef(void* emu_ptr) {
@@ -6798,6 +6863,7 @@ static void bridge_gl_rotatef(void* emu_ptr) {
     if (g_display_active) {
         glRotatef(angle, x, y, z);
     }
+    ffp::note_rotate(angle, x, y, z);
 }
 
 static void bridge_gl_scalef(void* emu_ptr) {
@@ -6814,6 +6880,7 @@ static void bridge_gl_scalef(void* emu_ptr) {
     if (g_display_active) {
         glScalef(x, y, z);
     }
+    ffp::note_scale(x, y, z);
 }
 
 static void bridge_gl_frustumf(void* emu_ptr) {
@@ -6844,6 +6911,7 @@ static void bridge_gl_frustumf(void* emu_ptr) {
     if (g_display_active) {
         glFrustum(l, r_, b, t, n, f);
     }
+    ffp::note_frustum(l, r_, b, t, n, f);
     g_current_projection_is_ortho = false;
 }
 
@@ -6877,6 +6945,48 @@ struct {
 
 GuestLightState g_frame_lights[8] = {};
 float g_frame_light_model_ambient[4] = {0.2f, 0.2f, 0.2f, 1.0f};
+
+// Per-light attenuation (constant, linear, quadratic) — Caver::LightComponent::Enable
+// sets GL_LINEAR_ATTENUATION from the component's range, so a faithful
+// per-fragment replacement needs the triple.
+float g_frame_light_attenuation[8][3] = {
+    {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f},
+    {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f},
+};
+
+// Fixed-function enables the forward-lighting pass needs to see.
+// GL_LIGHTING is enabled by Caver::Scene::Draw (arm64_13 0x4F905C) and
+// Caver::SkeletonInstance::Draw (0x4E6A9C) only — it is the gate that keeps the
+// forward pass off the sprite/UI geometry.
+bool g_frame_lighting_enabled = false;
+bool g_frame_color_material_enabled = false;
+bool g_frame_vertex_array_enabled = false;
+bool g_frame_normal_array_enabled = false;
+bool g_frame_color_array_enabled = false;
+bool g_frame_texcoord_array_enabled = false;
+int  g_frame_texenv_mode = 0x2100;  // GL_MODULATE
+GuestFogState g_frame_fog = {
+    false,            // enabled
+    0x0800,           // mode = GL_EXP
+    0.0f,             // start
+    1.0f,             // end
+    1.0f,             // density
+    {0.0f, 0.0f, 0.0f, 1.0f},
+};
+
+// ── Guest client-array snapshot for the forward renderer ───────────────────
+// The GLSL 330 pass reads vertex data straight out of guest memory (bounds
+// checked against the arena), so it needs the raw array descriptors — not just
+// the "which arrays are enabled" flags the FBO postfx handshake uses.
+static ffp::GuestArrays g_ffp_arrays;
+
+static void ffp_publish_arrays(IEmulatorArm64* emu) {
+    if (emu) {
+        g_ffp_arrays.memory = emu->get_memory_base();
+        g_ffp_arrays.arena_size = emu->get_memory_size();
+    }
+    ffp::note_arrays(g_ffp_arrays);
+}
 
 GuestMaterialState g_frame_material = {
     {0.2f, 0.2f, 0.2f, 1.0f},   // ambient
@@ -7037,7 +7147,18 @@ static void bridge_gl_draw_arrays(void* emu_ptr) {
         }
     }
 
-    glDrawArrays(mode, first, count);
+    // ── Forward per-fragment lighting (the real geometry pass) ────────────
+    // The guest runs RenderingAPI==0 (fixed-function GLES 1.1), so this is the
+    // only forward geometry pass that exists at runtime. When the draw is
+    // genuinely lit 3D geometry — GL_LIGHTING enabled by Caver::Scene::Draw /
+    // SkeletonInstance::Draw plus a bound normal array — we bind our own
+    // per-fragment forward shader for this single draw and restore the previous
+    // program afterwards. Everything else (sprites, UI, particles, unlit props)
+    // falls through to the untouched fixed-function path.
+    if (!ffp::draw(mode, (GLuint)g_frame_stats.last_bound_texture, (int)first, (int)count,
+                   nullptr, 0)) {
+        glDrawArrays(mode, first, count);
+    }
 
     if (do_stencil) {
         glDisable(GL_STENCIL_TEST);
@@ -7210,7 +7331,13 @@ static void bridge_gl_draw_elements(void* emu_ptr) {
         }
 
         uint8_t* memory = emu->get_memory_base();
-        glDrawElements(mode, count, type, (const void*)(memory + indices_ptr));
+        // Indexed variant of the forward per-fragment lighting pass (see
+        // bridge_gl_draw_arrays). The client vertex/normal/color/texcoord arrays
+        // are unaffected, so only the program binding changes for this draw.
+        if (!ffp::draw(mode, (GLuint)g_frame_stats.last_bound_texture, 0, (int)count,
+                       (const void*)(memory + indices_ptr), (GLenum)type)) {
+            glDrawElements(mode, count, type, (const void*)(memory + indices_ptr));
+        }
 
         if (do_stencil) {
             glDisable(GL_STENCIL_TEST);
@@ -7233,6 +7360,9 @@ static void bridge_gl_vertex_pointer(void* emu_ptr) {
     g_gl_state.vptr_size = size;
     g_gl_state.vptr_type = type;
     g_gl_state.vptr_stride = stride;
+    g_ffp_arrays.vptr = ptr; g_ffp_arrays.vsize = (int)size;
+    g_ffp_arrays.vtype = type; g_ffp_arrays.vstride = (int)stride;
+    ffp_publish_arrays(emu);
 
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
@@ -7263,6 +7393,9 @@ static void bridge_gl_texcoord_pointer(void* emu_ptr) {
     g_gl_state.tptr_size = size;
     g_gl_state.tptr_type = type;
     g_gl_state.tptr_stride = stride;
+    g_ffp_arrays.tptr = ptr; g_ffp_arrays.tsize = (int)size;
+    g_ffp_arrays.ttype = type; g_ffp_arrays.tstride = (int)stride;
+    ffp_publish_arrays(emu);
 
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
@@ -7288,6 +7421,9 @@ static void bridge_gl_color_pointer(void* emu_ptr) {
     uint32_t ptr = emu->get_reg(3);
     g_color_ptr = ptr;
     g_color_stride = stride;
+    g_ffp_arrays.cptr = ptr; g_ffp_arrays.csize = (int)size;
+    g_ffp_arrays.ctype = type; g_ffp_arrays.cstride = (int)stride;
+    ffp_publish_arrays(emu);
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
         g_vk_backend.color_pointer(size, type, stride, ptr);
@@ -7309,9 +7445,13 @@ static void bridge_gl_normal_pointer(void* emu_ptr) {
     uint32_t stride = emu->get_reg(1);
     uint32_t ptr = emu->get_reg(2);
     
+    GL_DIAG("glNormalPointer(type=0x%x, stride=%u, ptr=0x%x)", type, stride, ptr);
     g_gl_state.nptr_addr = ptr;
     g_gl_state.nptr_type = type;
     g_gl_state.nptr_stride = stride;
+    g_ffp_arrays.nptr = ptr;
+    g_ffp_arrays.ntype = type; g_ffp_arrays.nstride = (int)stride;
+    ffp_publish_arrays(emu);
 
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
@@ -7339,6 +7479,15 @@ static void bridge_gl_enable_client_state(void* emu_ptr) {
     GLenum arr = emu->get_reg(0);
     if (g_batching_enabled && arr == GL_COLOR_ARRAY) g_color_array_enabled = true;
     if (g_display_active) glEnableClientState(arr);
+    // ── Forward-lighting handshake: which arrays are live ─────────────────
+    switch (arr) {
+        case GL_VERTEX_ARRAY:        g_frame_vertex_array_enabled   = true; g_ffp_arrays.v_enabled = true; break;
+        case GL_NORMAL_ARRAY:        g_frame_normal_array_enabled   = true; g_ffp_arrays.n_enabled = true; break;
+        case GL_COLOR_ARRAY:         g_frame_color_array_enabled    = true; g_ffp_arrays.c_enabled = true; break;
+        case GL_TEXTURE_COORD_ARRAY: g_frame_texcoord_array_enabled = true; g_ffp_arrays.t_enabled = true; break;
+        default: return;
+    }
+    ffp_publish_arrays(emu);
 }
 
 static void bridge_gl_disable_client_state(void* emu_ptr) {
@@ -7354,6 +7503,14 @@ static void bridge_gl_disable_client_state(void* emu_ptr) {
     GLenum arr = emu->get_reg(0);
     if (g_batching_enabled && arr == GL_COLOR_ARRAY) g_color_array_enabled = false;
     if (g_display_active) glDisableClientState(arr);
+    switch (arr) {
+        case GL_VERTEX_ARRAY:        g_frame_vertex_array_enabled   = false; g_ffp_arrays.v_enabled = false; break;
+        case GL_NORMAL_ARRAY:        g_frame_normal_array_enabled   = false; g_ffp_arrays.n_enabled = false; break;
+        case GL_COLOR_ARRAY:         g_frame_color_array_enabled    = false; g_ffp_arrays.c_enabled = false; break;
+        case GL_TEXTURE_COORD_ARRAY: g_frame_texcoord_array_enabled = false; g_ffp_arrays.t_enabled = false; break;
+        default: return;
+    }
+    ffp_publish_arrays(emu);
 }
 
 // --- Phase 4: Textures ---
@@ -7947,6 +8104,22 @@ static void bridge_gl_enable(void* emu_ptr) {
     // ── Handshake: track per-light enable ────────────────────────────────
     if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7)
         g_frame_lights[cap - GL_LIGHT0].enabled = true;
+
+    // ── Translation-layer handshake ──────────────────────────────────────
+    // Every capability the transcoder understands is mirrored, not just the
+    // three that used to be tracked. GL_LIGHTING on its own is NOT a litness
+    // signal: the engine enables it 13 times against 3 disables per session, so
+    // it stays on across the background, the effects and the overlays — which
+    // is why the old pass, gating on it, shaded those draws as if they were lit.
+    ffp::note_capability(cap, true);
+
+    // Postfx mirrors (consumed by fbo_scaler.cpp).
+    switch (cap) {
+        case GL_LIGHTING:       g_frame_lighting_enabled = true; break;
+        case GL_COLOR_MATERIAL: g_frame_color_material_enabled = true; break;
+        case GL_FOG:            g_frame_fog.enabled = true; break;
+        default: break;
+    }
 }
 
 static void bridge_gl_disable(void* emu_ptr) {
@@ -7974,6 +8147,16 @@ static void bridge_gl_disable(void* emu_ptr) {
     // ── Handshake: track per-light disable ───────────────────────────────
     if (cap >= GL_LIGHT0 && cap <= GL_LIGHT7)
         g_frame_lights[cap - GL_LIGHT0].enabled = false;
+
+    ffp::note_capability(cap, false);
+
+    // Postfx mirrors (consumed by fbo_scaler.cpp).
+    switch (cap) {
+        case GL_LIGHTING:       g_frame_lighting_enabled = false; break;
+        case GL_COLOR_MATERIAL: g_frame_color_material_enabled = false; break;
+        case GL_FOG:            g_frame_fog.enabled = false; break;
+        default: break;
+    }
 }
 
 static void bridge_gl_blend_func(void* emu_ptr) {
@@ -8045,6 +8228,7 @@ static void bridge_gl_color4f(void* emu_ptr) {
     // ── Handshake: track current color ────────────────────────────────────
     g_current_color[0] = r; g_current_color[1] = g;
     g_current_color[2] = b; g_current_color[3] = a;
+    ffp::note_color4(r, g, b, a);
 }
 
 static void bridge_gl_scissor(void* emu_ptr) {
@@ -8597,6 +8781,7 @@ static void bridge_gl_alpha_func(void* emu_ptr) {
     if (g_display_active) {
         glAlphaFunc(emu->get_reg(0), ref);
     }
+    ffp::note_alpha_func((GLenum)emu->get_reg(0), ref);
 }
 
 static void bridge_gl_shade_model(void* emu_ptr) {
@@ -8609,6 +8794,7 @@ static void bridge_gl_shade_model(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glShadeModel(emu->get_reg(0));
+    ffp::note_shade_model((GLenum)emu->get_reg(0));
 }
 
 static void bridge_gl_clear_depthf(void* emu_ptr) {
@@ -10246,6 +10432,10 @@ void JniBridge64::init_standard_bridges() {
     // Compression
     register_handler("gzwrite", bridge_gzwrite);
 
+    // Forward per-fragment lighting for the fixed-function (RenderingAPI==0)
+    // geometry path — reads SWORDIGO_FFP_LIGHTING (default: enabled).
+    ffp::init_from_env();
+
     // GLES real bridge functions
     register_handler("glViewport", bridge_gl_viewport);
     register_handler("glClear", bridge_gl_clear);
@@ -10344,6 +10534,7 @@ void JniBridge64::init_standard_bridges() {
     register_handler("glFogi", bridge_glFogi);
     register_handler("glMaterialf", bridge_glMaterialf);
     register_handler("glMaterialfv", bridge_glMaterialfv);
+    register_handler("glColorMaterial", bridge_glColorMaterial);
     register_handler("glLightf", bridge_glLightf);
     register_handler("glLightfv", bridge_glLightfv);
     register_handler("glLightModelf", bridge_glLightModelf);

@@ -494,25 +494,31 @@ void RuntimeScene::tick(RuntimeObject& object, float dt) {
 void RuntimeScene::update(float dt) {
     clock_ += dt;
 
-    // Pass 1 — every C++ component behaviour (behaviour.cpp). No scripting runs
-    // here, so the object collection cannot be mutated mid-iteration.
-    for (size_t i = 0; i < objects_.size(); ++i)
-        tick(objects_[i], dt);
-
-    // Pass 2 — PROGRAM_UPDATE: the real Lua VM. `count` is snapshotted, so an
-    // object spawned by a script is only scripted from the next frame on (the
-    // same rule the engine uses for freshly created objects).
+    // The pass order is Caver::Scene::Update (0x4F81AC), whose first act after the
+    // frame counter is `ProgramState::Update(root, dt)` — the script pass — and
+    // whose object pass (`SceneObject::updateSpeedMultiplier` + `SceneObject::
+    // Update`) follows the camera/grid work. So *scripts run before components*,
+    // which means a resumed program observes the component state its owner had at
+    // the end of the previous frame. This port used to run components first, on
+    // the assumption that the scene ticks and then the scripts react; the binary
+    // does the opposite. See caver/frame_runner.h for the full recovered order.
     if (program_host_) {
         program_host_->sync_clock(clock_);
+        // `count` is snapshotted so the collection cannot be mutated mid-iteration.
         const size_t count = objects_.size();
         for (size_t i = 0; i < count; ++i) {
             RuntimeObject* object = this->object(objects_[i].identifier);
             if (object) program_host_->update_object(*this, *object, dt);
         }
-        // Pass 3 — events raised by the C++ behaviours this frame, then the
-        // spawns (Scene.CreateObject, drops, casts) the handlers requested.
-        program_host_->pump(*this);
     }
+
+    // The object pass — every C++ component behaviour (behaviour.cpp).
+    for (size_t i = 0; i < objects_.size(); ++i)
+        tick(objects_[i], dt);
+
+    // The event pass. The engine delivers queued events after the object pass has
+    // finished, so a handler never runs midway through an object iteration.
+    if (program_host_) program_host_->pump(*this);
 }
 
 RuntimeObject* RuntimeScene::object(const std::string& identifier) {

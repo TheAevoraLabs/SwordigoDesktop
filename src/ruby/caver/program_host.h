@@ -13,8 +13,13 @@
 //   * `Program.Bytes` is loaded with luaL_loadbuffer — the exact call
 //     Caver::Program::LoadIntoState makes — and falls back to compiling
 //     `Program.String` only when the chunk is absent;
-//   * keep-active scripts (`while true do … Program.Wait` loops, and anything the
-//     engine marks $keepActive) run as coroutines resumed on the scene clock;
+//   * every script runs as a coroutine whose suspension is a *stored wait*, not a
+//     returned value: Program.Wait is a C function that writes the duration onto
+//     the running state, and the scheduler revives it once the duration has been
+//     counted down by the speed-scaled dt. `Program.SetKeepActive` decides whether
+//     a program is started with its object; a script that returns instead of
+//     looping is aborted, exactly as ProgramState::Resume (0x545624) does;
+//     see program_state.h for the recovered state machine;
 //   * one-shot handlers run only when fired, never at spawn;
 //   * the API names and signatures are the ones the shipped corpus uses
 //     (Program, EntityController, Entity, PhysicsObject, KeyframeAnimation,
@@ -90,6 +95,9 @@ public:
     void note_api(const char* name);
     void set_current(Instance* instance) { current_ = instance; }
     void set_keep_active(bool keep);
+    // Program.Wait: Caver::ProgramState::Wait (0x5457AC) — store the duration on
+    // the running instance. The resume itself is the scheduler's decision.
+    void set_wait(double seconds);
     void execute_named(RuntimeObject* object, const std::string& name);
     void request_sound(const std::string& name);
     void begin_cast(RuntimeObject& caster);

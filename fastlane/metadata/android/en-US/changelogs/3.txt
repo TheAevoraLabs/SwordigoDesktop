@@ -1,0 +1,1 @@
+Release 1.3: Added game play option (via Lawncher), direct scene load capability, updated mesh editing workflow, and main window performance fixes.

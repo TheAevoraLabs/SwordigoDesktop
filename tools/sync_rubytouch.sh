@@ -31,6 +31,12 @@ rsync -a --delete \
     --exclude "zauonlok/" \
     "${ROOT_DIR}/src/ruby/" "${DEST_DIR}/src/ruby/"
 
+# Ensure prebuilt runtime libraries (GlossHook) are synced
+if [ -d "${ROOT_DIR}/src/ruby/android/libs" ]; then
+    mkdir -p "${DEST_DIR}/src/ruby/android/libs"
+    cp -r "${ROOT_DIR}/src/ruby/android/libs/"* "${DEST_DIR}/src/ruby/android/libs/"
+fi
+
 echo "--> Syncing src/tools/..."
 mkdir -p "${DEST_DIR}/src/tools"
 rsync -a --delete \
@@ -119,9 +125,12 @@ rsync -a --delete \
     --exclude "doc/" \
     "${ROOT_DIR}/src/sre/base/lua/" "${DEST_DIR}/src/sre/base/lua/"
 
-# 2. Sync license & translations
-echo "--> Syncing LICENSE.md and translations..."
+# 2. Sync license, changelog & translations
+echo "--> Syncing LICENSE.md, CHANGELOG.md and translations..."
 cp "${ROOT_DIR}/LICENSE.md" "${DEST_DIR}/LICENSE.md"
+if [ -f "${ROOT_DIR}/docs/RUBY_TOUCH_CHANGELOG.md" ]; then
+    cp "${ROOT_DIR}/docs/RUBY_TOUCH_CHANGELOG.md" "${DEST_DIR}/CHANGELOG.md"
+fi
 mkdir -p "${DEST_DIR}/.github/.localisation"
 rsync -a --delete "${ROOT_DIR}/.github/.localisation/" "${DEST_DIR}/.github/.localisation/"
 

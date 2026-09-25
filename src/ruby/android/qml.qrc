@@ -29,6 +29,7 @@
         <file>qml/components/SceneLoadingOverlay.qml</file>
         <file>qml/components/NewFileDialog.qml</file>
         <file>qml/components/PodConvertDialog.qml</file>
+        <file>qml/components/PlaceObjectDialog.qml</file>
         <file>qml/components/IdentityHeader.qml</file>
         <file>qml/components/GuideCard.qml</file>
         <file>qml/components/GuideReaderView.qml</file>

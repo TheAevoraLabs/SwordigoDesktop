@@ -72,6 +72,11 @@ bool action_finished(const BehaviourState& b) {
 // ── entity physics ──────────────────────────────────────────────────────────
 void tick_physics_object(RuntimeScene& scene, RuntimeObject& object, RuntimeComponent& c,
                          BehaviourState& b, float dt) {
+    // An ElevatorController drives its own object: it writes the position AND the
+    // velocity (this is the engine's own structure -- see level_mechanics.h), so
+    // integrating that velocity here as well would move the platform twice as far
+    // as it should. The flag is set every frame the controller is driving.
+    if (b.trigger.lift_driving) return;
     PhysicsState& p = b.physics;
     p.enabled = flag(c, "PhysicsEnabled", true);
     read_vec_field(c, "GravityDirection", p.gravity_dir, 2);
@@ -139,63 +144,111 @@ const BehaviourState::AnimClip* clip_named(const BehaviourState& b, const std::s
 
 // CharAnimControllerComponent + CharControllerComponent.
 //
-// The controller does not pick a clip by name — it hands an AnimNode to the
-// animation controller, and the node it hands over is chosen by the character's
-// physical state. CharControllerComponent::Update (0x2AB9E0) makes exactly three
-// calls into it:
+// This no longer chooses a clip. The choice is the recovered controller's
+// (char_anim.h): a three-node blend tree the *driver* moves through the engine's
+// own transitions (char_controller.h), and this function is only the binding —
+// build the driver's input out of what the port can observe, tick the tree, and
+// publish whichever clip the tree's weights favour.
 //
-//   CanJump + jump input   → StartJumping(air) → the jump / air-jump node
-//   leaving the ground     → StartFalling      → the fall node
-//   move input / stop      → StartMoving/StopMoving → the walk / stand node
+// What the port can observe is the limiting factor, and it is worth being exact
+// about it rather than papering over:
 //
-// and CharAnimControllerComponent::Update walks the active node back to the move
-// node once the node's own clock passes 95% of its duration (the transition the
-// engine uses to land a jump / finish a swing). Playback rate is the node's own
-// speed, with one twist: SetCurrentRunSpeed writes `speed / 100` into the walk
-// node, so the run cycle scales with how fast the character is actually moving.
+//   * there is no input layer here, so `jump_pressed` and `ledge_step_up` are
+//     false. The jump never fires; the run/stand/fall decisions all do.
+//   * there is no continuous ground clearance — the port's ground test is a feet
+//     contact — so the driver's 0.15 clearance gate is reported as satisfied
+//     whenever the feet are clear. The threshold itself is pinned by
+//     caver_char_controller_test.
+//   * the +584 air sub-state enumeration is unrecovered (only the value 3 is),
+//     so 0 is passed.
+//   * StartMoving is not part of Update at all — it belongs to the movement path
+//     (StartMovingToDirection, 0x35D578) — so the port synthesises that call from
+//     the character's own horizontal motion, and it synthesises the *stop* through
+//     StopMovingToDirection (0x35D6AC), which cuts the run cycle by clearing the
+//     ground flag and letting the driver's 0.11 s air rule do it. Calling the anim
+//     controller's StopMoving directly here would be an instant cut the engine
+//     never performs.
 void tick_char_animation(RuntimeScene& scene, RuntimeObject& object, BehaviourState& b, float dt) {
     (void)scene;
     BehaviourState::CharAnimState& c = b.char_anim;
-    if (!c.active) return;
+    if (!c.active || !b.anim_rig || !b.anim_rig->ready()) return;
+
+    canim::CharAnimController& anim = b.anim_rig->controller();
+    cchar::CharControllerState& ds = b.char_driver.state;
 
     const bool airborne = !b.physics.on_ground && !object.grounded;
     if (airborne) c.air_time += dt; else c.air_time = 0.0f;
 
-    std::string want;
-    if (b.action == EntityAction::Hurt && !c.hurt.empty())       want = c.hurt;
-    else if (b.action == EntityAction::Death && !c.die.empty())  want = c.die;
-    else if (b.action == EntityAction::Cast && !c.cast.empty())  want = c.cast;
-    else if (airborne)          want = object.vel[1] > 0.0f ? c.jump : c.fall;
-    else if (std::fabs(object.vel[0]) > 1.0f) want = c.walk;
-    else                        want = c.stand;
-    if (want.empty()) want = c.stand;
-    if (want.empty()) return;
-
-    if (want != c.current) {
-        c.current = want;
-        // StartMoving drops the walk node in at a quarter of its cycle (the
-        // engine's own mid-stride entry point); every other node starts at 0.
-        c.time = (want == c.walk) ? 0.25f : 0.0f;
-        const BehaviourState::AnimClip* clip = clip_named(b, want);
-        c.rate = clip ? clip->speed : 1.0f;
-        c.repeating = clip ? clip->repeating : true;
+    // ── the movement path, synthesised ──────────────────────────────────────
+    // Only on a *change*: StartMoving re-phases the run clip (a quarter of its
+    // cycle), so calling it every frame would pin the run cycle to that phase.
+    const int32_t dir = (std::fabs(object.vel[0]) > 1.0f)
+                            ? (object.vel[0] > 0.0f ? 1 : -1)
+                            : 0;
+    if (airborne) {
+        if (ds.on_ground || ds.moving_direction != 0)
+            b.char_driver.stop_moving_to_direction(ds.moving_direction);
+    } else if (dir != 0 && ds.moving_direction != dir) {
+        b.char_driver.start_moving_to_direction(dir, anim);
+    } else if (dir == 0 && ds.moving_direction != 0) {
+        b.char_driver.stop_moving_to_direction(ds.moving_direction);
     }
 
-    float rate = c.rate > 0.0f ? c.rate : 1.0f;
-    if (want == c.walk && c.run_speed > 0.0f) {
-        // SetCurrentRunSpeed: the walk node's rate is current speed / 100.
-        const float moving = std::max(std::fabs(object.vel[0]), 1.0f);
-        rate *= moving / 100.0f;
+    // ── the action slot ─────────────────────────────────────────────────────
+    // A cast is the recovered one: BeginCasting puts the cast clip in the action
+    // slot with the 0.08 s fade, and the driver's hand-back releases it on the
+    // frame the action ends. Hurt and die are *not* recovered from
+    // CharControllerComponent — they are entered from the damage/entity layer —
+    // so the port maps "something wants this clip played" onto the recovered
+    // BlendFromAnimationNode, which is the engine's way of fading from where the
+    // character visually was into a new clip.
+    const bool casting = (b.action == EntityAction::Cast);
+    if (casting && !ds.cast_active) {
+        ds.cast_active = true;
+        anim.begin_casting();
     }
-    c.time += dt * rate;
-    c.in_action = want != c.stand && want != c.walk;
+    const bool reacting = (b.action == EntityAction::Hurt) || (b.action == EntityAction::Death);
+    const std::string& react_clip = (b.action == EntityAction::Hurt) ? c.hurt : c.die;
+    if (reacting && !c.in_action) {
+        const int idx = b.anim_rig->index_of_name(react_clip);
+        if (anim::KeysNode* node = b.anim_rig->node_at(idx))
+            anim.blend_from_animation_node(*node, cchar::kActionBlendTime);
+    }
+    c.in_action = reacting || casting;
 
-    // Publish to the render stream: the clip's pod name and its own clock.
+    // ── the driver ──────────────────────────────────────────────────────────
+    cchar::CharInput in;
+    in.height_above_ground = airborne ? 1.0f : 0.0f;   // see the note above
+    in.vertical_speed = object.vel[1];
+    // The component's own speed, which the driver copies to +608 and hands to
+    // SetCurrentRunSpeed as `speed / 100`. It has to be a *speed*: passing the
+    // authored NormalRunSpeed instead would freeze the run cycle on the objects
+    // that leave it at 0 (c.run_speed is kept below as the authored value/fallback).
+    in.run_speed = std::fabs(object.vel[0]) > 1.0f ? std::fabs(object.vel[0]) : c.run_speed;
+    in.movement_behavior = static_cast<int>(b.movement);
+    in.jump_pressed = false;          // no input layer in a scene player
+    in.ledge_step_up = false;
+    in.swing_node_available = false;
+    in.cast_finished = ds.cast_active && !casting;
+    b.char_driver.update(dt, in, anim);
+
+    // The clocks, then the tree: every outlet advances, because the engine's blend
+    // node recurses into both children, and then the controller walks the tree once.
+    b.anim_rig->advance(dt);
+    anim.update(dt);
+
+    // ── publish ─────────────────────────────────────────────────────────────
+    // The clip the weight favours, and *that clip's own clock* — each outlet keeps
+    // one, so a switch is a different clock rather than a reset of a shared one.
+    const int shown = b.anim_rig->index_of(anim.display_node().keys);
+    if (shown >= 0 && !b.anim_rig->name_at(shown).empty()) c.current = b.anim_rig->name_at(shown);
+    c.time = b.anim_rig->time_at(shown);
+
     b.anim.current = c.current;
     b.anim.time = c.time;
-    b.anim.speed = 1.0f;      // the clock is already rate-scaled
-    b.anim.repeating = c.repeating;
-    b.anim.running = true;
+    b.anim.speed = 1.0f;      // the outlet clocks are already rate-scaled
+    b.anim.repeating = true;
+    b.anim.running = !c.current.empty();
 }
 
 void tick_animation(RuntimeObject& object, RuntimeComponent& c, BehaviourState& b, float dt) {
@@ -518,8 +571,11 @@ void tick_damage(RuntimeComponent& c, BehaviourState& b) {
 
 void tick_collision_shape(RuntimeComponent& c, BehaviourState& b) {
     // `Enabled` is both the initial state and what CollisionShape.SetEnabled
-    // writes at runtime; a pending re-enable is resolved by behaviour_tick.
-    if (b.health.reenable_timer <= 0.0f) b.health.shape_enabled = flag(c, "Enabled", true);
+    // writes at runtime; a pending re-enable is resolved by behaviour_tick. A
+    // controller that has forced the shape OFF (a door while it is open) wins over
+    // the authored value, which is the whole point of SetEnabled.
+    if (b.health.shape_forced_off) b.health.shape_enabled = false;
+    else if (b.health.reenable_timer <= 0.0f) b.health.shape_enabled = flag(c, "Enabled", true);
     b.health.collides = flag(c, "Collides", true);
     b.health.is_ground = flag(c, "IsGround", false);
     b.health.receives_damage = flag(c, "ReceivesDamage", false);
@@ -575,11 +631,38 @@ void tick_touchable(RuntimeScene& scene, RuntimeObject& object, RuntimeComponent
 
 void tick_door(RuntimeObject& object, RuntimeComponent& c, BehaviourState& b, float dt) {
     TriggerState& t = b.trigger;
-    t.open = flag(c, "Open", false);
-    const float target = t.open ? 1.0f : 0.0f;
-    const float rate = 1.5f;                 // unverified speed; the clip length owns it in-engine
-    if (t.open_amount < target) t.open_amount = std::min(target, t.open_amount + rate * dt);
-    else if (t.open_amount > target) t.open_amount = std::max(target, t.open_amount - rate * dt);
+    // `Open` is the component's own protobuf field (Proto::DoorControllerComponent-
+    // ::kOpenFieldNumber) and binding index 4 ("open"), and both read the same
+    // byte, so the field and the binding are one value.
+    const bool want_open = flag(c, "Open", false);
+
+    // `SetOpen` seeks the animation's time field to the clip's open frame (clip
+    // +48), read through `KeyframeAnimationComponent::LoadAnimation`. The ANI
+    // loader is not wired yet (CAVER_BACKEND_STATUS.md open item 2), so there is
+    // no clip to read that frame out of; a scene that supplies one is honoured.
+    // This is the single input the recovered transition cannot derive itself.
+    const int open_frame = static_cast<int>(c.number("OpenFrame", 0.0f));
+
+    // `Open()`/`Close()` only play the open/close SoundEffect when
+    // `*(*(animationController + 120) + 326) != 0`. The port has no
+    // AnimationController playback-state object for that byte to live on yet, so
+    // the gate is open; recorded rather than silently dropped.
+    const bool sound_gate = true;
+
+    mechanics::DoorTransition tr = t.door.set_open(want_open, open_frame, sound_gate);
+    t.open = t.door.is_open();
+    t.door_sound = tr.sound;
+    // `Open()` walks the owning object's components and `SetEnabled(false)` on
+    // every one that implements `CollisionShapeComponent::Interface`; `Close()`
+    // re-enables them. That is the entire reason a closed door blocks and an open
+    // one does not -- and the port previously had no door/collision link at all.
+    b.health.shape_forced_off = !tr.collision_enabled;
+
+    // `t.open_amount` stays 0/unknown on purpose: the door's travel IS the clip,
+    // and the clip has no loaded duration yet. `DoorController::open_amount()` is
+    // where the real answer will come from once the ANI loader lands -- it already
+    // refuses to invent a number.
+    (void)dt;
 
     if (const RuntimeField* f = c.field("AnimationControllerId"))
         b.anim.current = animation_name_for(object, static_cast<int32_t>(f->varint_value));
@@ -591,22 +674,68 @@ void tick_door(RuntimeObject& object, RuntimeComponent& c, BehaviourState& b, fl
 
 void tick_elevator(RuntimeObject& object, RuntimeComponent& c, BehaviourState& b, float dt) {
     TriggerState& t = b.trigger;
-    t.mode = static_cast<int>(c.number("Mode", 0.0f));
-    if (const RuntimeField* f = c.field("ElevationShapeId")) {
-        if (const RuntimeComponent* shape = object.find(static_cast<int32_t>(f->varint_value))) {
-            float c2[3] = {0, 0, 0};
-            read_vec_field(*shape, "Circle", c2, 3);
-            t.elevation[1] = c2[2];
+    mechanics::ElevatorController& lift = t.lift;
+
+    // `Mode` is the component's own payload field, and it is 1-BASED:
+    // `LoadFromProtobufMessage` (0x3A117C) writes `Mode - 1` into +144, and only
+    // when the field is present. An absent field leaves the internal default, 1.
+    if (const RuntimeField* f = c.field("Mode")) {
+        lift.mode = mechanics::ElevatorController::mode_from_payload(
+            static_cast<int>(f->varint_value));
+    }
+
+    if (!t.lift_prepared) {
+        // `Prepare()` derives the travel offset from the bounds of the component
+        // bound by the outlet named "elevationShape" (`Shape::Bounds`). No shape,
+        // no travel: the platform cannot move, and refusing is the honest outcome
+        // rather than inventing a reach from a radius.
+        if (const RuntimeField* f = c.field("ElevationShapeId")) {
+            if (const RuntimeComponent* shape =
+                    object.find(static_cast<int32_t>(f->varint_value))) {
+                Rect bounds{};
+                bool have = false;
+                if (const RuntimeField* rect = shape->field("Rectangle")) {
+                    float r[4] = {0, 0, 0, 0};
+                    read_vec(rect->bytes_value, r, 4);
+                    bounds = Rect{r[0], r[1], r[2] - r[0], r[3] - r[1]};
+                    have = true;
+                } else if (const RuntimeField* circle = shape->field("Circle")) {
+                    float cc[3] = {0, 0, 0};
+                    read_vec(circle->bytes_value, cc, 3);
+                    bounds = Rect{cc[0] - cc[2], cc[1] - cc[2], cc[2] * 2.0f, cc[2] * 2.0f};
+                    have = true;
+                }
+                if (have) {
+                    lift.prepare(bounds);
+                    t.lift_prepared = true;
+                }
+            }
         }
     }
-    // Mode 0: elevator shuttles while pressed; Mode 1: latches.
-    const float dir = t.pressed ? 1.0f : (t.mode == 1 ? 0.0f : -1.0f);
-    t.travel += dir * 2.0f * dt;
-    const float limit = t.elevation[1] > 0.0f ? t.elevation[1] : 3.0f;
-    t.travel = std::max(0.0f, std::min(limit, t.travel));
-    // The platform rides its own body; `travel` is the offset the render side
-    // applies so authored geometry is never destroyed by the simulation.
-    object.pos[1] = object.base_pos[1] + t.travel;
+
+    if (t.lift_prepared) {
+        // The recovered controller integrates the OWNER's position and velocity
+        // itself, exactly as the engine does: it aims the velocity at the target,
+        // steps by `vel * dt`, snaps onto the target, and zeroes the velocity on
+        // arrival. So the port hands it the object's own body and takes the result
+        // back -- there is no second, invented rate and no separate travel scalar
+        // for the render side to disagree with.
+        float pos[2] = {object.pos[0], object.pos[1]};
+        float vel[2] = {object.vel[0], object.vel[1]};
+        mechanics::ElevatorStep step = lift.update(dt, pos, vel);
+        object.pos[0] = pos[0];
+        object.pos[1] = pos[1];
+        object.vel[0] = vel[0];
+        object.vel[1] = vel[1];
+        t.mode = static_cast<int>(lift.mode);
+        t.travel = object.pos[1] - object.base_pos[1];
+        // The velocity has already been integrated above, so the physics step must
+        // not integrate it again.
+        t.lift_driving = true;
+        (void)step;
+    } else {
+        t.lift_driving = false;
+    }
 }
 
 void tick_bush(RuntimeObject& object, RuntimeComponent& c, BehaviourState& b, float dt) {
@@ -988,6 +1117,26 @@ void char_anim_init(RuntimeObject& object, BehaviourState& b) {
         c.run_speed  = cc->number("NormalRunSpeed", 0.0f);
         c.jump_speed = cc->number("JumpSpeed", 0.0f);
     }
+
+    // ── the recovered controller tree ───────────────────────────────────────
+    // Six outlets in constructor order (100..105). An empty name is the guest's
+    // null outlet: the tree is still built and that leaf simply evaluates nothing.
+    std::array<std::string, canim::ClipBinding::kCount> outlets{
+        c.stand, c.walk, c.jump, c.air_jump, c.fall, c.cast};
+    b.anim_rig = std::make_shared<canim::ClipBinding>();
+    b.anim_rig->configure(outlets, /*model_present=*/true);
+    for (int i = 0; i < canim::ClipBinding::kCount; ++i) {
+        if (const BehaviourState::AnimClip* clip = clip_named(b, outlets[i])) {
+            b.anim_rig->set_speed(i, clip->speed);   // the node's own +48 factor
+        }
+    }
+
+    // The spawn state (+552/+584/+596). The port has no input layer, so an object
+    // spawns standing: `set_initial_animation_state` then does `Reset` and nothing
+    // else, which leaves the root blend on the stand clip — the same place the
+    // guessed version put it, but now it is the engine's own route there.
+    canim::SpawnState spawn;
+    b.char_driver.set_initial_animation_state(spawn, b.anim_rig->controller());
 
     c.current = c.stand;
     c.time = 0.0f;

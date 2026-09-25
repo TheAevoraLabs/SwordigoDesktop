@@ -127,16 +127,31 @@ bool RubyCodeBridge::loadFile(const QString& path) {
     const bool is_scl_or_scene = (ext == QStringLiteral("scene") || ext == QStringLiteral("scl"));
 
     // Check if FileRift binary protobuf transcoding is needed for .scene / .scl
-    if (is_scl_or_scene && !bytes.startsWith("syntax =") && !bytes.startsWith("scl ") && !bytes.startsWith("scene ")) {
-        const std::string schema_type = (ext == QStringLiteral("scene")) ? "scene" : "scl";
-        std::string decoded_text = ::filerift::decode_protobuf(std::string(bytes.constData(), bytes.size()), schema_type);
-        if (!decoded_text.empty()) {
+    bool is_already_text = bytes.startsWith("## FileRift") ||
+                           bytes.startsWith("syntax =") ||
+                           bytes.startsWith("scl ") ||
+                           bytes.startsWith("scene ") ||
+                           bytes.startsWith("Object{");
 
-            m_content = QString::fromStdString(decoded_text);
+    if (is_scl_or_scene) {
+        const std::string schema_type = (ext == QStringLiteral("scene")) ? "scene" : "scl";
+        if (is_already_text) {
+            m_content = QString::fromUtf8(bytes);
             m_isFileriftTranscoded = true;
         } else {
-            m_content = QString::fromUtf8(bytes);
-            m_isFileriftTranscoded = false;
+            try {
+                std::string decoded_text = ::filerift::decode_protobuf(std::string(bytes.constData(), bytes.size()), schema_type);
+                if (!decoded_text.empty()) {
+                    m_content = QString::fromStdString(decoded_text);
+                    m_isFileriftTranscoded = true;
+                } else {
+                    m_content = QString::fromUtf8(bytes);
+                    m_isFileriftTranscoded = false;
+                }
+            } catch (...) {
+                m_content = QString::fromUtf8(bytes);
+                m_isFileriftTranscoded = false;
+            }
         }
     } else {
         m_content = QString::fromUtf8(bytes);
@@ -180,14 +195,19 @@ bool RubyCodeBridge::saveFile(const QString& newContent) {
     if (m_isFileriftTranscoded) {
         QFileInfo fi(m_path);
         const std::string schema_type = (fi.suffix().toLower() == QStringLiteral("scene")) ? "scene" : "scl";
-        std::string binary_str = ::filerift::recode_markup(newContent.toStdString(), schema_type);
-        if (binary_str.empty()) {
-
-            emit statusMessage(QStringLiteral("FileRift encode error: syntax error in markup!"));
+        try {
+            std::string binary_str = ::filerift::recode_markup(newContent.toStdString(), schema_type);
+            if (binary_str.empty()) {
+                emit statusMessage(QStringLiteral("FileRift encode error: syntax error in markup!"));
+                save_file.cancelWriting();
+                return false;
+            }
+            save_file.write(binary_str.data(), binary_str.size());
+        } catch (const std::exception& e) {
+            emit statusMessage(QStringLiteral("FileRift syntax error: ") + QString::fromUtf8(e.what()));
             save_file.cancelWriting();
             return false;
         }
-        save_file.write(binary_str.data(), binary_str.size());
     } else {
         save_file.write(newContent.toUtf8());
     }

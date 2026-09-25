@@ -193,3 +193,4 @@ __pycache__/
 *.bak
 *.glb
 src/tools/King_Crown/
+docs/livememory/

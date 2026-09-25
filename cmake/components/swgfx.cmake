@@ -4,6 +4,9 @@
 
 swordigo_library(swgfx
     ${SRC_DIR}/platform/fbo_scaler.cpp
+    # Real forward-geometry pass: per-fragment lighting that replaces the guest's
+    # fixed-function (RenderingAPI==0) per-vertex lighting. See ffp_forward.h.
+    ${SRC_DIR}/platform/ffp_forward.cpp
     ${SRC_DIR}/platform/vulkan_backend.cpp
     ${SRC_DIR}/platform/video_background.cpp
     ${SRC_DIR}/platform/ffmpeg_dyn.cpp

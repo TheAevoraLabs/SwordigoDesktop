@@ -1,0 +1,1 @@
+Release 1.4: Scene object placement studio (395 .POD models & 275 groundmesh prefabs), experimental Zypher/Zenith terrain generators, complex mesh throttling fixes, and dedicated Clone action.

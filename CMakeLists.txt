@@ -398,6 +398,71 @@ if (BUILD_TESTING)
     target_link_libraries(caver_runtime_test PRIVATE caver swpod swcore Threads::Threads)
     add_test(NAME caver_runtime_test COMMAND caver_runtime_test)
 
+    # DoorController / ElevatorController: the transition and the velocity-driven
+    # state machine, transcribed from their own functions. Guards against the
+    # invented per-second constants the port used to move these two with.
+    add_executable(caver_level_mechanics_test tests/caver_level_mechanics_test.cpp)
+    target_include_directories(caver_level_mechanics_test PRIVATE ${SRC_DIR})
+    target_link_libraries(caver_level_mechanics_test PRIVATE caver)
+    add_test(NAME caver_level_mechanics_test COMMAND caver_level_mechanics_test)
+
+    # ProgramState (the script scheduler: gate, dt scaling, wait countdown,
+    # child recursion, abort sweep) and the recovered Scene::Update frame order.
+    # Guards the two guesses the port made — a wait read off the yielded stack,
+    # and components ticking before scripts.
+    add_executable(caver_program_state_test tests/caver_program_state_test.cpp)
+    target_include_directories(caver_program_state_test PRIVATE ${SRC_DIR})
+    target_link_libraries(caver_program_state_test PRIVATE caver)
+    add_test(NAME caver_program_state_test COMMAND caver_program_state_test)
+
+    # The animation node tree and bone matching: the clip sampler, the crossfade
+    # that mutates its left child's buffer, the FloatDataTrack stride records, the
+    # quaternion hemisphere flip, and the skeleton's local/world/skin chain.
+    add_executable(caver_anim_bones_test tests/caver_anim_bones_test.cpp)
+    target_include_directories(caver_anim_bones_test PRIVATE ${SRC_DIR})
+    target_link_libraries(caver_anim_bones_test PRIVATE caver)
+    add_test(NAME caver_anim_bones_test COMMAND caver_anim_bones_test)
+
+    # The character animation *controller*: the six outlets, the three-node blend
+    # tree, the exact flag words each transition writes, IsMoving as a flag rather
+    # than a speed, the phase entry points, the action/casting slot and the base
+    # class's BlendToAnimationNode that the derived class replaces wholesale.
+    add_executable(caver_char_anim_test tests/caver_char_anim_test.cpp)
+    target_include_directories(caver_char_anim_test PRIVATE ${SRC_DIR})
+    target_link_libraries(caver_char_anim_test PRIVATE caver)
+    add_test(NAME caver_char_anim_test COMMAND caver_char_anim_test)
+
+    # The character animation *driver*: CharControllerComponent::Update — the
+    # air-timer thresholds that cut the run cycle and expire the jump grace, the
+    # falling-clip gates, the swing-tail test that picks which jump clip a jump
+    # uses, and the spawn path where `moving` is a separate `if` and not part of
+    # the if/else-if chain.
+    add_executable(caver_char_controller_test tests/caver_char_controller_test.cpp)
+    target_include_directories(caver_char_controller_test PRIVATE ${SRC_DIR})
+    target_link_libraries(caver_char_controller_test PRIVATE caver)
+    add_test(NAME caver_char_controller_test COMMAND caver_char_controller_test)
+
+    # The ground-mesh harness: boulderx regenerated onto a real shipped object and
+    # diffed against the bake. With no argument it runs built-in fixtures; with a
+    # path it reads the TSV that tools/ground_mesh_truth.py writes from a decoded
+    # scene, so a corpus object can be diffed without a rebuild.
+    add_executable(ground_mesh_compare_test
+        tests/ground_mesh_compare_test.cpp
+        ${SRC_DIR}/tools/boulderx.cpp)
+    target_include_directories(ground_mesh_compare_test PRIVATE ${SRC_DIR})
+    add_test(NAME ground_mesh_compare_test COMMAND ground_mesh_compare_test)
+
+    # The WHOLE-mesh differential: boulderx's triangle SETS against a shipped
+    # bake, family by family, in outline-node space. ground_mesh_compare_test
+    # checks statistics (face counts, Z envelope, per-node depth) and every one
+    # of those passes on thecave_part15 obj9#10 while only 3 of the bake's 57 cap
+    # triangles are reproduced — statistics cannot see a different surface.
+    # Input is `tools/ground_mesh_truth.py dump`, which carries the full bake.
+    add_executable(ground_mesh_exact_test
+        tests/ground_mesh_exact_test.cpp
+        ${SRC_DIR}/tools/boulderx.cpp)
+    target_include_directories(ground_mesh_exact_test PRIVATE ${SRC_DIR})
+
     # Template Palette + template hierarchy (master TODO 2.3/2.4): the .scl/
     # .pod scan, the link → override → materialize → reset lifecycle and the
     # Model-component / LocalAABB wire builders. Pure RAM unit test.
@@ -534,9 +599,13 @@ if (BUILD_TESTING)
 
     # Ground Mesh Studio: simple-polygon enforcement (repaint-lag fix) + the
     # "Add to Scene" object round trip. Runs headless (offscreen platform).
+    # boulderx.cpp comes along because the studio now writes both .swdm dialects
+    # and drives the generator choice; this target links filerift (boulder) but
+    # not boulderx, so without it the studio's symbols would be unresolved.
     add_executable(ground_mesh_studio_test
         tests/ground_mesh_studio_test.cpp
         ${SRC_DIR}/ruby/tools/ground_mesh_studio.cpp
+        ${SRC_DIR}/tools/boulderx.cpp
         ${SRC_DIR}/ruby/core/project_context.cpp)
     set_target_properties(ground_mesh_studio_test PROPERTIES AUTOMOC ON)
     target_include_directories(ground_mesh_studio_test PRIVATE ${SRC_DIR})
@@ -579,6 +648,16 @@ if (BUILD_TESTING)
         ${SRC_DIR}/tools/boulderx.cpp)
     target_include_directories(boulderx_engine_parity_test PRIVATE ${SRC_DIR})
     add_test(NAME boulderx_engine_parity_test COMMAND boulderx_engine_parity_test)
+
+    # Zypher (Gen 3 Procedural World Mesh Engine) behavioral & regression test
+    add_executable(zypher_test
+        tests/zypher_test.cpp
+        ${SRC_DIR}/tools/roller.cpp
+        ${SRC_DIR}/tools/boulderx.cpp
+        ${SRC_DIR}/tools/pod_loader.cpp
+        ${SRC_DIR}/tools/pod_stamp.cpp)
+    target_include_directories(zypher_test PRIVATE ${SRC_DIR} ${SRC_DIR}/tools)
+    add_test(NAME zypher_test COMMAND zypher_test)
 
     # Title-bar window controls must render visibly (painted icons). This
     # guards the frameless window's Close/Min/Max buttons against font-glyph
@@ -678,6 +757,7 @@ if (BUILD_TESTING)
         ${SRC_DIR}/tools/scene_v3_db.cpp
         ${SRC_DIR}/tools/boulder.cpp
         ${SRC_DIR}/tools/boulderx.cpp
+        ${SRC_DIR}/tools/roller.cpp
         ${SRC_DIR}/tools/rubymesh.cpp
         ${SRC_DIR}/tools/obj_loader.cpp
         ${SRC_DIR}/tools/ani_loader.cpp

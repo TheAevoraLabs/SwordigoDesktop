@@ -61,6 +61,7 @@ extern "C" void sre_guest_heap_drain_deferred(void);  // jni_bridge_arm64.cpp �
 #include "platform/gui.h"
 #include "platform/vulkan_backend.h"
 #include "platform/fbo_scaler.h"
+#include "platform/ffp_forward.h"   // forward-lighting census at session end
 #include "platform/io_thread.h"
 #include "platform/binary_selector.h"
 #include "platform/arm64_reloc.h"       // copy_and_relocate() — shared with hook-backend tests
@@ -365,6 +366,88 @@ static void pod_publish_frame() {
         s_fps_frames = 0;
         s_fps_last = now;
     }
+}
+
+// ── Env-gated frame capture ───────────────────────────────────────────────────
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+// SWORDIGO_CAPTURE_FRAMES=<n>  write the first n presented frames
+// SWORDIGO_CAPTURE_DIR=<path>  destination (default /tmp/swordigo-capture)
+// SWORDIGO_CAPTURE_EVERY=<n>   capture one frame out of every n (default 1)
+// SWORDIGO_CAPTURE_EMU_START=<n>
+//     Only start capturing once the *emulated* frame counter reaches n, and
+//     name the files emu_<counter>_<i>.ppm. This is what makes an A/B honest:
+//     the emulator runs as fast as it can, so two runs reach the same emulated
+//     frame at different wall-clock times, but the game state at a given
+//     emulated frame is reproducible. Presented-frame counting cannot align
+//     two runs (a translated frame is ~3x faster, so it drifts away).
+//
+// This exists so a renderer change can be A/B'd against vanilla by diffing
+// real pixels instead of by looking at the screen and hoping. It reads the
+// finished back buffer right before swap, exactly like pod_publish_frame.
+int g_emu_frame_now = 0;   // set by the frame loops right before presenting
+
+static void maybe_capture_frame() {
+    static int remaining = -1;
+    static int index = 0;
+    static int every = 1;
+    static int emu_start = -2;
+    static std::string dir;
+    if (remaining < 0) {
+        const char* n = getenv("SWORDIGO_CAPTURE_FRAMES");
+        remaining = n ? atoi(n) : 0;
+        const char* d = getenv("SWORDIGO_CAPTURE_DIR");
+        dir = d ? d : "/tmp/swordigo-capture";
+        const char* e = getenv("SWORDIGO_CAPTURE_EVERY");
+        every = e ? atoi(e) : 1;
+        if (every < 1) every = 1;
+        const char* s = getenv("SWORDIGO_CAPTURE_EMU_START");
+        emu_start = s ? atoi(s) : -1;
+        if (remaining > 0) {
+#ifdef _WIN32
+            _mkdir(dir.c_str());
+#else
+            mkdir(dir.c_str(), 0755);
+#endif
+        }
+    }
+    if (remaining <= 0) return;
+    if (emu_start >= 0 && g_emu_frame_now < emu_start) return;
+    static int tick = 0;
+    if ((tick++ % every) != 0) return;
+
+    const uint32_t w = (uint32_t)g_draw_w;
+    const uint32_t h = (uint32_t)g_draw_h;
+    if (!w || !h) return;
+
+    std::vector<uint8_t> raw((size_t)w * h * 4);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(0, 0, (GLsizei)w, (GLsizei)h, GL_RGBA, GL_UNSIGNED_BYTE, raw.data());
+
+    const std::string path = dir + "/" +
+        (emu_start >= 0 ? ("emu_" + std::to_string(g_emu_frame_now) + "_" + std::to_string(index))
+                        : ("frame_" + std::to_string(index))) + ".ppm";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (f) {
+        fprintf(f, "P6\n%u %u\n255\n", w, h);
+        std::vector<uint8_t> row((size_t)w * 3);
+        for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t* src = raw.data() + (size_t)(h - 1 - y) * w * 4;
+            for (uint32_t x = 0; x < w; ++x) {
+                row[x * 3 + 0] = src[x * 4 + 0];
+                row[x * 3 + 1] = src[x * 4 + 1];
+                row[x * 3 + 2] = src[x * 4 + 2];
+            }
+            fwrite(row.data(), 1, row.size(), f);
+        }
+        fclose(f);
+        std::cout << "[Capture] wrote " << path << " (" << w << "x" << h << ")" << std::endl;
+    }
+    index++;
+    remaining--;
 }
 
 // Direct pod touch injection (defined after g_emulator_64 is declared).
@@ -2460,7 +2543,9 @@ void load_and_boot() {
 #endif
                 {
                     RedstellGC::instance().process_main_thread_deletions();
+                    g_emu_frame_now = completed_frames;
                     if (g_pod_enabled) pod_publish_frame();
+                    maybe_capture_frame();
                     g_display_ptr->swap();
                 }
                 // Reclaim stale deferred guest frees every frame, on BOTH render paths
@@ -7932,7 +8017,9 @@ void load_and_boot_arm64() {
 #endif
                 {
                     RedstellGC::instance().process_main_thread_deletions();
+                    g_emu_frame_now = completed_frames;
                     if (g_pod_enabled) pod_publish_frame();
+                    maybe_capture_frame();
                     g_display_ptr->swap();
                 }
                 // Reclaim stale deferred guest frees every frame, on BOTH render paths
@@ -8782,6 +8869,10 @@ void load_and_boot_arm64() {
         std::cout << "  Total tex binds:       " << total_tex_binds << std::endl;
         std::cout << "  Avg draw/frame:        " << (completed_frames ? total_draw_calls / completed_frames : 0) << std::endl;
         std::cout << "========================================" << std::endl;
+        // The forward pass reports what it claimed and why it refused the rest.
+        // atexit() from the dlopened swgfx library cannot be relied on, so the
+        // census is printed here, on the way out of the real program.
+        ffp::print_stats();
     }
 }
 

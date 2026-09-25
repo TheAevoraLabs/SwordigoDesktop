@@ -5,9 +5,11 @@
 #include "ground_mesh_studio.h"
 
 #include "tools/boulder.h"
+#include "tools/boulderx.h"   // sheet dialect + the shared relief randomiser
 #include "ruby/core/project_context.h"
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDir>
 #include <QDoubleSpinBox>
 #include <QFile>
@@ -16,6 +18,7 @@
 #include <QFontDatabase>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QHBoxLayout>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -797,6 +800,35 @@ GroundMeshStudio::GroundMeshStudio(QWidget* parent) : QWidget(parent) {
     m_depth_min->setRange(-100000.0, 100000.0); m_depth_min->setValue(-45.0); m_depth_min->setDecimals(1);
     m_depth_max = new QDoubleSpinBox(mesh_box);
     m_depth_max->setRange(-100000.0, 100000.0); m_depth_max->setValue(45.0); m_depth_max->setDecimals(1);
+
+    // Which generator rebuilds this sheet's mesh (and, when BoulderX, which
+    // dialect a save writes). Same two-value choice as the mobile settings row;
+    // both go through boulderx::set_ground_generator(), so this is the desktop
+    // half of one setting rather than a second, divergent one.
+    m_generator = new QComboBox(mesh_box);
+    m_generator->addItem("Boulder (v1 sheet)", "boulder");
+    m_generator->addItem("Zenith (engine-faithful, v2 sheet)", "boulderx");
+    m_generator->setCurrentIndex(
+        boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX ? 1 : 0);
+
+    // Terrain relief. The canvas is 2D, so Z cannot be drawn: these two fields
+    // are the range the randomiser shapes per-node depth inside.
+    m_relief_front = new QDoubleSpinBox(mesh_box);
+    m_relief_front->setRange(0.0, 100000.0); m_relief_front->setValue(45.0);
+    m_relief_front->setDecimals(1);
+    m_relief_back = new QDoubleSpinBox(mesh_box);
+    m_relief_back->setRange(0.0, 100000.0); m_relief_back->setValue(45.0);
+    m_relief_back->setDecimals(1);
+    auto* relief_btn = new QPushButton("Randomise Z", mesh_box);
+    auto* relief_clear = new QPushButton("Flatten Z", mesh_box);
+    auto* relief_row = new QWidget(mesh_box);
+    auto* relief_layout = new QHBoxLayout(relief_row);
+    relief_layout->setContentsMargins(0, 0, 0, 0);
+    relief_layout->addWidget(relief_btn); relief_layout->addWidget(relief_clear);
+    m_relief_status = new QLabel("Flat slab — no per-node Z yet.", mesh_box);
+    m_relief_status->setWordWrap(true);
+
+    mesh_form->addRow("Generator", m_generator);
     mesh_form->addRow("Object name", m_name);
     mesh_form->addRow("Top texture", m_top_texture);
     mesh_form->addRow("Front texture", m_front_texture);
@@ -805,6 +837,10 @@ GroundMeshStudio::GroundMeshStudio(QWidget* parent) : QWidget(parent) {
     mesh_form->addRow("Object Depth (Z)", m_world_z);
     mesh_form->addRow("Min depth", m_depth_min);
     mesh_form->addRow("Max depth", m_depth_max);
+    mesh_form->addRow("Randomise +Z", m_relief_front);
+    mesh_form->addRow("Randomise -Z", m_relief_back);
+    mesh_form->addRow(relief_row);
+    mesh_form->addRow(m_relief_status);
     form->addWidget(mesh_box);
 
     auto* edit_box = new QGroupBox("Polygon", panel);
@@ -877,6 +913,18 @@ GroundMeshStudio::GroundMeshStudio(QWidget* parent) : QWidget(parent) {
     connect(save_btn, &QPushButton::clicked, this, &GroundMeshStudio::save_mesh);
     connect(add_btn, &QPushButton::clicked, this, &GroundMeshStudio::add_to_scene);
     connect(m_points_editor, &QPlainTextEdit::textChanged, this, &GroundMeshStudio::load_from_text);
+    connect(relief_btn, &QPushButton::clicked, this, &GroundMeshStudio::randomise_relief);
+    connect(relief_clear, &QPushButton::clicked, this, &GroundMeshStudio::clear_relief);
+    connect(m_generator, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        boulderx::set_ground_generator(index == 1 ? boulderx::GroundGenerator::BoulderX
+                                                  : boulderx::GroundGenerator::Boulder);
+        sync_relief_to_polygon();
+    });
+    // A ring edit invalidates per-node depths that no longer describe a vertex,
+    // so relief is re-synchronised (and dropped when it has become uniform)
+    // rather than left to pair a depth with the wrong node.
+    connect(m_canvas, &GroundMeshCanvas::changed, this, &GroundMeshStudio::sync_relief_to_polygon);
+    sync_relief_to_polygon();
 
     refresh_summary();
 }
@@ -930,6 +978,145 @@ void GroundMeshStudio::load_from_text() {
     refresh_summary();
 }
 
+// ── Sheet text: which dialect can express this sheet? ────────────────────────
+//
+// v1 (boulder) stores ONE depth pair for the whole sheet. v2 (boulderx) stores a
+// depth per node. So a sheet with any per-node relief can only be written as v2,
+// and writing it as v1 would silently flatten the Z the modder sculpted. The
+// converse is not a problem: v1 sheets load in both, so an untouched slab stays
+// readable by every tool.
+namespace {
+
+bool sheet_has_relief(const QVector<double>& front_z, const QVector<double>& back_z) {
+    if (front_z.isEmpty() || front_z.size() != back_z.size()) return false;
+    for (int i = 1; i < front_z.size(); ++i) {
+        if (std::fabs(front_z[i] - front_z[0]) > 1e-6 ||
+            std::fabs(back_z[i] - back_z[0]) > 1e-6)
+            return true;
+    }
+    return false;
+}
+
+std::string build_sheet_text(const std::vector<std::pair<float, float>>& points,
+                             const QVector<double>& front_z, const QVector<double>& back_z,
+                             double min_depth, double max_depth, double surface_width,
+                             int mesh_type, uint32_t random_seed,
+                             const std::string& top_tex, const std::string& front_tex,
+                             double world_z, const std::string& identifier,
+                             bool force_v2, bool* wrote_v2) {
+    const double front = std::max(min_depth, max_depth);
+    const double back = std::min(min_depth, max_depth);
+    const bool per_node = sheet_has_relief(front_z, back_z);
+    const bool v2 = per_node || force_v2;
+    if (wrote_v2) *wrote_v2 = v2;
+
+    if (!v2) {
+        boulder::GroundMesh gm;
+        for (const auto& p : points) gm.polygon.push_back({double(p.first), double(p.second)});
+        boulder::ensure_ccw(gm.polygon);
+        gm.min_depth = back;
+        gm.max_depth = front;
+        gm.surface_width = surface_width;
+        gm.top_texture = top_tex;
+        gm.bottom_texture = front_tex;
+        gm.z = world_z;
+        gm.random_seed = random_seed;
+        return boulder::serialize_swdm(gm);
+    }
+
+    boulderx::SwdmDocument doc;
+    doc.identifier = identifier;
+    doc.params.mesh_type = mesh_type;
+    doc.params.surface_width = surface_width;
+    doc.params.random_seed = random_seed;
+    doc.params.surface_texture = top_tex;
+    doc.params.front_texture = front_tex;
+    doc.outline.reserve(points.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+        boulderx::Node n;
+        n.x = points[i].first;
+        n.y = points[i].second;
+        // A node without its own depth (no relief yet) uses the slab's own pair,
+        // so toggling the generator does not change geometry by itself.
+        n.front_depth = (i < size_t(front_z.size())) ? front_z[int(i)] : front;
+        n.back_depth = (i < size_t(back_z.size())) ? back_z[int(i)] : back;
+        doc.outline.push_back(n);
+    }
+    return boulderx::serialize_swdm(doc);
+}
+
+} // namespace
+
+void GroundMeshStudio::sync_relief_to_polygon() {
+    if (m_relief_syncing) return;
+    m_relief_syncing = true;
+    const int n = m_canvas->vertex_count();
+    if (m_front_z.size() != n) {
+        m_front_z.resize(n);
+        m_back_z.resize(n);
+        for (int i = 0; i < n; ++i) {
+            m_front_z[i] = m_depth_max->value();
+            m_back_z[i] = m_depth_min->value();
+        }
+    }
+    if (!sheet_has_relief(m_front_z, m_back_z)) {
+        m_front_z.clear();
+        m_back_z.clear();
+        m_relief_seed = 0;
+    }
+    m_relief_syncing = false;
+
+    if (m_relief_status) {
+        const bool relief = sheet_has_relief(m_front_z, m_back_z);
+        m_relief_status->setText(relief
+            ? QString("Per-node Z active — seed %1. Exports as a Zenith sheet (v2); "
+                      "Boulder cannot open it.").arg(m_relief_seed)
+            : QString("Uniform slab at Min/Max depth — exports as a v1 sheet, which "
+                      "Boulder and Zenith both read."));
+    }
+}
+
+void GroundMeshStudio::randomise_relief() {
+    if (m_canvas->vertex_count() < 3) {
+        m_summary->setText("Need at least three vertices before shaping terrain relief.");
+        return;
+    }
+    const auto points = m_canvas->polygon();
+    std::vector<boulderx::Node> outline;
+    outline.reserve(points.size());
+    for (const auto& p : points) outline.push_back({double(p.first), double(p.second), 0.0, 0.0});
+
+    const double front = m_relief_front->value() > 0.0 ? m_relief_front->value()
+                                                       : std::fabs(m_depth_max->value());
+    const double back = m_relief_back->value() > 0.0 ? m_relief_back->value()
+                                                     : std::fabs(m_depth_min->value());
+
+    // Seed advances on every press so repeated taps give new terrain, and the
+    // value is shown so the same terrain can be reproduced from it.
+    m_relief_seed = m_relief_seed ? m_relief_seed * 1664525u + 1013904223u
+                                  : 12345u;
+    boulderx::randomise_node_depths(outline, front, back, m_relief_seed);
+
+    m_front_z.resize(int(outline.size()));
+    m_back_z.resize(int(outline.size()));
+    for (size_t i = 0; i < outline.size(); ++i) {
+        m_front_z[int(i)] = outline[i].front_depth;
+        m_back_z[int(i)] = outline[i].back_depth;
+    }
+    sync_relief_to_polygon();
+    m_canvas->update();
+    refresh_summary();
+}
+
+void GroundMeshStudio::clear_relief() {
+    m_front_z.clear();
+    m_back_z.clear();
+    m_relief_seed = 0;
+    sync_relief_to_polygon();
+    m_canvas->update();
+    refresh_summary();
+}
+
 void GroundMeshStudio::clear_canvas() { m_canvas->clear(); }
 
 void GroundMeshStudio::undo_canvas() { m_canvas->undo(); }
@@ -947,22 +1134,37 @@ void GroundMeshStudio::add_to_scene() {
         m_summary->setText("Polygon is self-intersecting — undo or move vertices until it is simple.");
         return;
     }
-    boulder::GroundMesh gm;
-    gm.top_texture = m_top_texture->text().toStdString();
-    gm.bottom_texture = m_front_texture->text().toStdString();
-    gm.z = m_world_z->value();
-    gm.min_depth = m_depth_min->value();
-    gm.max_depth = m_depth_max->value();
-    for (const auto& p : points) gm.polygon.push_back({p.first, p.second});
-    boulder::ensure_ccw(gm.polygon);
-
     QString name = m_name->text().trimmed();
     if (name.isEmpty()) name = "ground_mesh";
-    const std::string swdm = boulder::serialize_swdm(gm);
-    const std::string bin = boulder::generate_ground_mesh_object(swdm, name.toStdString(),
-                                                                 m_world_z->value());
+
+    const bool want_boulderx =
+        boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX;
+    bool wrote_v2 = false;
+    // MeshType 1 and the editor's default seed are what this panel has always
+    // built with (it exposes neither field); the point of routing through
+    // build_sheet_text is the per-node depth and the dialect, not new defaults.
+    const std::string swdm = build_sheet_text(
+        points, m_front_z, m_back_z, m_depth_min->value(), m_depth_max->value(), 80.0, 1,
+        1291618994u,
+        m_top_texture->text().toStdString(), m_front_texture->text().toStdString(),
+        m_world_z->value(), name.toStdString(), want_boulderx, &wrote_v2);
+
+    // The generator the user picked rebuilds the object; the sheet's dialect is
+    // what it must be able to express. BoulderX reads both, so a v1 sheet in
+    // BoulderX mode is fine — and a v2 sheet in Boulder mode is refused below
+    // with the reason, rather than flattened.
+    std::string bin;
+    if (want_boulderx) {
+        bin = boulderx::generate_ground_mesh_object_swdm(swdm, name.toStdString());
+    } else {
+        bin = boulder::generate_ground_mesh_object(swdm, name.toStdString(), m_world_z->value());
+    }
     if (bin.empty()) {
-        m_summary->setText("Ground mesh generator rejected the polygon (boulder).");
+        const std::string reason = want_boulderx ? boulderx::last_decline_reason()
+                                                 : boulder::last_parse_error();
+        m_summary->setText(QString("Ground mesh generator rejected the polygon (%1): %2")
+            .arg(want_boulderx ? "Zenith" : "Boulder")
+            .arg(QString::fromStdString(reason)));
         return;
     }
     emit groundMeshAddToScene(name, QByteArray(bin.data(), int(bin.size())),
@@ -981,17 +1183,17 @@ void GroundMeshStudio::save_mesh() {
         m_summary->setText("Polygon is self-intersecting — undo or move vertices until it is simple.");
         return;
     }
-    boulder::GroundMesh gm;
-    gm.top_texture = m_top_texture->text().toStdString();
-    gm.bottom_texture = m_front_texture->text().toStdString();
-    gm.z = m_world_z->value();
-    gm.min_depth = m_depth_min->value();
-    gm.max_depth = m_depth_max->value();
-    for (const auto& p : points) gm.polygon.push_back({p.first, p.second});
-    boulder::ensure_ccw(gm.polygon);
-    const std::string blob = boulder::serialize_swdm(gm);
+    QString mesh_name = m_name->text().trimmed();
+    if (mesh_name.isEmpty()) mesh_name = "ground_mesh";
+    bool wrote_v2 = false;
+    const std::string blob = build_sheet_text(
+        points, m_front_z, m_back_z, m_depth_min->value(), m_depth_max->value(), 80.0, 1,
+        1291618994u, m_top_texture->text().toStdString(),
+        m_front_texture->text().toStdString(), m_world_z->value(),
+        mesh_name.toStdString(),
+        boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX, &wrote_v2);
     if (blob.empty()) {
-        m_summary->setText("Ground mesh validation failed (boulder rejected the polygon).");
+        m_summary->setText("Ground mesh validation failed (the sheet could not be serialized).");
         return;
     }
     QString base_dir = QString::fromStdString(ruby::core::ProjectContext::instance().project_dir());
@@ -1004,8 +1206,7 @@ void GroundMeshStudio::save_mesh() {
     }
     if (base_dir.isEmpty() || !QDir(base_dir).exists()) base_dir = QDir::currentPath();
 
-    const QString suggested = QDir(base_dir).filePath(
-        QString::fromStdString(gm.top_texture.empty() ? "ground" : gm.top_texture) + "_ground.swdm");
+    const QString suggested = QDir(base_dir).filePath(mesh_name + "_ground.swdm");
     const QString path = QFileDialog::getSaveFileName(this, "Save ground mesh", suggested,
                                                       "Ground mesh (*.swdm *.gmesh)");
     if (path.isEmpty()) return;
@@ -1015,8 +1216,11 @@ void GroundMeshStudio::save_mesh() {
         return;
     }
     out.write(blob.data(), qint64(blob.size()));
-    m_summary->setText(QString("Saved %1 (%2 bytes). Wire it into a scene object to place it.")
-        .arg(QFileInfo(path).fileName()).arg(int(blob.size())));
+    m_summary->setText(QString("Saved %1 (%2 bytes, %3). Wire it into a scene object to place it.")
+        .arg(QFileInfo(path).fileName())
+        .arg(int(blob.size()))
+        .arg(wrote_v2 ? QStringLiteral("Zenith sheet, per-node Z")
+                      : QStringLiteral("sheet readable by both generators")));
     emit groundMeshSaved(path);
 }
 

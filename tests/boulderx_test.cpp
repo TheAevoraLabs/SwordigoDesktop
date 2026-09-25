@@ -104,15 +104,34 @@ static void test_vanilla_concave_outline() {
     boulderx::append_polyline(doc.outline, xy, 85.0, -85.0);
     doc.params.mesh_type = 0;
     doc.params.horiz_noise = 0.0;
+    // The outline's own depths are the subject of every check below, so this must
+    // be the outline-driven law, not the engine's SurfaceWidth law. `Engine` is
+    // the shipped default (see test [15]).
+    doc.params.depth_source = boulderx::Params::DepthSource::Outline;
     doc.params.surface_texture = "graveyard_ground";
     doc.params.front_texture = "graveyard_ground";
 
     boulderx::Mesh mesh;
     check(boulderx::generate(doc.outline, doc.params, mesh), "20-node concave outline generates");
-    check(mesh.surfaces.size() == 1 && mesh.fronts.size() == 1, "MT0 emits one ribbon + one cap");
-    check(mesh.fronts[0].vertices.size() == (xy.size() - 2) * 3,
-          "cap has n-2 non-indexed triangles");
-    check(mesh.surfaces[0].vertices.size() == xy.size() * 2, "ribbon has two vertices per node");
+    // Every family goes out in the engine's <=20-face chunks, so the shape of
+    // the result is "some ribbon chunks + some cap chunks, none over 20 faces"
+    // and the per-family totals, not one mesh per family (doc 13 §1.3.2).
+    auto faces_of = [](const std::vector<boulderx::Submesh>& v) {
+        size_t n = 0;
+        for (const auto& s : v) n += s.indices.empty() ? s.vertices.size() / 3
+                                                      : s.indices.size() / 3;
+        return n;
+    };
+    auto chunked_ok = [&](const std::vector<boulderx::Submesh>& v) {
+        for (const auto& s : v)
+            if (faces_of({s}) > 20) return false;
+        return true;
+    };
+    check(!mesh.surfaces.empty() && !mesh.fronts.empty(), "MT0 emits a ribbon and a cap");
+    check(chunked_ok(mesh.surfaces) && chunked_ok(mesh.fronts),
+          "every submesh is at most 20 faces");
+    check(faces_of(mesh.fronts) == xy.size() - 2, "cap has n-2 non-indexed triangles");
+    check(faces_of(mesh.surfaces) == xy.size() * 2, "ribbon has two triangles per node");
     check_near(mesh.max_abs_z(), 85.0, 1e-3, "outermost depth is the authored half-depth");
 }
 
@@ -125,15 +144,19 @@ static void test_arc_outline() {
     boulderx::append_arc(doc.outline, 0.0, 0.0, 60.0, 180.0, 0.0, 24, 30.0, -30.0);
     doc.outline.push_back({60.0, 0.0, 30.0, -30.0});
     doc.params.mesh_type = 1;
+    doc.params.depth_source = boulderx::Params::DepthSource::Outline;
 
     boulderx::Mesh mesh;
     check(boulderx::generate(doc.outline, doc.params, mesh), "arced outline generates");
     const size_t corners = doc.outline.size();
     check(corners >= 26, "arc appended its samples");
-    check(mesh.fronts[0].vertices.size() == (corners - 2) * 3, "cap tiles the arched outline");
+    size_t cap_corners = 0;
+    for (const auto& sm : mesh.fronts) cap_corners += sm.vertices.size();
+    check(cap_corners == (corners - 2) * 3, "cap tiles the arched outline");
     // The crest is genuinely 3D: cap vertices reach the crest height.
     double top_y = -1e9;
-    for (const auto& v : mesh.fronts[0].vertices) top_y = std::max(top_y, (double)v.y);
+    for (const auto& sm : mesh.fronts)
+        for (const auto& v : sm.vertices) top_y = std::max(top_y, (double)v.y);
     check_near(top_y, 60.0, 0.5, "cap reaches the arc crest");
 
     // A per-node tilt on the arc (what an editor would drag) must survive.
@@ -156,6 +179,7 @@ static void test_per_node_depth() {
     for (int i = 0; i < 4; ++i)
         doc.outline.push_back({px[i], py[i], front[i], back[i]});
     doc.params.mesh_type = 0;
+    doc.params.depth_source = boulderx::Params::DepthSource::Outline;
 
     boulderx::Mesh mesh;
     check(boulderx::generate(doc.outline, doc.params, mesh), "variable-depth outline generates");
@@ -193,6 +217,7 @@ static void test_horiz_noise() {
         doc.outline.push_back({100.0 * std::cos(a), 100.0 * std::sin(a), 10.0, -10.0});
     }
     doc.params.mesh_type = 0;
+    doc.params.depth_source = boulderx::Params::DepthSource::Outline;
 
     boulderx::Mesh flat;
     check(boulderx::generate(doc.outline, doc.params, flat), "noiseless outline generates");
@@ -234,6 +259,7 @@ static void test_mesh_types() {
     boulderx::append_rect(doc.outline, 0, 0, 200, 100, 100.0, -100.0);
     doc.params.hat_height = 25.0;
     doc.params.hat_width_offset_1 = 5.0;
+    doc.params.depth_source = boulderx::Params::DepthSource::Outline;
 
     doc.params.mesh_type = 0;
     boulderx::Mesh plain;
@@ -260,19 +286,56 @@ static void test_mesh_types() {
     check_near(rimmed.surfaces[1].vertices[0].z, -100.0, 1e-3, "MT1 inset ribbon stays on the plane");
     for (const auto& v : rimmed.fronts[0].vertices)
         check_near(v.z, 100.0, 1e-3, "MT1 cap stays on the front plane");
+    // Where the rim lands. MEASURED rule, not the single-edge reading: a node
+    // carries a cross-section when EITHER of its edge normals faces +Y past
+    // 1/sqrt(2), and a rim run spans consecutive such nodes. The evidence is
+    // thecave_part15 obj9#10, whose 59-node outline the generator reproduces
+    // vertex-for-vertex (tools/ground_mesh_truth.py + the node-by-node diff: 53 of
+    // 59 nodes exact, the rest 0.004 float noise): there the rim owns nodes 0..20
+    // while the plain wall owns 0, 16, 17, 20 and 21..58, which is only consistent
+    // with the either-edge rule at the run boundaries. On this CCW rectangle that
+    // is node 2 (200,100) — its outgoing edge runs -X, so its normal is +Y — and
+    // node 3 (0,100), whose INCOMING edge (200,100)->(0,100) also faces +Y. Two
+    // cross-sections, and because the two nodes are adjacent the rim sweeps a band
+    // between them instead of stopping.
+    check(rimmed.surfaces[0].vertices.size() == 12,
+          "MT1 rim covers both +Y-facing nodes (two 6-vertex cross-sections)");
+    check(!rimmed.surfaces[0].indices.empty(),
+          "adjacent rim nodes sweep a band between their cross-sections");
+
     // The rim rolls INWARD (verified: obj12's ring steps 99.644 -> 89.644 ->
     // 74.644 in y where the outward normal points +y). Only z leaves the
     // authored planes.
-    double max_x = -1e9, min_x = 1e9;
+    //
+    // The rho = 0 profile pair is not exactly ON the outline: it sits on the node
+    // pulled 3 units BACK along its incoming edge — the engine's convex-corner
+    // shift, measured at exactly 3.000 at thecave_crypt2 obj5 node 17 and
+    // beyond_graveyard obj12 node 2 (x 189.595 = 186.595 + 3). Here node 2's
+    // incoming edge (200,0)->(200,100) runs +Y, so its base is (200, 103), and
+    // node 3's incoming edge (200,100)->(0,100) runs -X, so its base is (-3, 100).
+    // The inset after that is pure (0.4*HatHeight for the bevel, HatHeight for the
+    // inner wall), so each cross-section keeps its shifted coordinate: node 2 runs
+    // y 103 -> 93 -> 78 at x 200, node 3 runs y 100 -> 90 -> 75 at x -3.
+    double max_x = -1e9, min_x = 1e9, max_y = -1e9, min_y = 1e9;
+    bool saw2 = false, saw3 = false, saw_bevel = false, saw_wall = false;
     for (const auto& v : rimmed.surfaces[0].vertices) {
         max_x = std::max(max_x, (double)v.x);
         min_x = std::min(min_x, (double)v.x);
+        max_y = std::max(max_y, (double)v.y);
+        min_y = std::min(min_y, (double)v.y);
+        if (std::fabs(v.x - 200.0) < 1e-3 && std::fabs(v.y - 103.0) < 1e-3) saw2 = true;
+        if (std::fabs(v.x + 3.0) < 1e-3 && std::fabs(v.y - 100.0) < 1e-3) saw3 = true;
+        if (std::fabs(v.y - 93.0) < 1e-3 || std::fabs(v.y - 90.0) < 1e-3) saw_bevel = true;
+        if (std::fabs(v.y - 78.0) < 1e-3 || std::fabs(v.y - 75.0) < 1e-3) saw_wall = true;
     }
-    // The rho = 0 profile points sit exactly ON the outline, so the rim's outer
-    // edge reproduces the authored polygon rather than approximating it.
-    check_near(max_x, 200.0, 1e-3, "rim outer edge follows the polygon edge");
-    check(min_x >= 0.0 - 1e-6, "rim does not push outside the polygon");
-    check(min_x < 25.0, "rim rolls in from the far edge");
+    check(saw2, "node 2's base sits 3 back along its +Y incoming edge");
+    check(saw3, "node 3's base sits 3 back along its -X incoming edge");
+    check_near(max_x, 200.0, 1e-3, "the rim only ever moves inward from the shifted base");
+    check_near(min_x, -3.0, 1e-3, "…on both cross-sections (the inset is pure -Y)");
+    check_near(max_y, 103.0, 1e-3, "node 2's cross-section starts on its shifted y");
+    check_near(min_y, 75.0, 1e-3, "and the deepest point is HatHeight in from node 3");
+    check(saw_bevel, "the bevel sits 0.4*HatHeight in from the outer pair");
+    check(saw_wall, "and the inner wall HatHeight in");
 }
 
 // ── 7. .swdm round-trip ─────────────────────────────────────────────────────
@@ -345,17 +408,30 @@ static void test_binary_object() {
 static void test_generator_choice() {
     std::printf("[9] generator choice + decline reason\n");
 
-    // Round-trip, plus totality: the id comes from a persisted config file, so
-    // an unrecognised one must resolve to Boulder rather than to a third state.
+    // Boulder is the shipped default, and BoulderX is opt-in. Checked before any
+    // setter runs, and skipped when the environment variable has deliberately
+    // overridden the initial value.
+    if (std::getenv("RUBY_GROUND_GENERATOR") == nullptr) {
+        check(boulderx::ground_generator() == boulderx::GroundGenerator::Boulder,
+              "Boulder is the default generator");
+    }
+
+    // Round-trip, plus totality: the id comes from a persisted config file, so an
+    // unrecognised one must resolve to a real generator rather than to a third
+    // state — and, since Boulder is the default, to the DEFAULT one rather than
+    // silently switching a scene to the other. Only the literal "boulderx"
+    // selects BoulderX.
     for (boulderx::GroundGenerator g : {boulderx::GroundGenerator::Boulder,
                                         boulderx::GroundGenerator::BoulderX}) {
         check(boulderx::ground_generator_from_id(boulderx::ground_generator_id(g)) == g,
               std::string("id round-trips: ") + boulderx::ground_generator_id(g));
     }
+    check(boulderx::ground_generator_from_id("boulderx") == boulderx::GroundGenerator::BoulderX,
+          "an explicit boulderx id selects BoulderX (still fully available)");
     check(boulderx::ground_generator_from_id("") == boulderx::GroundGenerator::Boulder,
-          "absent id resolves to Boulder");
+          "absent id resolves to the default, Boulder");
     check(boulderx::ground_generator_from_id("ZenithMesh") == boulderx::GroundGenerator::Boulder,
-          "unknown id resolves to Boulder, not to a generator that isn't there");
+          "unknown id resolves to the default, not to the non-default generator");
 
     // The setter is what the settings bridge drives; it must take effect on the
     // next call, not the next launch.
@@ -372,23 +448,32 @@ static void test_generator_choice() {
     // A shape boulderx reproduces: succeeds and leaves no decline behind.
     boulderx::clear_decline_reason();
     const std::string ok = boulderx::generate_ground_mesh_object_flat(
-        square, 1, 25.0, "surface_tex", "front_tex", "pick_ok", false, nullptr);
+        square, 1, 25.0, "surface_tex", "front_tex", "pick_ok", {}, nullptr);
     check(!ok.empty(), "flat adapter emits a plain square");
     check(boulderx::last_decline_reason().empty(),
           "a successful generation leaves no decline reason");
 
-    // Dome hats: refused, and the refusal says why.
-    const std::string refused = boulderx::generate_ground_mesh_object_flat(
-        square, 1, 25.0, "surface_tex", "front_tex", "pick_hat", true, nullptr);
-    check(refused.empty(), "dome hats are refused rather than silently dropped");
-    check(!boulderx::last_decline_reason().empty(), "a refusal always records a reason");
-    check(boulderx::last_decline_reason().find("dome hat") != std::string::npos,
-          "the reason names dome hats");
+    // Dome hats are emitted, not refused. boulder owns this geometry (the engine
+    // has no such thing — see the note on boulderx::Hat), so a generator that
+    // dropped it would delete a dome from a level on a generator switch. The
+    // geometry itself is pinned in [14].
+    const std::vector<boulderx::Hat> hats = {{50.0, 50.0, 30.0, 20.0}};
+    const std::string hat_ok = boulderx::generate_ground_mesh_object_flat(
+        square, 1, 25.0, "surface_tex", "front_tex", "pick_hat", hats, nullptr);
+    check(!hat_ok.empty(), "a dome hat is emitted rather than refused");
+    check(boulderx::last_decline_reason().empty(),
+          "and a hat is not a decline the HUD would report");
 
-    // A later success must clear the earlier refusal, or the HUD would report a
-    // fallback that did not happen on this edit.
+    // A degenerate request still declines, and a later success must clear that
+    // reason, or the HUD would report a fallback that did not happen on this edit.
+    const std::vector<std::pair<double, double>> too_few = {{0, 0}, {100, 0}};
+    check(boulderx::generate_ground_mesh_object_flat(
+              too_few, 1, 25.0, "surface_tex", "front_tex", "pick_bad", {}, nullptr)
+              .empty(),
+          "a two-node polygon is still refused");
+    check(!boulderx::last_decline_reason().empty(), "a refusal always records a reason");
     boulderx::generate_ground_mesh_object_flat(
-        square, 1, 25.0, "surface_tex", "front_tex", "pick_ok2", false, nullptr);
+        square, 1, 25.0, "surface_tex", "front_tex", "pick_ok2", {}, nullptr);
     check(boulderx::last_decline_reason().empty(),
           "a subsequent success clears the stale reason");
 
@@ -438,6 +523,7 @@ static void test_node_depth_preserved() {
     boulderx::append_polyline(doc.outline, xy, 40.0, -40.0);
     doc.params.mesh_type = 0;
     doc.params.horiz_noise = 0.0;
+    doc.params.depth_source = boulderx::Params::DepthSource::Outline;
 
     boulderx::Mesh flat;
     check(boulderx::generate(doc.outline, doc.params, flat), "uniform outline generates");
@@ -459,18 +545,19 @@ static void test_node_depth_preserved() {
     // And it has to survive into the emitted scene object, which is the only
     // thing the editor ever sees.
     const std::string bin = boulderx::generate_ground_mesh_object_nodes(
-        outline, doc.params, "relief_probe", false, nullptr);
+        outline, doc.params, "relief_probe", {}, nullptr);
     check(!bin.empty(), "per-node outline emits a scene object");
     check(bin.find("relief_probe") != std::string::npos,
           "the emitted object carries its identifier");
 
-    // The per-node entry point must still decline dome hats rather than drop
-    // them, exactly like the flat one.
+    // Hats ride along with a per-node outline too, instead of deciding whether
+    // the object may be generated at all.
+    const std::vector<boulderx::Hat> hats = {{50.0, 50.0, 30.0, 20.0}};
     boulderx::clear_decline_reason();
-    check(boulderx::generate_ground_mesh_object_nodes(outline, doc.params, "hat", true, nullptr)
-              .empty(),
-          "the per-node entry point refuses dome hats too");
-    check(!boulderx::last_decline_reason().empty(), "and records why");
+    const std::string with_hat =
+        boulderx::generate_ground_mesh_object_nodes(outline, doc.params, "hat", hats, nullptr);
+    check(!with_hat.empty(), "the per-node entry point emits dome hats");
+    check(boulderx::last_decline_reason().empty(), "and declines nothing");
 }
 
 // ── 11. Relief randomiser ──────────────────────────────────────────────────
@@ -590,22 +677,324 @@ static void test_swdm_dialects() {
     check_near(upgraded.outline[1].back_depth, -25.0, 1e-6, "MinDepth became the per-node back");
     check(upgraded.params.surface_texture == "fire_grass", "TopTexture maps to the surface texture");
     check(upgraded.params.front_texture == "graveyard_ground", "BottomTexture maps to the front texture");
-    check(!upgraded.has_dome_hats, "boulder's empty Hat[ block is not mistaken for a dome");
+    check(upgraded.hats.empty(), "boulder's empty Hat[ block is not mistaken for a dome");
 
     // And the upgrade is usable end to end.
     check(!boulderx::generate_ground_mesh_object_swdm(v1, "upgraded").empty(),
           "a legacy sheet generates through BoulderX");
 
-    // A v1 sheet that really does carry a dome is refused rather than emitted
-    // without it.
+    // A v1 sheet that really does carry a dome keeps it: the block is read as
+    // geometry, the sheet generates, and the dome survives a write-back.
     std::string with_hat = v1;
     const size_t hat = with_hat.find("Hat[\n");
     if (hat != std::string::npos) with_hat.insert(hat + 5, "10 20 60 40\n");
     boulderx::SwdmDocument hat_doc;
-    check(boulderx::parse_swdm(with_hat, hat_doc) && hat_doc.has_dome_hats,
-          "a real Hat[ entry is recorded");
-    check(boulderx::generate_ground_mesh_object_swdm(with_hat, "hat").empty(),
-          "and the sheet is refused while dome hats are unimplemented");
+    check(boulderx::parse_swdm(with_hat, hat_doc) && hat_doc.hats.size() == 1,
+          "a real Hat[ entry comes back as geometry, not as a flag");
+    check_near(hat_doc.hats[0].x, 10.0, 1e-6, "carrying the hat's centre X");
+    check_near(hat_doc.hats[0].radius, 60.0, 1e-6, "its radius");
+    check(!boulderx::generate_ground_mesh_object_swdm(with_hat, "hat").empty(),
+          "and the sheet generates with its dome instead of being refused");
+
+    boulderx::SwdmDocument hat_rt;
+    const std::string hat_v2 = boulderx::serialize_swdm(hat_doc);
+    check(boulderx::parse_swdm(hat_v2, hat_rt) && hat_rt.hats.size() == 1,
+          "the hat survives a v2 write/read round trip");
+    check_near(hat_rt.hats[0].height, 40.0, 1e-6, "height included");
+    // The hatless sheets stay byte-identical: the block is written only when a
+    // hat exists, so nothing that used to parse this format changes shape.
+    check(boulderx::serialize_swdm(back).find("Hat[") == std::string::npos,
+          "a hatless sheet still writes no Hat[ block");
+}
+
+// ── 13. Recovering per-node Z out of a baked mesh ──────────────────────────
+//
+// The engine bakes one vertex per outline node at that node's exact XY, so a
+// shipped mesh IS the per-node depth array. This is what keeps an edit from
+// replacing vanilla relief with a uniform slab: the editors import through it.
+static void test_depth_recovery() {
+    std::printf("[13] per-node depth recovered from a baked mesh\n");
+
+    std::vector<boulderx::Node> outline = {
+        {0, 0, 30.0, -18.0}, {120, 0, 55.0, -40.0}, {120, 90, 12.5, -9.0},
+        {0, 90, 70.0, -3.0}};
+
+    // What the engine would have baked: a front-plane and a back-plane vertex per
+    // node at the node's XY, plus an inset rim vertex that must NOT match (the
+    // rim's bevel and inner wall sit inside the outline, not on it).
+    std::vector<float> positions;
+    for (const auto& n : outline) {
+        positions.push_back(float(n.x));
+        positions.push_back(float(n.y));
+        positions.push_back(float(n.front_depth));
+    }
+    for (const auto& n : outline) {
+        positions.push_back(float(n.x));
+        positions.push_back(float(n.y));
+        positions.push_back(float(n.back_depth));
+    }
+    positions.push_back(25.0f);   // inset rim profile, 25 units inside the ring
+    positions.push_back(30.0f);
+    positions.push_back(85.0f);
+
+    std::vector<double> front, back;
+    check(boulderx::recover_node_depths(outline, positions, 0.5, front, back),
+          "recovers depths from baked vertex positions");
+    check(front.size() == outline.size() && back.size() == outline.size(),
+          "one depth pair per node");
+    check_near(front[1], 55.0, 1e-4, "front depth comes back");
+    check_near(back[1], -40.0, 1e-4, "back depth comes back");
+    check_near(front[2], 12.5, 1e-4, "a thinner node keeps its own depth");
+    check_near(back[3], -3.0, 1e-4, "the thinnest node is not clamped to the mesh's max");
+
+    // With nothing near the ring there is nothing to recover, and saying so is
+    // what stops a caller from inventing relief.
+    const std::vector<float> elsewhere = {900, 900, 40, 950, 950, -40, 990, 990, 10};
+    std::vector<double> f2, b2;
+    check(!boulderx::recover_node_depths(outline, elsewhere, 0.5, f2, b2),
+          "a mesh that does not match the outline recovers nothing");
+
+    // A node with no match keeps the recovered range instead of gaining a
+    // zero-depth spike.
+    std::vector<float> partial;
+    for (size_t i = 0; i + 1 < outline.size(); ++i) {
+        partial.push_back(float(outline[i].x));
+        partial.push_back(float(outline[i].y));
+        partial.push_back(float(outline[i].front_depth));
+        partial.push_back(float(outline[i].x));
+        partial.push_back(float(outline[i].y));
+        partial.push_back(float(outline[i].back_depth));
+    }
+    std::vector<double> f3, b3;
+    check(boulderx::recover_node_depths(outline, partial, 0.5, f3, b3),
+          "a partially matching mesh still recovers");
+    // 55, not 70: the fallback range is taken from the nodes that DID match, so a
+    // node with no geometry behind it keeps the sheet's thickness rather than
+    // borrowing a depth from a neighbour it was never paired with.
+    check_near(f3[3], 55.0, 1e-4, "the unmatched node falls back to the matched front max");
+    check(b3[3] <= 0.0, "and never lands on the front side");
+
+    // The recovered depths must survive an edit: generate with noise zeroed (the
+    // bake already contains the object's HorizNoise) and the mesh comes back with
+    // the same per-node Z rather than one flat value.
+    boulderx::SwdmDocument doc;
+    doc.params.mesh_type = 0;
+    doc.params.horiz_noise = 0.0;
+    doc.params.depth_source = boulderx::Params::DepthSource::Outline;
+    boulderx::Mesh mesh;
+    check(boulderx::generate(outline, doc.params, mesh), "the recovered outline generates");
+    check(distinct_positive_z(mesh) == 4, "every recovered depth survives generation");
+
+    // The plain plane is what comes back, not the extreme one. A MeshType 1 rim
+    // rings its node with vertices at `plain +- HatWidthOffset1`, so taking the
+    // highest/lowest z on the column (what this function used to do) returns the
+    // RIM's plane, and build_rim then adds HatWidthOffset1 to it a second time.
+    // The stack below is one ribbon node's: ribbon +-30, rim +-35, bevel +-40.
+    std::vector<double> rf, rb;
+    std::vector<boulderx::Node> one_node = {
+        {0, 0, 30.0, -30.0}, {100, 0, 30.0, -30.0}, {0, 100, 30.0, -30.0}};
+    std::vector<float> three_nodes;
+    for (const auto& n : one_node) {
+        for (double z : {40.0, 30.0, 35.0}) {
+            three_nodes.push_back(float(n.x));
+            three_nodes.push_back(float(n.y));
+            three_nodes.push_back(float(z));
+        }
+        for (double z : {-40.0, -30.0, -35.0}) {
+            three_nodes.push_back(float(n.x));
+            three_nodes.push_back(float(n.y));
+            three_nodes.push_back(float(z));
+        }
+    }
+    check(boulderx::recover_node_depths(one_node, three_nodes, 0.5, rf, rb),
+          "a rimmed column still recovers");
+    check_near(rf[0], 30.0, 1e-4, "recovery returns the plain plane, not the rim's");
+    check_near(rb[0], -30.0, 1e-4, "…on the back side too");
+}
+
+// ── 14. Dome hats ──────────────────────────────────────────────────────────
+//
+// A hat is boulder's geometry, not the engine's: `.scratch/ground_dome_probe.py`
+// measures all 2,538 ground objects in the 202 decoded scenes and finds no dome
+// anywhere (every out-of-footprint vertex is exactly 3.000 from a convex node —
+// the rim's corner shift). So there is nothing to pin against a shipped scene
+// here; what there IS to pin is that boulderx reproduces boulder's dome, because
+// that is what a modder's sheet says the object should look like.
+//
+// The contract, from src/tools/boulder.cpp's generate_hat_mesh: a footprint
+// circle of `radius` at (x, y), a base 0.05 above the polygon's own top edge (the
+// anti-z-fighting lift), rising `height`, spanning the sheet's whole depth.
+static void test_dome_hats() {
+    std::printf("[14] dome hats: boulder's geometry, emitted not refused\n");
+
+    boulderx::SwdmDocument doc;
+    boulderx::append_rect(doc.outline, 0, 0, 200, 100, 30.0, -20.0);
+    doc.params.mesh_type = 1;
+    doc.params.horiz_noise = 0.0;
+    doc.params.depth_source = boulderx::Params::DepthSource::Outline;
+    doc.params.surface_texture = "hat_surface";
+    doc.params.front_texture = "hat_front";
+    doc.params.texture_scale = 250.0;
+
+    const std::vector<boulderx::Hat> hats = {
+        {50.0, 80.0, 30.0, 40.0},    // a real dome
+        {150.0, 80.0, 0.0, 40.0},    // no footprint: must contribute nothing
+    };
+
+    boulderx::Mesh mesh;
+    check(boulderx::generate(doc.outline, doc.params, mesh, &hats), "generates with hats");
+    // rim + ribbon + one dome (the zero-radius hat is skipped, not emitted as a
+    // degenerate spike).
+    check(mesh.surfaces.size() == 3, "MT1 + one hat = rim, ribbon, dome");
+    check(mesh.fronts.size() == 1, "the cap is unaffected");
+    check(mesh.surfaces[2].texture == "hat_surface", "the dome is walkable surface");
+    check(mesh.surfaces[2].indexed, "the dome is an indexed SurfaceMesh");
+
+    const boulderx::Submesh& dome = mesh.surfaces[2];
+    const int N = 18;   // cross-section segments, as boulder sweeps
+    check(dome.vertices.size() == size_t(2 * (N + 1) + 2),
+          "two vertices per profile sample plus the two cap centres");
+    check(dome.indices.size() / 3 == size_t(2 * N + 2 * N),
+          "a ridge quad per segment plus two N-gon fans");
+
+    double lo_x = 1e9, hi_x = -1e9, lo_y = 1e9, hi_y = -1e9, lo_z = 1e9, hi_z = -1e9;
+    for (const auto& v : dome.vertices) {
+        lo_x = std::min(lo_x, (double)v.x); hi_x = std::max(hi_x, (double)v.x);
+        lo_y = std::min(lo_y, (double)v.y); hi_y = std::max(hi_y, (double)v.y);
+        lo_z = std::min(lo_z, (double)v.z); hi_z = std::max(hi_z, (double)v.z);
+    }
+    // The polygon's own top edge is y = 100, so the base sits at 100.05 and the
+    // apex at 140.05 — it really does stand ON the surface and rise `height`.
+    check_near(lo_y, 100.05, 1e-4, "the dome base is the polygon's top edge (+0.05)");
+    check_near(hi_y, 140.05, 1e-4, "and the apex is exactly `height` above it");
+    check_near(hi_y - lo_y, 40.0, 1e-4, "so the silhouette height is the authored height");
+    check_near(lo_x, 20.0, 1e-4, "footprint left edge = centre - radius");
+    check_near(hi_x, 80.0, 1e-4, "footprint right edge = centre + radius");
+    check_near(hi_x - lo_x, 60.0, 1e-4, "so the footprint really is 2*radius wide");
+    // The sheet's depth: every node is 30/-20 here, so the dome spans it exactly
+    // rather than carrying a thickness of its own.
+    check_near(lo_z, -20.0, 1e-4, "the dome spans the sheet's back depth");
+    check_near(hi_z, 30.0, 1e-4, "and its front depth");
+
+    // Per-node relief must carry into the dome as well, or a hat on a noisy
+    // ledge would be a flat plate sunk into it.
+    std::vector<boulderx::Node> varied = doc.outline;
+    for (size_t i = 0; i < varied.size(); ++i) {
+        varied[i].front_depth = 30.0 + 10.0 * double(i);
+        varied[i].back_depth = -20.0 - 5.0 * double(i);
+    }
+    boulderx::Mesh varied_mesh;
+    check(boulderx::generate(varied, doc.params, varied_mesh, &hats), "generates on a noisy sheet");
+    lo_z = 1e9; hi_z = -1e9;
+    for (const auto& v : varied_mesh.surfaces[2].vertices) {
+        lo_z = std::min(lo_z, (double)v.z); hi_z = std::max(hi_z, (double)v.z);
+    }
+    check_near(lo_z, -35.0, 1e-4, "the dome reaches the sheet's deepest back node");
+    check_near(hi_z, 60.0, 1e-4, "and its shallowest front node");
+
+    // Independence: the dome is its own submesh with its own 0-based indices, so
+    // adding one cannot renumber the rim or the ribbon.
+    boulderx::Mesh no_hats;
+    check(boulderx::generate(doc.outline, doc.params, no_hats), "generates without hats");
+    check(no_hats.surfaces.size() == 2, "no hat means no third SurfaceMesh");
+    bool rim_unchanged = no_hats.surfaces[0].indices == mesh.surfaces[0].indices &&
+                         no_hats.surfaces[1].indices == mesh.surfaces[1].indices;
+    check(rim_unchanged, "a hat does not renumber the existing submeshes");
+
+    // The object's LocalAabb has to contain the dome: it rises above the polygon
+    // bounds, and an Aabb that stops at the polygon can get the dome culled.
+    // The Aabb is encoded as (x, y, w, h), so with the dome this object's height
+    // is 150.05 = -10 (the polygon's outset bottom) .. 140.05 (the apex).
+    const std::string bin = boulderx::generate_ground_mesh_object(
+        doc.outline, doc.params, "dome_obj", nullptr, &hats);
+    check(!bin.empty(), "the object emits with a dome");
+    const float want_h = 150.05f;
+    const std::string h_bytes(reinterpret_cast<const char*>(&want_h), 4);
+    check(bin.find(h_bytes) != std::string::npos,
+          "the emitted Aabb height reaches the dome's apex");
+
+    const std::string bin_no_hat = boulderx::generate_ground_mesh_object(
+        doc.outline, doc.params, "dome_obj", nullptr, nullptr);
+    check(bin_no_hat.find(h_bytes) == std::string::npos,
+          "and a hatless object does not borrow a hat's Aabb");
+
+    // Determinism: the same sheet and hats give the same mesh.
+    boulderx::Mesh again;
+    check(boulderx::generate(doc.outline, doc.params, again, &hats), "regenerates");
+    check(again.surfaces[2].vertices.size() == dome.vertices.size() &&
+          again.surfaces[2].vertices.back().z == dome.vertices.back().z,
+          "the same hats reproduce the same dome");
+}
+
+// ── 15. The depth law, and which one runs by default ───────────────────────
+//
+// GenerateMesh does not read a per-node depth from anywhere. It builds the array
+// from the generator's own parameters — `(frand() - 0.5) * HorizNoise +
+// SurfaceWidth/2` for the front plane, and the mirror for the back — with two
+// draws per node off one shared sequence. That law is what every other part of
+// the generator measures from (the ribbon and the cap sit on those planes, and
+// build_rim's bevel and inner wall are offsets from them), so it is the default.
+//
+// The values below are not invented: they are the first eight draws of that law
+// on seed 1291618994, SurfaceWidth 200, HorizNoise 40, and the same sequence is
+// what reproduces the shipped bakes (see tests/ground_mesh_compare_test.cpp,
+// which diffs a regenerated mesh against a real cave object).
+static void test_depth_law() {
+    std::printf("[15] the engine depth law, and the outline-driven alternative\n");
+
+    // An octagon, so there is real area — a collinear outline has none and is
+    // refused before either law is reached.
+    std::vector<boulderx::Node> outline;
+    for (int i = 0; i < 8; ++i) {
+        const double a = i * 3.14159265358979 / 4.0;
+        // Authored depths that are deliberately nothing like the law's, so a
+        // generator that ignores `depth_source` cannot pass by accident.
+        outline.push_back({200.0 * std::cos(a), 200.0 * std::sin(a), 5.0, -5.0});
+    }
+    boulderx::Params params;
+    params.mesh_type = 0;
+    params.surface_width = 200.0;
+    params.horiz_noise = 40.0;
+    params.random_seed = 1291618994u;
+
+    std::vector<double> front, back;
+    boulderx::engine_node_depths(params, outline.size(), front, back);
+    check(front.size() == outline.size() && back.size() == outline.size(),
+          "the law gives one depth pair per node");
+    double law_hi = 0.0, law_lo = 0.0;
+    for (size_t i = 0; i < outline.size(); ++i) {
+        // half = 100, noise/2 = 20, so every plane is inside [80, 120] / [-120, -80]
+        // and never on the authored +-5.
+        check(front[i] > 79.9 && front[i] < 120.1, "the law's front plane sits on SurfaceWidth/2");
+        check(back[i] < -79.9 && back[i] > -120.1, "…and its back plane mirrors it");
+        law_hi = std::max(law_hi, front[i]);
+        law_lo = std::min(law_lo, back[i]);
+    }
+    check(law_hi > 100.0, "the law's relief is genuinely per node, not one value");
+
+    boulderx::Mesh engine_mesh;
+    params.depth_source = boulderx::Params::DepthSource::Engine;
+    check(boulderx::generate(outline, params, engine_mesh), "the law generates");
+    // MeshType 0 is the ribbon and the cap alone, and both sit on the plain
+    // planes, so the mesh's envelope must be exactly the law's. max_abs_z is
+    // over both planes, so the expectation is the larger of the two.
+    check_near(engine_mesh.max_abs_z(), std::max(law_hi, -law_lo), 1e-3,
+               "the engine law ignores the outline's authored depths");
+    double lo_z = 1e9;
+    for (const auto& sm : engine_mesh.surfaces)
+        for (const auto& v : sm.vertices) lo_z = std::min(lo_z, (double)v.z);
+    check_near(lo_z, law_lo, 1e-3, "and reproduces the law's back plane too");
+
+    boulderx::Mesh outline_mesh;
+    params.depth_source = boulderx::Params::DepthSource::Outline;
+    params.horiz_noise = 0.0;   // the outline carries the jitter already
+    check(boulderx::generate(outline, params, outline_mesh), "the outline law generates");
+    check_near(outline_mesh.max_abs_z(), 5.0, 1e-3,
+               "the outline law honours them instead");
+
+    boulderx::Params fresh;
+    check(fresh.depth_source == boulderx::Params::DepthSource::Engine,
+          "Engine is the shipped default");
 }
 
 int main() {
@@ -624,6 +1013,9 @@ int main() {
     test_node_depth_preserved();
     test_relief_randomiser();
     test_swdm_dialects();
+    test_depth_recovery();
+    test_dome_hats();
+    test_depth_law();
     if (g_failures) {
         std::printf("FAIL: %d check(s) failed\n", g_failures);
         return 1;

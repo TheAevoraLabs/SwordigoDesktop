@@ -20,6 +20,7 @@
 #include <QKeyEvent>
 #include <cstdio>
 #include <cmath>
+#include <algorithm>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -27,6 +28,7 @@
 #include "ruby/viewport/viewport_3d_widget.h"
 #include "tools/scene_workspace.h"   // swk::object_world_matrix / world_to_screen / ImVec2
 #include "tools/boulder.h"
+#include "tools/boulderx.h"            // per-node relief: the Z that must survive an edit
 #include "platform/protobuf_reader.h"
 #include <map>
 
@@ -153,15 +155,44 @@ static void send_move(QWidget* w, const QPoint& pos, Qt::MouseButtons buttons = 
                    Qt::NoButton, buttons, Qt::NoModifier);
     QApplication::sendEvent(w, &ev);
 }
-static void send_press(QWidget* w, const QPoint& pos) {
+static void send_press_btn(QWidget* w, const QPoint& pos, Qt::MouseButton btn) {
     QMouseEvent ev(QEvent::MouseButtonPress, QPointF(pos), QPointF(pos),
-                   Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+                   btn, btn, Qt::NoModifier);
     QApplication::sendEvent(w, &ev);
 }
-static void send_release(QWidget* w, const QPoint& pos) {
+static void send_release_btn(QWidget* w, const QPoint& pos, Qt::MouseButton btn) {
     QMouseEvent ev(QEvent::MouseButtonRelease, QPointF(pos), QPointF(pos),
-                   Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+                   btn, Qt::NoButton, Qt::NoModifier);
     QApplication::sendEvent(w, &ev);
+}
+static void send_press(QWidget* w, const QPoint& pos) {
+    send_press_btn(w, pos, Qt::LeftButton);
+}
+static void send_release(QWidget* w, const QPoint& pos) {
+    send_release_btn(w, pos, Qt::LeftButton);
+}
+
+// How much the sheet's TOP surface varies from node to node. A per-node relief
+// mesh has a spread of tens of units; a uniform slab has one depth pair for the
+// whole sheet, so every node's crown sits at the SAME z and this collapses to 0.
+// That difference is the whole "Ruby GG flattens Z" report, so it is the metric
+// the regression asserts on rather than a proxy for it.
+static double top_surface_z_spread(const av::SceneObject& obj) {
+    std::map<std::pair<long, long>, double> top;
+    for (const auto& m : obj.ground_meshes) {
+        for (size_t v = 0; v + 2 < m.positions.size(); v += 3) {
+            const std::pair<long, long> k(std::lround(m.positions[v] * 2.0),
+                                          std::lround(m.positions[v + 1] * 2.0));
+            const double z = (double)m.positions[v + 2];
+            auto it = top.find(k);
+            if (it == top.end()) top.emplace(k, z);
+            else it->second = std::max(it->second, z);
+        }
+    }
+    if (top.size() < 3) return 0.0;
+    double lo = 1e30, hi = -1e30;
+    for (const auto& kv : top) { lo = std::min(lo, kv.second); hi = std::max(hi, kv.second); }
+    return hi - lo;
 }
 static void send_key(QWidget* w, int key) {
     QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier);
@@ -330,6 +361,127 @@ int main(int argc, char** argv) {
                 std::printf("FAIL: reloaded scene object count %zu != %zu\n",
                             reloaded.objects.size(), after.objects.size());
                 ++g_failures;
+            }
+        }
+    }
+
+    // ── Per-node relief must survive a STRUCTURAL edit ─────────────────────
+    //
+    // The "Ruby GG flattens Z" report. Boulder holds ONE depth pair for the whole
+    // sheet, so any path that reached it rebuilt a levelled terrain as a constant
+    // slab — and the desktop editor had two routes into it:
+    //
+    //   1. the per-node depth arrays were never kept in lockstep when a node was
+    //      inserted or deleted, so mesh_apply found them "missing" and used the
+    //      uniform pair for EVERY node, and
+    //   2. the pairing itself was all-or-nothing, so a single unpaired node
+    //      flattened the sheet.
+    //
+    // This drives the real RMB-edge-insert on an object that ships per-node
+    // relief and asserts the relief is still there when the session commits.
+    //
+    // It also has to select BoulderX, because per-node relief only exists on that
+    // path: Boulder holds one depth pair for the whole sheet, so it is *expected*
+    // to level this fixture, and a build whose default is Boulder would fail this
+    // assertion for the right reason. The lockstep property belongs to the
+    // BoulderX path, so the block selects it and restores the default after.
+    {
+        struct GeneratorScope {
+            boulderx::GroundGenerator saved;
+            explicit GeneratorScope(boulderx::GroundGenerator which)
+                : saved(boulderx::ground_generator()) {
+                boulderx::set_ground_generator(which);
+            }
+            ~GeneratorScope() { boulderx::set_ground_generator(saved); }
+        } generator_scope(boulderx::GroundGenerator::BoulderX);
+
+        std::vector<boulderx::Node> ring;
+        const double rx = 400.0, ry = 200.0;
+        for (int i = 0; i < 8; ++i) {
+            const double a = 2.0 * 3.14159265358979 * double(i) / 8.0;
+            boulderx::Node n;
+            n.x = rx * std::cos(a);
+            n.y = ry * std::sin(a);
+            n.front_depth = 20.0 + 12.0 * std::sin(a * 2.0);    // varies node to node
+            n.back_depth = -(20.0 + 12.0 * std::cos(a * 2.0));
+            ring.push_back(n);
+        }
+        boulderx::SwdmDocument doc;
+        doc.identifier = "mesh_relief_lockstep_test";
+        doc.params.surface_width = 80.0;
+        doc.params.random_seed = 1291618994u;
+        doc.params.surface_texture = "fire_grass";
+        doc.params.front_texture = "graveyard_ground";
+        doc.outline = ring;
+        const std::string relief_bin = boulderx::generate_ground_mesh_object_swdm(
+            boulderx::serialize_swdm(doc), doc.identifier);
+        if (relief_bin.empty()) {
+            std::printf("FAIL: BoulderX declined the relief fixture (%s)\n",
+                        boulderx::last_decline_reason().c_str());
+            ++g_failures;
+        } else {
+            std::vector<uint8_t> rbytes(relief_bin.begin(), relief_bin.end());
+            av::SceneData rparsed = av::scene_load_bytes(rbytes, src);
+            CHECK(!rparsed.objects.empty() && !rparsed.objects[0].ground_meshes.empty(),
+                  "the relief fixture parses into a ground-mesh object");
+            const int ridx = viewport->add_ground_mesh_object(rparsed.objects[0]);
+            app.processEvents();
+            viewport->set_selected_object(ridx);
+            app.processEvents();
+
+            const double relief_before =
+                top_surface_z_spread(viewport->scene().objects[ridx]);
+            std::printf("relief lockstep: top-surface Z spread before = %.2f\n", relief_before);
+            CHECK(relief_before > 5.0, "the fixture really does carry per-node relief");
+
+            viewport->set_mesh_edit(true);
+            app.processEvents();
+            CHECK(viewport->mesh_edit_active(), "mesh edit arms on the relief object");
+
+            // Screen position of the midpoint of edge 0->1: the RMB insert target.
+            const av::SceneObject& robj = viewport->scene().objects[ridx];
+            float rmat[16];
+            swk::object_world_matrix(robj, rmat);
+            const double mlx = (ring[0].x + ring[1].x) * 0.5;
+            const double mly = (ring[0].y + ring[1].y) * 0.5;
+            const float mid_w[3] = {
+                rmat[0] * (float)mlx + rmat[4] * (float)mly + rmat[12],
+                rmat[1] * (float)mlx + rmat[5] * (float)mly + rmat[13],
+                rmat[2] * (float)mlx + rmat[6] * (float)mly + rmat[14],
+            };
+            const auto rcam = viewport->camera_state();
+            av::Camera rc;
+            rc.yaw = rcam.yaw; rc.pitch = rcam.pitch; rc.distance = rcam.dist;
+            rc.target[0] = rcam.target[0]; rc.target[1] = rcam.target[1];
+            rc.target[2] = rcam.target[2];
+            rc.fov = 45.0f;
+            ImVec2 mid_scr;
+            if (!swk::world_to_screen(rc, 800, 600, ImVec2(0, 0), mid_w, mid_scr)) {
+                std::printf("FAIL: the edge midpoint does not project on screen\n");
+                ++g_failures;
+            } else {
+                const QPoint mid((int)mid_scr.x, (int)mid_scr.y);
+                send_move(viewport, mid);                  // hover arms the edge
+                app.processEvents();
+                send_press_btn(viewport, mid, Qt::RightButton);
+                app.processEvents();
+                send_release_btn(viewport, mid, Qt::RightButton);
+                app.processEvents();
+                send_key(viewport, Qt::Key_Escape);        // commit
+                app.processEvents();
+
+                const av::SceneObject& rel = viewport->scene().objects[ridx];
+                const int nodes_after = (int)(rel.ground_polygon_points.size() / 2);
+                std::printf("relief lockstep: outline nodes %zu -> %d\n",
+                            ring.size(), nodes_after);
+                CHECK(nodes_after == (int)ring.size() + 1,
+                      "RMB on an edge inserted exactly one node");
+
+                const double relief_after = top_surface_z_spread(rel);
+                std::printf("relief lockstep: top-surface Z spread after  = %.2f\n",
+                            relief_after);
+                CHECK(relief_after > relief_before * 0.5,
+                      "per-node relief survives a vertex insert (Boulder's slab is flat)");
             }
         }
     }

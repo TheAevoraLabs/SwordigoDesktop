@@ -100,6 +100,19 @@ std::filesystem::path resolve_pod(const fs::path& scene_path,
         dirs.push_back(home_path / "SwordigoDesktop/assets");
         dirs.push_back(home_path / "SwordigoDesktop/resources");
     }
+    for (const char* apath : {
+        "/storage/emulated/0/Download/Swordigo_Es_2.1.1/assets/resources",
+        "/storage/emulated/0/SwordigoMini.ver.7.0.build.46/assets/resources",
+        "/storage/emulated/0/Download/Swordigo_Es_2.1.1",
+        "/storage/emulated/0/Swordigo/assets/resources",
+        "/storage/emulated/0/Swordigo/resources",
+        "/sdcard/Swordigo/assets/resources",
+        "/sdcard/Download/Swordigo/resources",
+        "/sdcard/Swordigo/resources"
+    }) {
+        dirs.push_back(fs::path(apath));
+        dirs.push_back(fs::path(apath) / "resources");
+    }
     dirs.push_back(fs::path("assets"));
     dirs.push_back(fs::path("assets/resources"));
     dirs.push_back(fs::path("assets/models"));
@@ -179,6 +192,19 @@ std::vector<fs::path> texture_candidates(const fs::path& model_path,
         search_dirs.push_back(home_path / "SwordigoRefresh/assets/resources");
         search_dirs.push_back(home_path / "SwordigoDesktop/assets");
         search_dirs.push_back(home_path / "SwordigoDesktop/resources");
+    }
+    for (const char* apath : {
+        "/storage/emulated/0/Download/Swordigo_Es_2.1.1/assets/resources",
+        "/storage/emulated/0/SwordigoMini.ver.7.0.build.46/assets/resources",
+        "/storage/emulated/0/Download/Swordigo_Es_2.1.1",
+        "/storage/emulated/0/Swordigo/assets/resources",
+        "/storage/emulated/0/Swordigo/resources",
+        "/sdcard/Swordigo/assets/resources",
+        "/sdcard/Download/Swordigo/resources",
+        "/sdcard/Swordigo/resources"
+    }) {
+        search_dirs.push_back(fs::path(apath));
+        search_dirs.push_back(fs::path(apath) / "resources");
     }
     search_dirs.push_back(fs::path("assets"));
     search_dirs.push_back(fs::path("assets/resources"));

@@ -23,6 +23,7 @@
 #include <functional>
 #include <set>
 #include <thread>
+#include <fstream>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -331,6 +332,19 @@ static std::vector<fs::path> build_asset_roots(const fs::path& scene_or_model_pa
     }
     roots.push_back(fs::path("/sdcard/Swordigo/assets/resources"));
     roots.push_back(fs::path("/sdcard/Download/Swordigo/resources"));
+    roots.push_back(fs::path("/storage/emulated/0/Download/Swordigo_Es_2.1.1/assets/resources"));
+    roots.push_back(fs::path("/storage/emulated/0/SwordigoMini.ver.7.0.build.46/assets/resources"));
+    roots.push_back(fs::path("/storage/emulated/0/Download/Swordigo_Es_2.1.1"));
+    roots.push_back(fs::path("/storage/emulated/0/Swordigo/assets/resources"));
+    roots.push_back(fs::path("/storage/emulated/0/Swordigo/resources"));
+    roots.push_back(fs::path("/sdcard/Swordigo/resources"));
+    const char* home = getenv("HOME");
+    if (home) {
+        fs::path hp(home);
+        roots.push_back(hp / ".local/share/swordigo-desktop/assets/resources");
+        roots.push_back(hp / "SwordigoRefresh/assets/resources");
+        roots.push_back(hp / "SwordigoDesktop/assets/resources");
+    }
     return roots;
 }
 
@@ -348,6 +362,10 @@ public:
         delete m_outlineShader;
         if (m_gridVbo) glDeleteBuffers(1, &m_gridVbo);
         if (m_cubeVbo) glDeleteBuffers(1, &m_cubeVbo);
+        for (auto& pair : m_selLineCache) {
+            if (pair.second.ebo) glDeleteBuffers(1, &pair.second.ebo);
+        }
+        m_selLineCache.clear();
         for (auto& ggpu : m_sceneGroundGpu) {
             for (auto& g : ggpu.meshes) g.destroy(this);
         }
@@ -629,7 +647,7 @@ public:
             if (m_meshEditActive) {
                 renderMeshEditOverlay(view, proj);
             } else if (m_selectedObject >= 0 && m_selectedObject < int(m_sceneObjects.size())) {
-                renderSelectionHighlight(view, proj, m_sceneObjects[m_selectedObject]);
+                renderSelectionHighlight(view, proj, m_sceneObjects[m_selectedObject], m_selectedObject);
                 if (m_gizmoMode > 0) {
                     renderGizmo(view, proj, m_sceneObjects[m_selectedObject]);
                 }
@@ -866,6 +884,73 @@ private:
         if (found < 4) return false;
         out[0] = vals[0]; out[1] = vals[1]; out[2] = vals[2]; out[3] = vals[3];
         return true;
+    }
+
+    // ── Selection-highlight wireframe cache ────────────────────────────────
+    // A GL_LINES index buffer per mesh, built once from that mesh's triangles
+    // (desktop keeps the same cache in m_sel_line_cache). Keyed by the source
+    // position VBO, and re-verified against it, so a mesh re-upload or a scene
+    // reload can never show a stale wireframe.
+    struct SelLineCacheEntry {
+        GLuint ebo = 0;
+        int line_count = 0;
+        GLuint src_pos_vbo = 0;
+    };
+
+    static uint64_t sel_line_key(uint64_t kind, uint64_t id) {
+        return (kind << 32) ^ (id & 0xffffffffull);
+    }
+
+    void draw_mesh_edges(const MeshGpu& g, const av::PODMesh& src, uint64_t key, float line_w) {
+        if (!g.valid() || src.positions.empty()) return;
+
+        const size_t nv = src.positions.size() / 3;
+        const size_t tri = src.indices.empty() ? nv / 3 : src.indices.size() / 3;
+        // A level-wide ground submesh is a whole terrain; wiring every triangle of
+        // one is both slow and illegible, and the same cap applies to the rim.
+        if (tri == 0 || tri > 300000) return;
+
+        auto it = m_selLineCache.find(key);
+        if (it == m_selLineCache.end() || it->second.ebo == 0 ||
+            it->second.src_pos_vbo != g.pos_vbo) {
+            std::vector<uint32_t> lines;
+            lines.reserve(tri * 6);
+            for (size_t t = 0; t < tri; ++t) {
+                const uint32_t i0 = src.indices.empty() ? uint32_t(t * 3)     : src.indices[t * 3];
+                const uint32_t i1 = src.indices.empty() ? uint32_t(t * 3 + 1) : src.indices[t * 3 + 1];
+                const uint32_t i2 = src.indices.empty() ? uint32_t(t * 3 + 2) : src.indices[t * 3 + 2];
+                if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
+                lines.push_back(i0); lines.push_back(i1);
+                lines.push_back(i1); lines.push_back(i2);
+                lines.push_back(i2); lines.push_back(i0);
+            }
+            if (lines.empty()) return;
+
+            if (it != m_selLineCache.end() && it->second.ebo) {
+                GLuint old = it->second.ebo;
+                glDeleteBuffers(1, &old);
+            }
+
+            SelLineCacheEntry entry;
+            glGenBuffers(1, &entry.ebo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, entry.ebo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                         GLsizeiptr(lines.size() * sizeof(uint32_t)), lines.data(), GL_STATIC_DRAW);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+            entry.line_count = int(lines.size());
+            entry.src_pos_vbo = g.pos_vbo;
+            it = m_selLineCache.insert_or_assign(key, entry).first;
+        }
+
+        glBindBuffer(GL_ARRAY_BUFFER, g.pos_vbo);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, it->second.ebo);
+        glLineWidth(line_w);
+        glDrawElements(GL_LINES, it->second.line_count, GL_UNSIGNED_INT, nullptr);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glDisableVertexAttribArray(0);
     }
 
     void invalidate_scene_bounds() { m_boundsValid = false; }
@@ -1253,15 +1338,34 @@ private:
         m_unlitShader->release();
     }
 
-    void renderSelectionHighlight(const QMatrix4x4& view, const QMatrix4x4& proj, const av::SceneObject& obj) {
-        if (!m_unlitShader || !m_unlitShader->isLinked() || !m_cubeVbo) return;
+    // Desktop selection highlight, on the phone.
+    //
+    // Viewport3DWidget::draw_selection_highlight() highlights the object's REAL
+    // geometry: a crisp wireframe of its actual triangles plus an inverted-hull
+    // rim, and explicitly never "a flat box over the object". The mobile version
+    // used to draw the flat `ground_polygon_points` contour for ground objects
+    // and a cyan/red BOUNDING CUBE for anything else — and a baked-only ground
+    // object (no polygon component at all, so no contour) always landed in the
+    // cube branch. That cube is what showed over the selected terrain.
+    //
+    // Now the two front-ends draw the same thing: real triangle edges + rim.
+    void renderSelectionHighlight(const QMatrix4x4& view, const QMatrix4x4& proj,
+                                  const av::SceneObject& obj, int objIdx) {
+        if (!m_unlitShader || !m_unlitShader->isLinked()) return;
 
         float outMat[16];
         calc_object_world_matrix(obj, outMat);
         QMatrix4x4 baseWorld;
         std::memcpy(baseWorld.data(), outMat, 16 * sizeof(float));
 
-        bool renderedSilhouette = false;
+        // The rim is displaced in OBJECT space by the outline shader, so the
+        // offset has to be divided by the object's world scale to read as a
+        // constant distance on screen (desktop scales it by the view distance).
+        const float objScale = std::max(1e-3f,
+            std::max(std::abs(obj.scale_x), std::max(std::abs(obj.scale_y), std::abs(obj.scale_z)))
+            * std::abs(obj.template_scaling));
+        const float rim_world = std::clamp(0.006f * std::max(1.0f, m_distance), 0.02f, 4.0f);
+        const float rim_offset = rim_world / objScale;
 
         // 1. Inverted-hull silhouette outline for 3D Models
         const std::string modelName = !obj.mesh_name.empty() ? obj.mesh_name : obj.template_name;
@@ -1282,8 +1386,11 @@ private:
 
                     m_outlineShader->bind();
                     m_outlineShader->setUniformValue("uProj", proj);
-                    m_outlineShader->setUniformValue("uOutlineWidth", 0.035f);
-                    m_outlineShader->setUniformValue("uOutlineColor", QVector4D(1.0f, 0.16f, 0.38f, 0.95f));
+                    // The shader's uniform is uOutlineOffset; the old code set
+                    // "uOutlineWidth", which exists nowhere in it — so the rim was
+                    // drawn with a zero offset and was invisible.
+                    m_outlineShader->setUniformValue("uOutlineOffset", rim_offset);
+                    m_outlineShader->setUniformValue("uColor", QVector4D(0.72f, 0.25f, 0.98f, 0.45f));
 
                     float renderMat[16];
                     calc_object_render_matrix(obj, renderMat);
@@ -1314,70 +1421,91 @@ private:
                     glDisable(GL_CULL_FACE);
                     glDepthMask(GL_TRUE);
                     glDisable(GL_BLEND);
-                    renderedSilhouette = true;
+
+                    // Triangle-edge wireframe, per node, exactly as desktop does.
+                    m_unlitShader->bind();
+                    m_unlitShader->setUniformValue("uProj", proj);
+                    glDisable(GL_DEPTH_TEST);
+                    for (size_t ni = 0; ni < itM->second.nodes.size(); ++ni) {
+                        const auto& node = itM->second.nodes[ni];
+                        if (node.object_index < 0 || node.object_index >= static_cast<int>(itM->second.meshes.size())) continue;
+                        if (node.object_index >= static_cast<int>(itG->second.size())) continue;
+                        const MeshGpu& g = itG->second[node.object_index];
+                        if (!g.valid()) continue;
+
+                        float node_mat[16];
+                        av::get_node_matrix(itM->second, static_cast<int>(ni), m_frame, node_mat);
+                        QMatrix4x4 nodeMat;
+                        std::memcpy(nodeMat.data(), node_mat, 16 * sizeof(float));
+
+                        QMatrix4x4 modelMat = objWorld;
+                        if (itM->second.has_center_point) {
+                            modelMat.translate(-itM->second.center_point[0], -itM->second.center_point[1], -itM->second.center_point[2]);
+                        }
+                        modelMat = modelMat * nodeMat;
+                        m_unlitShader->setUniformValue("uModelView", view * modelMat);
+                        m_unlitShader->setUniformValue("uColor", QVector4D(0.16f, 0.82f, 1.0f, 0.95f));
+                        glLineWidth(2.0f);
+                        draw_mesh_edges(g, itM->second.meshes[node.object_index],
+                                        sel_line_key(0x504F44ull, g.pos_vbo), 1.6f);
+                    }
+                    m_unlitShader->release();
+                    glEnable(GL_DEPTH_TEST);
                 }
             }
         }
 
-        // 2. Contour loop outline for Ground Meshes
-        if (!obj.ground_polygon_points.empty() && obj.ground_polygon_points.size() >= 6) {
-            std::vector<float> contourVerts;
-            contourVerts.reserve(obj.ground_polygon_points.size() / 2 * 3);
-            for (size_t pi = 0; pi < obj.ground_polygon_points.size(); pi += 2) {
-                contourVerts.push_back(obj.ground_polygon_points[pi]);
-                contourVerts.push_back(obj.ground_polygon_points[pi + 1]);
-                contourVerts.push_back(0.0f);
+        // 2. Ground meshes: the REAL terrain, not a box and not the flat
+        //    GroundPolygon contour.
+        //
+        //    Desktop draws exactly this for `ro->ground_gpu`: an inverted-hull rim
+        //    of the shipped submeshes plus a wireframe of their own triangles. It
+        //    is the only highlight that works for a baked-only object (no polygon
+        //    component → no contour to draw) and it never encloses the level in a
+        //    fake cube, which is what the old `!renderedSilhouette` branch did.
+        if (objIdx >= 0 && objIdx < int(m_sceneGroundGpu.size()) && !obj.ground_meshes.empty()) {
+            const auto& ggpu = m_sceneGroundGpu[objIdx].meshes;
+
+            // Rim pass — back faces pushed out along their normals.
+            if (!ggpu.empty() && m_outlineShader && m_outlineShader->isLinked()) {
+                glEnable(GL_DEPTH_TEST);
+                glDepthMask(GL_FALSE);
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glEnable(GL_CULL_FACE);
+                glCullFace(GL_FRONT);
+
+                m_outlineShader->bind();
+                m_outlineShader->setUniformValue("uProj", proj);
+                m_outlineShader->setUniformValue("uOutlineOffset", rim_offset);
+                m_outlineShader->setUniformValue("uColor", QVector4D(0.72f, 0.25f, 0.98f, 0.35f));
+                m_outlineShader->setUniformValue("uModelView", view * baseWorld);
+                for (const MeshGpu& g : ggpu) {
+                    if (g.valid()) draw_mesh_gpu(g);
+                }
+                m_outlineShader->release();
+
+                glCullFace(GL_BACK);
+                glDisable(GL_CULL_FACE);
+                glDepthMask(GL_TRUE);
+                glDisable(GL_BLEND);
             }
 
-            glDisable(GL_DEPTH_TEST);
-            glLineWidth(3.5f);
+            // Edge pass — the mesh's own triangle edges.
             m_unlitShader->bind();
             m_unlitShader->setUniformValue("uProj", proj);
             m_unlitShader->setUniformValue("uModelView", view * baseWorld);
-            m_unlitShader->setUniformValue("uColor", QVector4D(1.0f, 0.16f, 0.38f, 1.0f));
-
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, contourVerts.data());
-            glDrawArrays(GL_LINE_LOOP, 0, int(contourVerts.size() / 3));
-            glDisableVertexAttribArray(0);
-
-            m_unlitShader->release();
-            glEnable(GL_DEPTH_TEST);
-            renderedSilhouette = true;
-        }
-
-        // 3. Fallback wireframe bounding box if not a mesh or model
-        if (!renderedSilhouette) {
-            float hw = std::max(40.0f, std::abs(obj.scale_x * obj.template_scaling) * 1.55f);
-            float hh = std::max(40.0f, std::abs(obj.scale_y * obj.template_scaling) * 1.55f);
-            float hd = std::max(40.0f, std::abs(obj.scale_z * obj.template_scaling) * 1.55f);
-
-            QMatrix4x4 boxWorld = baseWorld;
-            boxWorld.scale(hw * 2.0f, hh * 2.0f, hd * 2.0f);
-
-            m_unlitShader->bind();
-            m_unlitShader->setUniformValue("uProj", proj);
-
-            glBindBuffer(GL_ARRAY_BUFFER, m_cubeVbo);
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
-
-            glDisable(GL_DEPTH_TEST);
-            glEnable(GL_BLEND);
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            m_unlitShader->setUniformValue("uColor", QVector4D(0.16f, 0.82f, 1.0f, 0.95f));
             glLineWidth(2.0f);
-            m_unlitShader->setUniformValue("uModelView", view * boxWorld);
-            m_unlitShader->setUniformValue("uColor", QVector4D(0.20f, 0.75f, 1.0f, 0.40f));
-            glDrawArrays(GL_LINES, 0, 24);
-
-            glEnable(GL_DEPTH_TEST);
-            glLineWidth(3.0f);
-            m_unlitShader->setUniformValue("uColor", QVector4D(0.96f, 0.22f, 0.38f, 1.0f));
-            glDrawArrays(GL_LINES, 0, 24);
-
-            glDisableVertexAttribArray(0);
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glDisable(GL_DEPTH_TEST);
+            const size_t meshCount = std::min(ggpu.size(), obj.ground_meshes.size());
+            for (size_t mi = 0; mi < meshCount; ++mi) {
+                const MeshGpu& g = ggpu[mi];
+                if (!g.valid()) continue;
+                draw_mesh_edges(g, obj.ground_meshes[mi], sel_line_key(0x4772ull, g.pos_vbo), 2.0f);
+            }
             m_unlitShader->release();
+            glEnable(GL_DEPTH_TEST);
         }
 
         // Center origin indicator (amber diamond / pivot)
@@ -1603,6 +1731,7 @@ private:
     GLuint m_gridVbo = 0;
     int m_gridVertexCount = 0;
     GLuint m_cubeVbo = 0;
+    std::unordered_map<uint64_t, SelLineCacheEntry> m_selLineCache;
 };
 
 // ─── RubyQuickViewport Implementation ──────────────────────────────────────
@@ -2034,6 +2163,10 @@ void RubyQuickViewport::loadSceneAsync(const QString& path) {
             for (const auto& tex_name : obj.ground_mesh_textures)
                 take_texture(scPath, tex_name);
 
+        // `pod_names[i]` is the scene-facing model name for `pod_paths[i]`, so the
+        // resolved model's extent can be filed under the SAME key the scene uses
+        // (`mesh_name`/`template_name`) — see m_podLocalBounds in the header.
+        std::vector<std::string> pod_names;
         for (const auto& obj : scene.objects) {
             const std::string modelName = !obj.mesh_name.empty() ? obj.mesh_name : obj.template_name;
             if (modelName.empty()) continue;
@@ -2045,6 +2178,7 @@ void RubyQuickViewport::loadSceneAsync(const QString& path) {
             if (pod_seen.insert(sp).second) {
                 pod_paths.push_back(sp);
                 pod_hints.push_back(obj.template_name);
+                pod_names.push_back(modelName);
             }
         }
         if (m_sceneLoadGen.load() != gen) return;
@@ -2098,6 +2232,17 @@ void RubyQuickViewport::loadSceneAsync(const QString& path) {
         if (m_sceneLoadGen.load() != gen) return;
 
         // ── Assemble (single-threaded: these maps are not concurrent) ────────
+        // Picking needs each model's local AABB. It is already in the parsed POD
+        // (the union over its meshes), and the renderer moves the model away — so
+        // keep the extent here, now, while it is still in hand.
+        std::unordered_map<std::string, PodLocalBounds> podBounds;
+        for (size_t i = 0; i < pods.size() && i < pod_names.size(); ++i) {
+            if (pods[i].meshes.empty() || pods[i].min_x > pods[i].max_x) continue;
+            PodLocalBounds b;
+            b.min[0] = pods[i].min_x; b.min[1] = pods[i].min_y; b.min[2] = pods[i].min_z;
+            b.max[0] = pods[i].max_x; b.max[1] = pods[i].max_y; b.max[2] = pods[i].max_z;
+            podBounds[pod_names[i]] = b;
+        }
         for (size_t i = 0; i < tex_paths.size(); ++i)
             if (!decoded[i].isNull()) predecodedImages[tex_paths[i]] = std::move(decoded[i]);
         for (size_t i = 0; i < pod_tex_paths.size(); ++i)
@@ -2110,12 +2255,14 @@ void RubyQuickViewport::loadSceneAsync(const QString& path) {
         // 4. Commit to UI & scene state on main thread
         QMetaObject::invokeMethod(this, [this, gen, scene = std::move(scene),
                                          preloadedPods = std::move(preloadedPods),
+                                         podBounds = std::move(podBounds),
                                          predecodedImages = std::move(predecodedImages),
                                          path]() mutable {
             if (m_sceneLoadGen.load() != gen) return;
             m_filePath = path;
             m_scene = std::move(scene);
             m_preloadedPods = std::move(preloadedPods);
+            m_podLocalBounds = std::move(podBounds);
             m_predecodedImages = std::move(predecodedImages);
             m_hasScene = !m_scene.objects.empty() || !m_scene.filepath.empty();
             m_hasModel = false;
@@ -2307,52 +2454,145 @@ int RubyQuickViewport::pickObjectAt(float x, float y) {
 
     Ray ray = ruby::picking::get_mouse_ray(x, y, float(width()), float(height()), view, proj);
 
-    int closest3DIdx = -1;
-    float closest3DDist = 1e9f;
+    // ── Why this is not a scale-derived box anymore ────────────────────────
+    // The old picker tested every object against an AXIS-ALIGNED box of
+    // `scale * template_scaling * 1.5` clamped to a 40-unit minimum, and fell
+    // back to "nearest object ORIGIN within 140 px". Two ways that fails:
+    //   * a ground object (or any authored-large object) whose visible extent is
+    //     hundreds of units while its scale-derived box is 40 → the box test
+    //     misses the tap entirely and only the 140 px origin fallback can match,
+    //     i.e. "you have to know where the object's centre is";
+    //   * a rotated object's world-space AABB is not its extent in any
+    //     meaningful sense.
+    // Now: real geometry where we have it (exact ray/triangle against the ground
+    // submeshes, same kernel `Viewport3DWidget::pick_object_at()` uses), and a
+    // rotation-aware extent test from each object's ACTUAL local AABB elsewhere.
+    int bestIdx = -1;
+    int bestCurrent = -1;
+    float bestDist = 1e30f;
 
-    int closestScreenIdx = -1;
-    float closestScreenDist = 140.0f;
-
-    QMatrix4x4 vp = proj * view;
+    auto consider_world_box = [&](const float matrix[16], const float lmin[3], const float lmax[3]) {
+        float bmin[3], bmax[3];
+        if (!world_box_of(matrix, lmin, lmax, bmin, bmax)) return;
+        BoundingBox box;
+        box.min = Vector3{ bmin[0], bmin[1], bmin[2] };
+        box.max = Vector3{ bmax[0], bmax[1], bmax[2] };
+        RayCollision col = ruby::picking::get_ray_collision_box(ray, box);
+        if (col.hit && col.distance < bestDist) {
+            bestDist = col.distance;
+            bestIdx = bestCurrent;
+        }
+    };
 
     for (size_t i = 0; i < m_scene.objects.size(); ++i) {
-        const auto& obj = m_scene.objects[i];
+        const av::SceneObject& obj = m_scene.objects[i];
         if (obj.hidden) continue;
-
-        float hw = std::max(40.0f, std::abs(obj.scale_x * obj.template_scaling) * 1.5f);
-        float hh = std::max(40.0f, std::abs(obj.scale_y * obj.template_scaling) * 1.5f);
-        float hd = std::max(40.0f, std::abs(obj.scale_z * obj.template_scaling) * 1.5f);
-
-        BoundingBox box;
-        box.min = Vector3{obj.pos_x - hw, obj.pos_y - hh, obj.pos_z - hd};
-        box.max = Vector3{obj.pos_x + hw, obj.pos_y + hh, obj.pos_z + hd};
-
-        RayCollision col = ruby::picking::get_ray_collision_box(ray, box);
-        if (col.hit && col.distance < closest3DDist) {
-            closest3DDist = col.distance;
-            closest3DIdx = static_cast<int>(i);
+        // Backgrounds / sky planes and dimension-rift objects are not clickable
+        // (the same exclusions desktop picking makes).
+        if (!obj.background_name.empty() || obj.is_dimension_object) continue;
+        {
+            std::string low = obj.name;
+            for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (low.find("background") != std::string::npos || low.find("sky") != std::string::npos)
+                continue;
         }
 
-        QVector4D clip = vp.map(QVector4D(obj.pos_x, obj.pos_y, obj.pos_z, 1.0f));
-        if (clip.w() > 0.001f) {
-            QVector3D ndc = clip.toVector3D() / clip.w();
-            if (ndc.z() >= -1.0f && ndc.z() <= 1.0f) {
-                float sx = (ndc.x() + 1.0f) * 0.5f * float(width());
-                float sy = (1.0f - ndc.y()) * 0.5f * float(height());
-                float sdist = std::hypot(sx - x, sy - y);
-                if (sdist < closestScreenDist) {
-                    closestScreenDist = sdist;
-                    closestScreenIdx = static_cast<int>(i);
+        const bool has_ground = !obj.ground_meshes.empty();
+        const std::string modelName = !obj.mesh_name.empty() ? obj.mesh_name : obj.template_name;
+        const bool has_model = !modelName.empty();
+
+        float mat[16];
+        if (has_ground) calc_object_world_matrix(obj, mat);
+        else            calc_object_render_matrix(obj, mat);
+
+        bestCurrent = static_cast<int>(i);
+
+        // 1. Ground meshes: exact ray/triangle. The cheap per-submesh box reject
+        //    keeps the triangle sweep to the submeshes the ray can reach at all.
+        if (has_ground) {
+            const Matrix rmat = ruby::math::from_gl(mat);
+            for (const auto& gm : obj.ground_meshes) {
+                if (gm.positions.empty()) continue;
+                if (gm.min_x <= gm.max_x && gm.min_y <= gm.max_y && gm.min_z <= gm.max_z) {
+                    const float lmin[3] = { gm.min_x, gm.min_y, gm.min_z };
+                    const float lmax[3] = { gm.max_x, gm.max_y, gm.max_z };
+                    float bmin[3], bmax[3];
+                    if (world_box_of(mat, lmin, lmax, bmin, bmax)) {
+                        BoundingBox b;
+                        b.min = Vector3{ bmin[0], bmin[1], bmin[2] };
+                        b.max = Vector3{ bmax[0], bmax[1], bmax[2] };
+                        if (!ruby::picking::get_ray_collision_box(ray, b).hit) continue;
+                    }
+                }
+
+                RayCollision c = ruby::picking::get_ray_collision_triangles(
+                    ray, gm.positions.data(), 3 * sizeof(float),
+                    gm.positions.size() / 3,
+                    gm.indices.empty() ? nullptr : gm.indices.data(),
+                    gm.indices.size(), &rmat);
+                if (c.hit && c.distance < bestDist) {
+                    bestDist = c.distance;
+                    bestIdx = static_cast<int>(i);
                 }
             }
         }
+
+        // 2. POD / 3D model instances: the model's own local AABB, transformed by
+        //    the object matrix, so a tap anywhere on the prop selects it. Falls
+        //    back to the authored scale box if the model was never parsed.
+        if (has_model) {
+            auto itb = m_podLocalBounds.find(modelName);
+            if (itb != m_podLocalBounds.end()) {
+                consider_world_box(mat, itb->second.min, itb->second.max);
+            } else {
+                const float half = std::max(20.0f, std::abs(obj.scale_x * obj.template_scaling) * 0.5f);
+                const float lmin[3] = { -half, -half, -half };
+                const float lmax[3] = {  half,  half,  half };
+                consider_world_box(mat, lmin, lmax);
+            }
+        }
+
+        // 3. Logic markers with no geometry (portal, spawn, camera, triggers):
+        //    desktop's 30-unit cube, scaled by the object.
+        if (!has_ground && !has_model) {
+            const float half = 30.0f * std::max(0.2f, std::abs(obj.scale_x * obj.template_scaling));
+            const float lmin[3] = { -half, -half, -half };
+            const float lmax[3] = {  half,  half,  half };
+            consider_world_box(mat, lmin, lmax);
+        }
     }
 
-    int finalIdx = (closest3DIdx >= 0) ? closest3DIdx : closestScreenIdx;
-    if (finalIdx >= 0) {
-        selectObject(finalIdx);
+    if (bestIdx >= 0) {
+        selectObject(bestIdx);
     }
-    return finalIdx;
+    return bestIdx;
+}
+
+// 8-corner transform of a local box by `matrix` into a world-space AABB — the
+// same construction the renderer's cull bounds use, so picking and culling
+// agree about where an object is.
+bool RubyQuickViewport::world_box_of(const float matrix[16], const float local_min[3],
+                                     const float local_max[3], float out_min[3], float out_max[3]) {
+    if (!(local_min[0] <= local_max[0] && local_min[1] <= local_max[1] && local_min[2] <= local_max[2]))
+        return false;
+
+    QMatrix4x4 m;
+    std::memcpy(m.data(), matrix, 16 * sizeof(float));
+
+    QVector3D mn(1e30f, 1e30f, 1e30f), mx(-1e30f, -1e30f, -1e30f);
+    for (int c = 0; c < 8; ++c) {
+        const QVector3D local((c & 1) ? local_max[0] : local_min[0],
+                              (c & 2) ? local_max[1] : local_min[1],
+                              (c & 4) ? local_max[2] : local_min[2]);
+        const QVector3D p = m.map(local);
+        mn.setX(std::min(mn.x(), p.x())); mx.setX(std::max(mx.x(), p.x()));
+        mn.setY(std::min(mn.y(), p.y())); mx.setY(std::max(mx.y(), p.y()));
+        mn.setZ(std::min(mn.z(), p.z())); mx.setZ(std::max(mx.z(), p.z()));
+    }
+
+    out_min[0] = mn.x(); out_min[1] = mn.y(); out_min[2] = mn.z();
+    out_max[0] = mx.x(); out_max[1] = mx.y(); out_max[2] = mx.z();
+    return true;
 }
 
 void RubyQuickViewport::toggleObjectVisibility(int idx) {
@@ -2465,6 +2705,437 @@ void RubyQuickViewport::addObject() {
     emit selectedObjectChanged();
     emit objectTransformChanged();
     update();
+}
+
+static std::string make_unique_name(const av::SceneData& scene, const std::string& base) {
+    std::string cand = base;
+    bool taken = false;
+    for (const auto& o : scene.objects) {
+        if (o.name == cand) { taken = true; break; }
+    }
+    if (!taken) return cand;
+    int suffix = 1;
+    while (true) {
+        cand = base + "_" + std::to_string(suffix++);
+        taken = false;
+        for (const auto& o : scene.objects) {
+            if (o.name == cand) { taken = true; break; }
+        }
+        if (!taken) return cand;
+    }
+}
+
+QVariantList RubyQuickViewport::getAvailableLibraries() {
+    QVariantList list;
+    std::set<std::string> seenNames;
+    std::vector<fs::path> roots = build_asset_roots(fs::path(m_filePath.toStdString()));
+
+    auto addLib = [&](const std::string& name, const std::string& displayName, const std::string& path, bool isGround) {
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (seenNames.count(lower)) return;
+        seenNames.insert(lower);
+
+        QVariantMap map;
+        map["name"] = QString::fromStdString(name);
+        map["displayName"] = QString::fromStdString(displayName.empty() ? name : displayName);
+        map["path"] = QString::fromStdString(path);
+        map["isGroundMesh"] = isGround;
+        list.append(map);
+    };
+
+    // 1. Check if groundmeshes.scl exists anywhere in roots
+    for (const auto& r : roots) {
+        fs::path p = r / "groundmeshes.scl";
+        std::error_code ec;
+        if (fs::is_regular_file(p, ec)) {
+            addLib("groundmeshes", "Ground Meshes (Prefabs)", p.string(), true);
+            break;
+        }
+    }
+    if (!seenNames.count("groundmeshes")) {
+        for (const char* gpath : {
+            "/storage/emulated/0/Download/Swordigo_Es_2.1.1/assets/resources/groundmeshes.scl",
+            "/storage/emulated/0/SwordigoMini.ver.7.0.build.46/assets/resources/groundmeshes.scl",
+            "/sdcard/Swordigo/assets/resources/groundmeshes.scl"
+        }) {
+            std::error_code ec;
+            if (fs::is_regular_file(gpath, ec)) {
+                addLib("groundmeshes", "Ground Meshes (Prefabs)", gpath, true);
+                break;
+            }
+        }
+    }
+
+    // 2. Scan roots for all other *.scl files
+    for (const auto& r : roots) {
+        std::error_code ec;
+        if (!fs::is_directory(r, ec)) continue;
+        for (fs::directory_iterator it(r, ec), end; it != end && !ec; it.increment(ec)) {
+            if (it->is_regular_file(ec)) {
+                std::string ext = it->path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext == ".scl") {
+                    std::string stem = it->path().stem().string();
+                    std::string display = stem;
+                    if (stem == "rocks") display = "Rocks & Boulders";
+                    else if (stem == "platforms") display = "Platforms & Bridges";
+                    else if (stem == "caves_stuff") display = "Caves Props";
+                    else if (stem == "collectibles") display = "Collectibles";
+                    else if (stem == "traps" || stem == "traps_stuffs") display = "Traps & Hazards";
+                    else if (stem == "monsters") display = "Monsters & Bosses";
+                    else if (stem == "weapons") display = "Weapons & Swords";
+                    else if (stem == "lights") display = "Torches & Lights";
+                    else if (stem == "statues") display = "Statues & Relics";
+                    else if (stem == "florennum_stuff") display = "Florennum Props";
+                    else if (stem == "forest") display = "Forest Props";
+                    else if (stem == "icecastle") display = "Ice Castle Props";
+                    else if (stem == "woodkeep_stuff") display = "Woodkeep Props";
+                    else if (stem == "snowy_stuff") display = "Snowy Props";
+                    else if (stem == "towers_stuff") display = "Towers Props";
+                    else if (stem == "plains_stuff") display = "Plains Props";
+                    else if (stem == "grovestuff") display = "Grove Stuff";
+
+                    addLib(stem, display, it->path().string(), stem == "groundmeshes");
+                }
+            }
+        }
+    }
+
+    // Also check scene's external_libraries or imported_library_names
+    for (const auto& lib_name : m_scene.imported_library_names) {
+        if (!seenNames.count(lib_name)) {
+            addLib(lib_name, lib_name, "", lib_name == "groundmeshes");
+        }
+    }
+
+    return list;
+}
+
+QVariantList RubyQuickViewport::getTemplatesInLibrary(const QString& sclPathOrName) {
+    QVariantList list;
+    if (sclPathOrName.isEmpty()) return list;
+
+    std::string key = sclPathOrName.toStdString();
+    fs::path targetPath(key);
+    std::error_code ec;
+    if (!fs::is_regular_file(targetPath, ec)) {
+        std::vector<fs::path> roots = build_asset_roots(fs::path(m_filePath.toStdString()));
+        std::string stem = key;
+        if (stem.size() > 4 && stem.substr(stem.size() - 4) == ".scl") {
+            stem = stem.substr(0, stem.size() - 4);
+        }
+        for (const auto& r : roots) {
+            fs::path cand = r / (stem + ".scl");
+            if (fs::is_regular_file(cand, ec)) { targetPath = cand; break; }
+        }
+    }
+
+    std::string cacheKey = targetPath.string();
+    if (cacheKey.empty()) cacheKey = key;
+
+    auto it = m_sclTemplateCache.find(cacheKey);
+    if (it == m_sclTemplateCache.end()) {
+        std::ifstream in(targetPath, std::ios::binary);
+        if (!in) return list;
+        std::string bytes((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+        if (bytes.empty()) return list;
+        m_sclTemplateCache[cacheKey] = av::scl_load_templates(bytes);
+        it = m_sclTemplateCache.find(cacheKey);
+    }
+
+    if (it == m_sclTemplateCache.end()) return list;
+
+    for (const auto& entry : it->second) {
+        QVariantMap map;
+        map["name"] = QString::fromStdString(entry.name);
+        map["scaling"] = entry.scaling;
+
+        bool hasGround = !entry.object.ground_meshes.empty() || !entry.object.ground_polygon_points.empty();
+        bool hasModel = !entry.object.mesh_name.empty();
+        map["hasGround"] = hasGround;
+        map["hasModel"] = hasModel;
+        map["meshName"] = QString::fromStdString(entry.object.mesh_name);
+
+        QString kind = "Logic";
+        if (hasGround) kind = "GroundMesh";
+        else if (hasModel) kind = "Model";
+        else if (entry.object.is_spawn_point) kind = "Spawn";
+        else if (entry.object.is_portal) kind = "Portal";
+        map["kind"] = kind;
+
+        std::string name = entry.name;
+        std::string cat = "General";
+        size_t lastUnderscore = name.rfind('_');
+        if (lastUnderscore != std::string::npos && lastUnderscore > 0) {
+            cat = name.substr(0, lastUnderscore);
+        }
+        if (!cat.empty()) cat[0] = static_cast<char>(std::toupper(cat[0]));
+        map["category"] = QString::fromStdString(cat);
+
+        list.append(map);
+    }
+
+    return list;
+}
+
+QVariantList RubyQuickViewport::getAvailableModels() {
+    QVariantList list;
+    std::vector<fs::path> roots = build_asset_roots(fs::path(m_filePath.toStdString()));
+    std::set<std::string> seenStems;
+
+    for (const auto& r : roots) {
+        std::error_code ec;
+        if (!fs::is_directory(r, ec)) continue;
+        for (fs::directory_iterator it(r, ec), end; it != end && !ec; it.increment(ec)) {
+            if (it->is_regular_file(ec)) {
+                std::string ext = it->path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext == ".pod") {
+                    std::string stem = it->path().stem().string();
+                    std::string lowerStem = stem;
+                    std::transform(lowerStem.begin(), lowerStem.end(), lowerStem.begin(), ::tolower);
+                    if (seenStems.count(lowerStem)) continue;
+                    seenStems.insert(lowerStem);
+
+                    QVariantMap map;
+                    map["name"] = QString::fromStdString(stem);
+                    map["path"] = QString::fromStdString(it->path().string());
+                    auto sz = it->file_size(ec);
+                    if (!ec && sz > 0) {
+                        if (sz >= 1024 * 1024)
+                            map["sizeStr"] = QString::asprintf("%.1f MB", sz / (1024.0 * 1024.0));
+                        else
+                            map["sizeStr"] = QString::asprintf("%lld KB", (long long)(sz / 1024));
+                    } else {
+                        map["sizeStr"] = "POD";
+                    }
+                    list.append(map);
+                }
+            }
+        }
+    }
+
+    std::sort(list.begin(), list.end(), [](const QVariant& a, const QVariant& b) {
+        return a.toMap()["name"].toString().toLower() < b.toMap()["name"].toString().toLower();
+    });
+
+    return list;
+}
+
+int RubyQuickViewport::importModelObject(const QString& podPathOrStem) {
+    if (!m_hasScene) return -1;
+    pushUndoSnapshot();
+
+    fs::path p(podPathOrStem.toStdString());
+    std::string stem = p.stem().string();
+    if (stem.empty()) stem = podPathOrStem.toStdString();
+
+    std::string unique_name = make_unique_name(m_scene, stem);
+
+    // Measure POD model bounds if possible
+    std::string sp = av::assets::resolve_pod(fs::path(m_filePath.toStdString()), stem, build_asset_roots(fs::path(m_filePath.toStdString()))).string();
+    float local_bounds[4] = {-25.0f, -25.0f, 25.0f, 25.0f};
+    float lift_y = 0.0f;
+    if (!sp.empty()) {
+        av::PODModel model = av::pod_load(sp, "");
+        if (!model.meshes.empty()) {
+            local_bounds[0] = model.min_x;
+            local_bounds[1] = model.min_y;
+            local_bounds[2] = model.max_x;
+            local_bounds[3] = model.max_y;
+            if (model.min_y < 0.0f) {
+                lift_y = -model.min_y;
+            }
+        }
+    }
+
+    float x = m_cameraTarget.x();
+    float z = m_cameraTarget.z();
+    float y = av::scene_terrain_top_y(m_scene, x);
+    if (std::abs(y - m_cameraTarget.y()) > 400.0f) {
+        y = m_cameraTarget.y();
+    }
+    y += lift_y;
+
+    av::SceneObject obj;
+    obj.name = unique_name;
+    obj.template_name = "SceneObject";
+    obj.mesh_name = stem;
+    obj.pos_x = x;
+    obj.pos_y = y;
+    obj.pos_z = z;
+    obj.scale_x = obj.scale_y = obj.scale_z = 1.0f;
+    obj.template_scaling = 1.0f;
+    obj.local_aabb = av::scene_build_local_aabb(local_bounds[0], local_bounds[1],
+                                                local_bounds[2], local_bounds[3]);
+    obj.components.push_back(av::scene_make_model_component(stem));
+
+    m_scene.objects.push_back(std::move(obj));
+    const int new_idx = static_cast<int>(m_scene.objects.size() - 1);
+
+    validateAndRepairScene();
+    m_selectedObject = new_idx;
+    m_lastNudgeMs = 0;
+    m_hasScene = true;
+    touch_scene(/*geometry_changed=*/true);
+    m_objectModel.updateFromScene(m_scene);
+
+    emit objectListChanged();
+    emit selectedObjectChanged();
+    emit objectTransformChanged();
+    emit dirtyChanged();
+    update();
+
+    return new_idx;
+}
+
+int RubyQuickViewport::importTemplateObject(const QString& sclPathOrName, const QString& templateName) {
+    if (!m_hasScene || templateName.isEmpty()) return -1;
+    pushUndoSnapshot();
+
+    std::string tName = templateName.toStdString();
+    std::string key = sclPathOrName.toStdString();
+
+    fs::path targetPath(key);
+    std::error_code ec;
+    if (!fs::is_regular_file(targetPath, ec)) {
+        std::vector<fs::path> roots = build_asset_roots(fs::path(m_filePath.toStdString()));
+        std::string stem = key;
+        if (stem.size() > 4 && stem.substr(stem.size() - 4) == ".scl") {
+            stem = stem.substr(0, stem.size() - 4);
+        }
+        for (const auto& r : roots) {
+            fs::path cand = r / (stem + ".scl");
+            if (fs::is_regular_file(cand, ec)) { targetPath = cand; break; }
+        }
+    }
+
+    std::string cacheKey = targetPath.string();
+    if (cacheKey.empty()) cacheKey = key;
+
+    auto it = m_sclTemplateCache.find(cacheKey);
+    if (it == m_sclTemplateCache.end()) {
+        std::ifstream in(targetPath, std::ios::binary);
+        if (in) {
+            std::string bytes((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>());
+            if (!bytes.empty()) {
+                m_sclTemplateCache[cacheKey] = av::scl_load_templates(bytes);
+                it = m_sclTemplateCache.find(cacheKey);
+            }
+        }
+    }
+
+    if (it == m_sclTemplateCache.end() || it->second.empty()) return -1;
+
+    const av::SclTemplateEntry* found = nullptr;
+    for (const auto& entry : it->second) {
+        if (entry.name == tName) { found = &entry; break; }
+    }
+    if (!found) return -1;
+
+    av::SceneObject obj = found->object;
+    obj.template_name = found->name;
+    obj.template_scaling = found->scaling;
+    obj.name = make_unique_name(m_scene, found->name);
+
+    float x = m_cameraTarget.x();
+    float y = m_cameraTarget.y();
+    float z = m_cameraTarget.z();
+    if (obj.ground_meshes.empty()) {
+        float ty = av::scene_terrain_top_y(m_scene, x);
+        if (std::abs(ty - y) <= 400.0f) y = ty;
+    }
+    obj.pos_x = x;
+    obj.pos_y = y;
+    obj.pos_z = z;
+    obj.scale_x = obj.scale_y = obj.scale_z = 1.0f;
+
+    std::string lib_stem = targetPath.stem().string();
+    if (lib_stem.empty()) lib_stem = key;
+    bool imported = false;
+    for (const auto& n : m_scene.imported_library_names) {
+        if (n == lib_stem) { imported = true; break; }
+    }
+    if (!imported) {
+        m_scene.imported_library_names.push_back(lib_stem);
+        if (!targetPath.empty()) {
+            m_scene.external_libraries.push_back(targetPath.string());
+        }
+    }
+
+    m_scene.objects.push_back(std::move(obj));
+    const int new_idx = static_cast<int>(m_scene.objects.size() - 1);
+
+    validateAndRepairScene();
+    m_selectedObject = new_idx;
+    m_lastNudgeMs = 0;
+    m_hasScene = true;
+    touch_scene(/*geometry_changed=*/true);
+    m_objectModel.updateFromScene(m_scene);
+
+    emit objectListChanged();
+    emit selectedObjectChanged();
+    emit objectTransformChanged();
+    emit dirtyChanged();
+    update();
+
+    return new_idx;
+}
+
+int RubyQuickViewport::importPrimitiveObject(const QString& typeName) {
+    if (!m_hasScene) return -1;
+    pushUndoSnapshot();
+
+    std::string kind = typeName.toStdString();
+    float x = m_cameraTarget.x();
+    float y = m_cameraTarget.y();
+    float z = m_cameraTarget.z();
+
+    av::SceneObject obj;
+    if (kind == "SpawnPoint") {
+        obj = av::scene_build_spawn_object(av::scene_fresh_identifier(m_scene), x, y, 1);
+        obj.pos_z = z;
+    } else if (kind == "Portal") {
+        obj = av::scene_build_portal_object(av::scene_fresh_identifier(m_scene), x, y);
+        obj.pos_z = z;
+    } else {
+        size_t idx = av::scene_create_object(m_scene, "SceneObject");
+        if (idx < m_scene.objects.size()) {
+            auto& created = m_scene.objects[idx];
+            created.pos_x = x; created.pos_y = y; created.pos_z = z;
+            created.scale_x = created.scale_y = created.scale_z = 1.0f;
+            validateAndRepairScene();
+            m_selectedObject = static_cast<int>(idx);
+            touch_scene(true);
+            m_objectModel.updateFromScene(m_scene);
+            emit objectListChanged();
+            emit selectedObjectChanged();
+            emit objectTransformChanged();
+            emit dirtyChanged();
+            update();
+            return m_selectedObject;
+        }
+        return -1;
+    }
+
+    m_scene.objects.push_back(std::move(obj));
+    const int new_idx = static_cast<int>(m_scene.objects.size() - 1);
+
+    validateAndRepairScene();
+    m_selectedObject = new_idx;
+    touch_scene(true);
+    m_objectModel.updateFromScene(m_scene);
+
+    emit objectListChanged();
+    emit selectedObjectChanged();
+    emit objectTransformChanged();
+    emit dirtyChanged();
+    update();
+
+    return new_idx;
 }
 
 void RubyQuickViewport::deleteObject(int idx) {
@@ -2690,27 +3361,39 @@ void RubyQuickViewport::meshImport(int idx) {
     if (top_tex.empty()) top_tex = "fire_grass";
     if (bottom_tex.empty()) bottom_tex = "graveyard_ground";
 
-    // Fallback: unique XY positions from the embedded ground meshes
+    // NO fabricated fallback outline, from either source.
+    //
+    // There used to be a canned 200x100 rectangle here, which meant that arming
+    // Mesh Edit on a ground object whose polygon could not be recovered and then
+    // committing silently REPLACED the object's real ground geometry with that
+    // rectangle: the mesh still collided, but the original terrain was gone for
+    // good. It was replaced by a subtler version of the same mistake -- the
+    // unique XY of the baked ground meshes, capped at 64, stopping at the first
+    // submesh ("fallback: unique XY positions from the embedded ground meshes").
+    //
+    // That is NOT the polygon. It is a scatter of baked vertices that includes
+    // the rim's inward-offset bevel and inner-wall points, and the FIRST submesh
+    // is itself a rim patch. Measured on thecave_part1411 (which ships 19 ground
+    // objects with no GroundPolygonComponent at all, one of them carrying 20
+    // level-wide submeshes spanning x[-2079, 2076]), the invented outline was a
+    // small inward blob at one end of the level. Regenerating from it produced
+    // geometry strung between the first and last invented node and discarded the
+    // real ground -- the "3D points concentrated between the first and last node"
+    // / "loss of vanilla mesh nature" report. (.scratch/ground_roundtrip_probe)
+    //
+    // The baked mesh is the only faithful record of these objects, and the
+    // renderer already draws it verbatim. So when no outline can be recovered we
+    // refuse: meshImport leaves m_meshEditPoints short, beginMeshEdit() returns
+    // false, and the object is left exactly as it was.
     if (m_meshEditPoints.size() < 3) {
-        for (const auto& gm : obj.ground_meshes) {
-            for (size_t i = 0; i + 2 < gm.positions.size(); i += 3) {
-                const double x = gm.positions[i], y = gm.positions[i + 1];
-                bool dup = false;
-                for (const auto& pt : m_meshEditPoints)
-                    if (std::fabs(pt.x - x) < 0.01 && std::fabs(pt.y - y) < 0.01) { dup = true; break; }
-                if (!dup && m_meshEditPoints.size() < 64) m_meshEditPoints.push_back({x, y});
-            }
-            if (m_meshEditPoints.size() >= 3) break;
-        }
+        setGroundGeneratorStatus(QStringLiteral(
+            "Mesh Edit: this ground object has no polygon to edit "
+            "(baked mesh only) — it was left untouched"));
+        return;
     }
 
-    // No fabricated fallback outline here.  There used to be one — a canned
-    // 200x100 rectangle — which meant that arming Mesh Edit on a ground object
-    // whose polygon could not be recovered and then committing silently REPLACED
-    // the object's real ground geometry with that rectangle: the mesh still
-    // collided, but the original terrain was gone for good.  Desktop Ruby bails
-    // instead (mesh_import returns early), so mobile does too: begin_mesh_edit
-    // refuses below and the object is left untouched.
+    // Unreachable when the outline was refused above, but kept explicit: every
+    // step past this line rewrites the object's ground geometry.
 
     if (!have_depth) {
         float dmin = 1e30f, dmax = -1e30f;
@@ -2740,15 +3423,49 @@ void RubyQuickViewport::meshImport(int idx) {
     m_meshEditTextureScale = texture_scale;
     m_meshEditMinDepth = min_depth;
     m_meshEditMaxDepth = max_depth;
-    // Relief starts clean: a fresh import is a uniform slab at the object's own
-    // depth, and relief is something the modder asks for. Carving recovered
-    // per-node depths back out of the baked cap would need a node-to-vertex
-    // correspondence the format does not guarantee, and guessing it is how you
-    // silently deform terrain. The engine's own mechanism — HorizNoise over the
-    // per-node depths — is carried through instead.
-    m_meshEditFrontZ.clear();
-    m_meshEditBackZ.clear();
-    m_meshEditReliefSeed = 0;
+    // The object's own per-node depth.
+    //
+    // This used to be *recovered* from the mesh the object shipped with, by
+    // matching every baked vertex's XY against the outline — which works on a
+    // MeshType 0 sheet and fails on a MeshType 1 one, silently: at a rim node the
+    // ribbon yields its node to the rim, so the bake holds no plain-plane back
+    // vertex there at all, and the shallowest baked z on that column is the
+    // rim's own, `HatWidthOffset1` further out. Recovery reported that extreme,
+    // and boulderx::build_rim then added HatWidthOffset1 a second time (measured
+    // on the desktop side: a sheet whose own envelope is +-95 regenerated at
+    // -105 — the "it over-increases the Z" report).
+    //
+    // So the array is not recovered, it is recomputed. GenerateMesh derives one
+    // depth per node from the generator's own parameters and nothing else, and a
+    // ground object always carries them; there is no XY matching left to fail, so
+    // no node can collapse onto another's depth.
+    m_meshEditVanillaFrontZ.clear();
+    m_meshEditVanillaBackZ.clear();
+    if (surface_width > 0.0f) {
+        boulderx::Params law;
+        law.mesh_type = mesh_type;
+        law.surface_width = surface_width;
+        law.horiz_noise = horiz_noise;
+        law.random_seed = random_seed;
+        boulderx::engine_node_depths(law, m_meshEditPoints.size(),
+                                     m_meshEditVanillaFrontZ, m_meshEditVanillaBackZ);
+    } else {
+        std::vector<float> positions;
+        for (const auto& pm : obj.ground_meshes)
+            positions.insert(positions.end(), pm.positions.begin(), pm.positions.end());
+        // Half a world unit: engine-written floats, and the level's own scale.
+        boulderx::recover_node_depths(
+            [&] {
+                std::vector<boulderx::Node> nodes;
+                nodes.reserve(m_meshEditPoints.size());
+                for (const auto& pt : m_meshEditPoints) nodes.push_back({pt.x, pt.y, 0.0, 0.0});
+                return nodes;
+            }(),
+            positions, 0.5, m_meshEditVanillaFrontZ, m_meshEditVanillaBackZ);
+    }
+    m_meshEditFrontZ = m_meshEditVanillaFrontZ;
+    m_meshEditBackZ = m_meshEditVanillaBackZ;
+    m_meshEditReliefSeed = 0;   // 0 = the object's own depths, not sculpted
     m_meshEditParams.texture_scale = scale_from_tm;
     m_meshEditParams.random_seed = random_seed;
     m_meshEditIds = target_ids;
@@ -2868,9 +3585,15 @@ bool RubyQuickViewport::randomiseGroundRelief(float frontMagnitude, float backMa
 }
 
 void RubyQuickViewport::clearGroundRelief() {
-    if (m_meshEditFrontZ.empty() && m_meshEditBackZ.empty()) return;
-    m_meshEditFrontZ.clear();
-    m_meshEditBackZ.clear();
+    // Back to the object's OWN depths, not to flat: on an object with real relief
+    // a "reset" that flattens is a destructive edit, and it is also the exact
+    // symptom this feature exists to remove. An object whose vanilla mesh is a
+    // slab restores to a slab, which is the only case that is flat.
+    if (m_meshEditFrontZ == m_meshEditVanillaFrontZ &&
+        m_meshEditBackZ == m_meshEditVanillaBackZ && m_meshEditReliefSeed == 0)
+        return;
+    m_meshEditFrontZ = m_meshEditVanillaFrontZ;
+    m_meshEditBackZ = m_meshEditVanillaBackZ;
     m_meshEditReliefSeed = 0;
     emit groundReliefChanged();
     if (m_meshEditActive) liveMeshPreview();
@@ -2891,14 +3614,49 @@ bool RubyQuickViewport::regenerateGroundMesh() {
     gm.polygon = m_meshEditPoints;
     boulder::ensure_ccw(gm.polygon);
 
-    // Generator choice: boulder by default, boulderx when the user picks it in
-    // Settings (see boulderx::ground_generator()). boulderx declines what it
-    // cannot reproduce exactly — currently dome hats — and we fall back rather
-    // than drop it.
+    // Generator choice: boulder by default, boulderx or zypher when the user picks it in
+    // Settings (see boulderx::ground_generator()). Zypher generates smooth, modern
+    // computational 3D geometry with zero-snag collision; boulderx attempts engine parity.
     std::string bin;
-    const bool want_boulderx =
-        boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX;
-    if (want_boulderx) {
+    const auto gen_choice = boulderx::ground_generator();
+    if (gen_choice == boulderx::GroundGenerator::Zypher) {
+        std::vector<zypher::TerrainNode> nodes;
+        nodes.reserve(m_meshEditPoints.size());
+        const bool have_relief = m_meshEditFrontZ.size() == m_meshEditPoints.size() &&
+                                 m_meshEditBackZ.size() == m_meshEditPoints.size();
+        for (size_t i = 0; i < m_meshEditPoints.size(); ++i) {
+            zypher::TerrainNode n;
+            n.x = m_meshEditPoints[i].x;
+            n.y = m_meshEditPoints[i].y;
+            if (have_relief) {
+                n.front_depth = m_meshEditFrontZ[i];
+                n.back_depth = m_meshEditBackZ[i];
+            } else {
+                double hw = gm.surface_width > 0 ? gm.surface_width * 0.5 : 50.0;
+                n.front_depth = hw;
+                n.back_depth = -hw;
+            }
+            n.height = std::fabs(n.front_depth - n.back_depth);
+            nodes.push_back(n);
+        }
+        zypher::TerrainParams params;
+        params.bevel = zypher::ProfileKind::SmoothFillet;
+        params.surface_tex = gm.top_texture.empty() ? "fire_grass" : gm.top_texture;
+        params.cliff_tex = gm.bottom_texture.empty() ? "graveyard_ground" : gm.bottom_texture;
+        params.surface_width = (gm.surface_width > 0 ? gm.surface_width : 100.0);
+        params.hat_height = (gm.hat_height > 0 ? static_cast<float>(gm.hat_height) : 20.0f);
+        params.hat_width = (gm.hat_width_offset_1 > 0 ? static_cast<float>(gm.hat_width_offset_1) : 8.0f);
+        params.texture_scale = m_meshEditTextureScale > 0 ? m_meshEditTextureScale : 250.0f;
+        params.fbm_amplitude = 12.0f;
+        params.rear_closure = true;
+
+        zypher::ComponentIds ids{
+            m_meshEditIds.polygon_id, m_meshEditIds.mesh_id,
+            m_meshEditIds.generator_id, m_meshEditIds.collision_id,
+            m_meshEditIds.tm_surface_id, m_meshEditIds.tm_front_id
+        };
+        bin = zypher::generate_terrain_object(nodes, params, m_scene.objects[m_meshEditObject].name, &ids);
+    } else if (gen_choice == boulderx::GroundGenerator::BoulderX) {
         // A per-node outline, not a uniform slab, and built from
         // m_meshEditPoints rather than gm.polygon: boulder::ensure_ccw may have
         // reversed gm.polygon, and pairing depths with the wrong node would
@@ -2920,15 +3678,13 @@ bool RubyQuickViewport::regenerateGroundMesh() {
         }
         boulderx::ensure_ccw(outline);
 
-        // Everything meshImport recovered goes back in. Previously only the mesh
-        // type (hardcoded to 1) and one scalar depth were passed, so an edit
-        // turned a MeshType 0 sheet into a rimmed one and rebuilt the relief
-        // from zero noise — i.e. it changed the object's structure and flattened
-        // its terrain, regardless of what the object was.
         boulderx::Params params;
         params.mesh_type = m_meshEditMeshType;
         params.horiz_noise = m_meshEditNoise;
         params.random_seed = m_meshEditSeed;
+        params.horiz_noise = 0.0;
+        params.emitted_horiz_noise = m_meshEditNoise;
+        params.depth_source = boulderx::Params::DepthSource::Outline;
         params.texture_scale = m_meshEditTextureScale;
         params.surface_width = gm.surface_width;
         params.hat_height = gm.hat_height;
@@ -2940,8 +3696,12 @@ bool RubyQuickViewport::regenerateGroundMesh() {
         const int ids6[6] = {m_meshEditIds.polygon_id, m_meshEditIds.mesh_id,
                              m_meshEditIds.generator_id, m_meshEditIds.collision_id,
                              m_meshEditIds.tm_surface_id, m_meshEditIds.tm_front_id};
+        std::vector<boulderx::Hat> hats;
+        hats.reserve(gm.hats.size());
+        for (const auto& h : gm.hats)
+            hats.push_back({h.x, h.y, h.radius, h.height});
         bin = boulderx::generate_ground_mesh_object_nodes(
-            outline, params, m_scene.objects[m_meshEditObject].name, !gm.hats.empty(), ids6);
+            outline, params, m_scene.objects[m_meshEditObject].name, hats, ids6);
     }
     if (bin.empty()) {
         const std::string swdm = boulder::serialize_swdm(gm);
@@ -2949,19 +3709,25 @@ bool RubyQuickViewport::regenerateGroundMesh() {
             swdm, m_scene.objects[m_meshEditObject].name, m_meshEditZ, &m_meshEditIds);
     }
 
-    // Report which generator actually produced this mesh. The reason is only
-    // consulted when boulderx was asked for: it survives from an earlier edit
-    // otherwise, and showing it would attribute a decline to a run that never
-    // requested boulderx. A refusal that reaches the user must be the refusal
-    // that just happened.
-    if (!want_boulderx) {
-        setGroundGeneratorStatus(QStringLiteral("Boulder"));
-    } else if (!boulderx::last_decline_reason().empty()) {
-        setGroundGeneratorStatus(
-            QStringLiteral("Boulder · BoulderX declined: %1")
-                .arg(QString::fromStdString(boulderx::last_decline_reason())));
+    // Report which generator actually produced this mesh.
+    if (gen_choice == boulderx::GroundGenerator::Zypher) {
+        if (!bin.empty()) {
+            setGroundGeneratorStatus(QStringLiteral("Zypher (Gen 3)"));
+        } else {
+            setGroundGeneratorStatus(
+                QStringLiteral("Boulder · Zypher declined: %1")
+                    .arg(QString::fromStdString(zypher::last_decline_reason())));
+        }
+    } else if (gen_choice == boulderx::GroundGenerator::BoulderX) {
+        if (!boulderx::last_decline_reason().empty()) {
+            setGroundGeneratorStatus(
+                QStringLiteral("Boulder · Zenith declined: %1")
+                    .arg(QString::fromStdString(boulderx::last_decline_reason())));
+        } else {
+            setGroundGeneratorStatus(QStringLiteral("Zenith"));
+        }
     } else {
-        setGroundGeneratorStatus(QStringLiteral("BoulderX"));
+        setGroundGeneratorStatus(QStringLiteral("Boulder"));
     }
 
     if (bin.empty()) return false;

@@ -32,6 +32,7 @@
 
 #include "scene_loader.h"
 #include "scene_schemas.h"
+#include "filerift.h"
 #include "platform/protobuf_reader.h"
 
 #include <memory>
@@ -2763,15 +2764,52 @@ SceneData scene_load(const std::string& path, const std::vector<std::string>& ex
     file.read(reinterpret_cast<char*>(buf.data()), size);
     file.close();
 
+    // Auto-detect if input is FileRift markup text and transcode to binary protobuf
+    if (buf.size() >= 4) {
+        std::string_view preview(reinterpret_cast<const char*>(buf.data()), std::min<size_t>(buf.size(), 256));
+        if (preview.find("## FileRift") != std::string_view::npos ||
+            preview.find("Object{") != std::string_view::npos ||
+            preview.find("scene \"") != std::string_view::npos ||
+            preview.find("syntax =") != std::string_view::npos) {
+            try {
+                std::string text(reinterpret_cast<const char*>(buf.data()), buf.size());
+                std::string binary = filerift::recode_markup(text, "scene");
+                if (!binary.empty()) {
+                    std::vector<uint8_t> bin_buf(binary.begin(), binary.end());
+                    return scene_parse_buffer(bin_buf, path, extra_roots);
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[scene_loader] FileRift recode on load error: " << e.what() << "\n";
+            }
+        }
+    }
+
     return scene_parse_buffer(buf, path, extra_roots);
 }
 
-// Parse from an in-memory buffer. Callers that detect a FileRift text scene
-// ("## FileRift decoded" banner) can re-encode it to binary and load it here
-// without touching the disk file, keeping `path` as the scene identity.
+// Parse from an in-memory buffer. Automatically transcode FileRift markup text
+// if detected, keeping `path` as the scene identity.
 SceneData scene_load_bytes(const std::vector<uint8_t>& bytes,
                            const std::string& path,
                            const std::vector<std::string>& extra_roots) {
+    if (bytes.size() >= 4) {
+        std::string_view preview(reinterpret_cast<const char*>(bytes.data()), std::min<size_t>(bytes.size(), 256));
+        if (preview.find("## FileRift") != std::string_view::npos ||
+            preview.find("Object{") != std::string_view::npos ||
+            preview.find("scene \"") != std::string_view::npos ||
+            preview.find("syntax =") != std::string_view::npos) {
+            try {
+                std::string text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                std::string binary = filerift::recode_markup(text, "scene");
+                if (!binary.empty()) {
+                    std::vector<uint8_t> bin_buf(binary.begin(), binary.end());
+                    return scene_parse_buffer(bin_buf, path, extra_roots);
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[scene_loader] FileRift recode on load error: " << e.what() << "\n";
+            }
+        }
+    }
     return scene_parse_buffer(bytes, path, extra_roots);
 }
 

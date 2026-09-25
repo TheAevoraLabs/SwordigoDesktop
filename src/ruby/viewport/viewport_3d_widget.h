@@ -35,6 +35,7 @@ namespace fs = std::filesystem;
 #include "tools/av_renderer.h"
 #include "tools/boulder.h"
 #include "tools/boulderx.h"   // boulderx::ground_generator() — generator choice
+#include "tools/roller.h"     // zypher::generate_terrain_object() — Gen 3 modern generator
 #include "ruby/viewport/camera_bounds_gizmo.h"
 #include "ruby/render/glb_model.h"
 
@@ -437,6 +438,26 @@ private:
     boulder::GroundMesh m_mesh_params;             // imported generator params (depth, textures…)
     boulder::GroundComponentIds m_mesh_ids;        // preserved GroundMesh component ids
     double m_mesh_z = 40.0;                        // depth layer (object pos_z)
+    // Generator parameters that used to be dropped on import, so every edit
+    // rebuilt the sheet as a MeshType 1 slab with zero noise regardless of what
+    // the object was (field 7 MeshType, field 6 HorizNoise).
+    int    m_mesh_type = 1;
+    double m_mesh_noise = 0.0;
+    // Which generator actually produced the mesh on screen ("BoulderX", or
+    // "Boulder · BoulderX declined: <reason>"). The Boulder fallback is the ONE
+    // remaining path that re-emits a uniform-thickness slab, so it must never be
+    // silent: mobile has shown this since the decline was added
+    // (RubyQuickViewport::groundGeneratorStatus), and the desktop editor falling
+    // back without saying so is indistinguishable from "BoulderX is broken".
+    QString m_mesh_generator_status;
+    bool m_mesh_generator_declined = false;   // BoulderX was asked for and refused
+    // Per-node depth, recovered from the mesh the object shipped with (see
+    // mesh_import). Empty means the object's own mesh had none to recover, and
+    // the edit keeps its uniform depth.
+    std::vector<double> m_mesh_front_z;
+    std::vector<double> m_mesh_back_z;
+    std::vector<double> m_mesh_vanilla_front_z;
+    std::vector<double> m_mesh_vanilla_back_z;
     av::SceneData m_mesh_scene_saved;              // R / Ctrl+Z whole-session revert target
     bool m_mesh_scene_saved_valid = false;
     bool m_mesh_dirty = false;
@@ -460,6 +481,7 @@ private:
     void begin_mesh_edit();
     void end_mesh_edit(bool apply);
     void mesh_import(int idx);                     // polygon + params from the object
+    void mesh_sync_relief_to_polygon();            // keep per-node depth lockstep with the polygon
     bool mesh_apply();                             // boulder regenerate + GPU re-upload
     void mesh_resync_gpu(int idx);
     void mesh_revert_session();

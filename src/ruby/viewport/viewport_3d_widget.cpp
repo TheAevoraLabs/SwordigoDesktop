@@ -5733,6 +5733,12 @@ void Viewport3DWidget::mesh_import(int idx) {
     float hat_offset_1 = 5.0f;
     float hat_offset_2 = 5.0f;
     uint32_t random_seed = 1291618994u;
+    // MeshType (field 7) and HorizNoise (field 6) were read past here before and
+    // are what the engine actually builds terrain from: dropping them made an
+    // edit add a rounded rim to a plain sheet and rebuild its relief from zero
+    // noise, i.e. change the object's structure and flatten its Z.
+    int mesh_type = 1;
+    double horiz_noise = 0.0;
 
     // Pass 1: Extract GroundPolygon, GroundMesh, GroundMeshGenerator, CollisionShape
     for (const auto& comp : comps) {
@@ -5790,6 +5796,8 @@ void Viewport3DWidget::mesh_import(int idx) {
                         if (g.field_number == 3) front_tm_id = static_cast<uint32_t>(g.varint_val);
                         else if (g.field_number == 4) surface_tm_id = static_cast<uint32_t>(g.varint_val);
                         else if (g.field_number == 5) random_seed = static_cast<uint32_t>(g.varint_val);
+                        else if (g.field_number == 6 && g.wire_type == proto::WIRE_I32) horiz_noise = g.float_val;
+                        else if (g.field_number == 7) mesh_type = static_cast<int>(g.varint_val);
                         else if (g.field_number == 8 && g.wire_type == proto::WIRE_I32) surface_width = g.float_val;
                         else if (g.field_number == 9 && g.wire_type == proto::WIRE_I32) hat_height = g.float_val;
                         else if (g.field_number == 10 && g.wire_type == proto::WIRE_I32) hat_offset_1 = g.float_val;
@@ -5866,19 +5874,15 @@ void Viewport3DWidget::mesh_import(int idx) {
     if (top_tex.empty()) top_tex = "fire_grass";
     if (bottom_tex.empty()) bottom_tex = "graveyard_ground";
 
-    // Fallback: unique XY positions from the embedded ground meshes.
-    if (m_mesh_points.size() < 3) {
-        for (const auto& gm : obj.ground_meshes) {
-            for (size_t i = 0; i + 2 < gm.positions.size(); i += 3) {
-                const double x = gm.positions[i], y = gm.positions[i + 1];
-                bool dup = false;
-                for (const auto& pt : m_mesh_points)
-                    if (std::fabs(pt.x - x) < 0.01 && std::fabs(pt.y - y) < 0.01) { dup = true; break; }
-                if (!dup && m_mesh_points.size() < 64) m_mesh_points.push_back({x, y});
-            }
-            if (m_mesh_points.size() >= 3) break;
-        }
-    }
+    // NO fabricated fallback outline -- see the longer note in
+    // RubyQuickViewport::meshImport(). Scraping the baked mesh's unique XY is not
+    // the polygon: it mixes in the rim's inward-offset bevel and inner-wall
+    // points, stops at the first submesh (itself a rim patch) and caps at 64, so
+    // the "outline" was a small inward blob whose regeneration discarded the real
+    // level-wide ground. An object whose polygon cannot be recovered is baked-only
+    // and the renderer already draws its mesh verbatim, so refusing here leaves it
+    // untouched -- exactly what the early return below did before the fallback was
+    // added. (../.scratch/ground_roundtrip_probe.cpp is the measurement.)
     if (m_mesh_points.size() < 3) return;
 
     if (!have_depth) {
@@ -5902,8 +5906,110 @@ void Viewport3DWidget::mesh_import(int idx) {
     m_mesh_params.hat_width_offset_2 = hat_offset_2;
     m_mesh_params.texture_scale = scale_from_tm;
     m_mesh_params.random_seed = random_seed;
+    m_mesh_type = mesh_type;
+    m_mesh_noise = horiz_noise;
     m_mesh_ids = target_ids;
     m_mesh_z = obj.pos_z;
+
+    // The object's own per-node depth.
+    //
+    // This used to be *recovered* from the mesh the object shipped with, by
+    // matching every baked vertex's XY against the outline. That works on a
+    // MeshType 0 sheet and fails on a MeshType 1 one, and it fails silently:
+    //
+    //   * at a rim node the ribbon YIELDS its node to the rim, so the bake holds
+    //     no plain-plane back vertex there at all — the shallowest baked z on
+    //     that column is the rim's own, `HatWidthOffset1` further out;
+    //   * recovery reported the extreme pair, so it handed back that inflated
+    //     plane, and boulderx::build_rim then added HatWidthOffset1 a SECOND
+    //     time (measured: a sheet whose own envelope is +-95 regenerated at
+    //     -105, i.e. the "it over-increases the Z" report).
+    //
+    // Measured on fire_part2 obj3#15 (SurfaceWidth 150, HorizNoise 50, seed 0,
+    // 36 nodes): the law's front plane is present in the bake at 36/36 nodes,
+    // its back plane at 33/36, and each of the 3 misses is exactly 5.00 —
+    // HatWidthOffset1 — too deep. (.scratch/rim_noise_probe.py is that run.)
+    //
+    // So the array is not recovered, it is recomputed: GenerateMesh derives one
+    // depth per node from the generator's own parameters and nothing else, and a
+    // ground object always carries them. No XY matching, so no node can fail to
+    // match, and every node keeps the depth the engine would have given it.
+    m_mesh_vanilla_front_z.clear();
+    m_mesh_vanilla_back_z.clear();
+    // Every shipped ground object carries a GroundMeshGenerator, but a
+    // hand-authored or truncated one may not: only when there is no usable
+    // SurfaceWidth does this fall back to reading the bake.
+    if (surface_width > 0.0f) {
+        boulderx::Params law;
+        law.mesh_type = mesh_type;
+        law.surface_width = surface_width;
+        law.horiz_noise = horiz_noise;
+        law.random_seed = random_seed;
+        boulderx::engine_node_depths(law, m_mesh_points.size(),
+                                     m_mesh_vanilla_front_z, m_mesh_vanilla_back_z);
+    } else {
+        std::vector<boulderx::Node> outline;
+        outline.reserve(m_mesh_points.size());
+        for (const auto& pt : m_mesh_points) outline.push_back({pt.x, pt.y, 0.0, 0.0});
+        std::vector<float> positions;
+        for (const auto& pm : obj.ground_meshes)
+            positions.insert(positions.end(), pm.positions.begin(), pm.positions.end());
+        boulderx::recover_node_depths(outline, positions, 0.5,
+                                      m_mesh_vanilla_front_z, m_mesh_vanilla_back_z);
+    }
+    m_mesh_front_z = m_mesh_vanilla_front_z;
+    m_mesh_back_z = m_mesh_vanilla_back_z;
+    mesh_sync_relief_to_polygon();
+    // A fresh import has not generated anything yet; the previous object's
+    // "declined" line must not be attributed to this one.
+    m_mesh_generator_status.clear();
+}
+
+// Keep the per-node depth arrays the same length as the polygon — one depth per
+// node, always.
+//
+// m_mesh_points and m_mesh_front_z/m_mesh_back_z are parallel arrays, but only
+// the vertex list was edited: inserting a node on an edge or deleting a vertex
+// left the depth arrays at their old length, so mesh_apply's all-or-nothing
+// `have_relief` check went false and EVERY node fell back to the object's own
+// uniform depth. A levelled terrain rebuilt as a constant slab is exactly the
+// "Ruby GG flattens Z" symptom, and it is why one vertex edit destroyed the
+// whole sheet. Mobile carries the mirror of this in
+// RubyQuickViewport::insertMeshVertex()/eraseMeshVertex(); this is the desktop
+// half, and it runs both after every structural edit and again before a
+// generate, so a path that forgets to call it cannot flatten anything.
+//
+// A node with no depth of its own takes the vanilla depth at that index when the
+// object shipped one, and the object's own uniform front/back depth otherwise —
+// what it would have baked at had the sheet been flat, never a hardcoded pair.
+void Viewport3DWidget::mesh_sync_relief_to_polygon() {
+    const size_t n = m_mesh_points.size();
+    if (n == 0) {
+        m_mesh_front_z.clear();
+        m_mesh_back_z.clear();
+        return;
+    }
+
+    const double uniform_front = std::fabs((double)m_mesh_params.max_depth);
+    const double uniform_back = -std::fabs((double)m_mesh_params.min_depth);
+
+    // Rebuilt rather than resized: a live value wins at its own index, then the
+    // object's vanilla depth there, then the uniform one. Truncating or padding
+    // would pair a depth with the wrong node when the edit was in the middle of
+    // the ring, which shears the terrain instead of flattening it.
+    const auto fit = [&](std::vector<double>& live, const std::vector<double>& vanilla,
+                         double fallback) {
+        if (live.size() == n) return;   // already in lockstep — never touch it
+        std::vector<double> out(n);
+        for (size_t i = 0; i < n; ++i) {
+            if (i < live.size())          out[i] = live[i];
+            else if (i < vanilla.size())  out[i] = vanilla[i];
+            else                         out[i] = fallback;
+        }
+        live.swap(out);
+    };
+    fit(m_mesh_front_z, m_mesh_vanilla_front_z, uniform_front);
+    fit(m_mesh_back_z, m_mesh_vanilla_back_z, uniform_back);
 }
 
 void Viewport3DWidget::begin_mesh_edit() {
@@ -6037,6 +6143,10 @@ bool Viewport3DWidget::mesh_apply() {
     if (m_mesh_edit_object < 0 || m_mesh_edit_object >= (int)m_scene.objects.size()) return false;
     if (m_mesh_points.size() < 3) return false;
 
+    // Pair the depths with the nodes before anything reads them, so a vertex
+    // added or removed since the import cannot desynchronise the two arrays.
+    mesh_sync_relief_to_polygon();
+
     boulder::GroundMesh gm = m_mesh_params;
     gm.polygon = m_mesh_points;
     boulder::ensure_ccw(gm.polygon);
@@ -6047,21 +6157,147 @@ bool Viewport3DWidget::mesh_apply() {
     // hats today), and we fall straight back to boulder rather than emit an
     // object with geometry missing.
     std::string bin;
-    if (boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX) {
-        std::vector<std::pair<double, double>> xy;
-        xy.reserve(gm.polygon.size());
-        for (const auto& p : gm.polygon) xy.emplace_back(p.x, p.y);
+    const auto gen_choice = boulderx::ground_generator();
+    if (gen_choice == boulderx::GroundGenerator::Zypher) {
+        std::vector<zypher::TerrainNode> nodes;
+        nodes.reserve(m_mesh_points.size());
+        const bool have_relief = m_mesh_front_z.size() == m_mesh_points.size() &&
+                                 m_mesh_back_z.size() == m_mesh_points.size();
+        for (size_t i = 0; i < m_mesh_points.size(); ++i) {
+            zypher::TerrainNode n;
+            n.x = m_mesh_points[i].x;
+            n.y = m_mesh_points[i].y;
+            if (have_relief) {
+                n.front_depth = m_mesh_front_z[i];
+                n.back_depth = m_mesh_back_z[i];
+            } else {
+                double hw = gm.surface_width > 0 ? gm.surface_width * 0.5 : 50.0;
+                n.front_depth = hw;
+                n.back_depth = -hw;
+            }
+            n.height = std::fabs(n.front_depth - n.back_depth);
+            nodes.push_back(n);
+        }
+        zypher::TerrainParams params;
+        params.bevel = zypher::ProfileKind::SmoothFillet;
+        params.surface_tex = gm.top_texture.empty() ? "fire_grass" : gm.top_texture;
+        params.cliff_tex = gm.bottom_texture.empty() ? "graveyard_ground" : gm.bottom_texture;
+        params.surface_width = (gm.surface_width > 0 ? gm.surface_width : 100.0);
+        params.hat_height = (gm.hat_height > 0 ? static_cast<float>(gm.hat_height) : 20.0f);
+        params.hat_width = (gm.hat_width_offset_1 > 0 ? static_cast<float>(gm.hat_width_offset_1) : 8.0f);
+        params.texture_scale = m_mesh_params.texture_scale > 0 ? m_mesh_params.texture_scale : 250.0f;
+        params.fbm_amplitude = 12.0f;
+        params.rear_closure = true;
+
+        zypher::ComponentIds ids{
+            m_mesh_ids.polygon_id, m_mesh_ids.mesh_id,
+            m_mesh_ids.generator_id, m_mesh_ids.collision_id,
+            m_mesh_ids.tm_surface_id, m_mesh_ids.tm_front_id
+        };
+        bin = zypher::generate_terrain_object(nodes, params, m_scene.objects[m_mesh_edit_object].name, &ids);
+    } else if (gen_choice == boulderx::GroundGenerator::BoulderX) {
+        // A per-node outline, built from m_mesh_points rather than gm.polygon:
+        // boulder::ensure_ccw may have reversed gm.polygon, and pairing depths
+        // with the wrong node would shear the terrain. Carrying x/y/depth in one
+        // Node means the winding fix cannot desynchronise them.
+        const bool have_relief = m_mesh_front_z.size() == m_mesh_points.size() &&
+                                 m_mesh_back_z.size() == m_mesh_points.size();
+        // The uniform pair is only ever the fallback for a node that has no depth
+        // of its own, never for the whole outline: keying the choice on the
+        // arrays' LENGTH meant one inserted vertex flattened the entire sheet.
+        const double uniform_front = std::fabs(gm.max_depth);
+        const double uniform_back = -std::fabs(gm.min_depth);
+        std::vector<boulderx::Node> outline;
+        outline.reserve(m_mesh_points.size());
+        for (size_t i = 0; i < m_mesh_points.size(); ++i) {
+            boulderx::Node n;
+            n.x = m_mesh_points[i].x;
+            n.y = m_mesh_points[i].y;
+            // The object's own depth at this node, otherwise its uniform depth —
+            // never a hardcoded 1/45 pair.
+            n.front_depth = (have_relief && i < m_mesh_front_z.size())
+                                ? m_mesh_front_z[i] : uniform_front;
+            n.back_depth = (have_relief && i < m_mesh_back_z.size())
+                               ? m_mesh_back_z[i] : uniform_back;
+            outline.push_back(n);
+        }
+        boulderx::ensure_ccw(outline);
+
+        boulderx::Params params;
+        params.mesh_type = m_mesh_type;
+        params.horiz_noise = m_mesh_noise;
+        params.random_seed = m_mesh_params.random_seed;
+        params.texture_scale = m_mesh_params.texture_scale;
+        params.surface_width = gm.surface_width;
+        params.hat_height = gm.hat_height;
+        params.hat_width_offset_1 = gm.hat_width_offset_1;
+        params.hat_width_offset_2 = gm.hat_width_offset_2;
+        params.surface_texture = gm.top_texture;
+        params.front_texture = gm.bottom_texture;
+        // Depths recovered from the object's own bake already contain its
+        // HorizNoise (the engine applies it when baking), so applying it again
+        // would jitter them a second time. Suppressed unconditionally, not only
+        // when the recovered array is non-empty: the empty case is the recovery
+        // FAILURE path, and re-applying the noise there replaced the object with
+        // a freshly randomised surface rather than the sheet it arrived as. The
+        // object's generator parameters are still written back unchanged —
+        // emitted_horiz_noise decouples the two.
+        params.horiz_noise = 0.0;
+        params.emitted_horiz_noise = m_mesh_noise;
+        // The outline's depths are the engine's own array (mesh_import recomputes
+        // it from the generator parameters), so honouring them IS the engine's
+        // shape — and it is the only way a modder's dragged relief survives. The
+        // engine law is not re-applied here on purpose: it would overwrite the
+        // sculpt, which is the "my edit snapped back to vanilla" complaint.
+        params.depth_source = boulderx::Params::DepthSource::Outline;
+
         const int ids6[6] = {m_mesh_ids.polygon_id, m_mesh_ids.mesh_id,
                              m_mesh_ids.generator_id, m_mesh_ids.collision_id,
                              m_mesh_ids.tm_surface_id, m_mesh_ids.tm_front_id};
-        bin = boulderx::generate_ground_mesh_object_flat(
-            xy, 1, std::fabs(gm.max_depth), gm.top_texture, gm.bottom_texture,
-            m_scene.objects[m_mesh_edit_object].name, !gm.hats.empty(), ids6);
+        // Dome hats travel with the object, not as a "has hats" flag: boulderx
+        // never includes boulder.h, so the two identical structs are converted
+        // explicitly rather than aliased.
+        std::vector<boulderx::Hat> hats;
+        hats.reserve(gm.hats.size());
+        for (const auto& h : gm.hats)
+            hats.push_back({h.x, h.y, h.radius, h.height});
+        bin = boulderx::generate_ground_mesh_object_nodes(
+            outline, params, m_scene.objects[m_mesh_edit_object].name, hats, ids6);
     }
     if (bin.empty()) {
         const std::string swdm = boulder::serialize_swdm(gm);
         bin = boulder::generate_ground_mesh_object(
             swdm, m_scene.objects[m_mesh_edit_object].name, m_mesh_z, &m_mesh_ids);
+    }
+
+    // Report which generator actually produced this mesh, the same three-way
+    // report mobile shows. Boulder has exactly ONE depth pair for the whole
+    // sheet, so reaching it from a BoulderX run means the relief this object
+    // carried was replaced by a slab — that has to be visible, not inferred from
+    // the terrain going flat. The reason is only consulted when BoulderX was
+    // asked for: last_decline_reason() survives from an earlier run otherwise,
+    // which would attribute a decline to a generate that never requested one.
+    m_mesh_generator_declined = false;
+    if (gen_choice == boulderx::GroundGenerator::Zypher) {
+        if (!bin.empty()) {
+            m_mesh_generator_status = QStringLiteral("Zypher (Gen 3)");
+        } else {
+            m_mesh_generator_status =
+                QStringLiteral("Boulder · Zypher declined: %1")
+                    .arg(QString::fromStdString(zypher::last_decline_reason()));
+            m_mesh_generator_declined = true;
+        }
+    } else if (gen_choice == boulderx::GroundGenerator::BoulderX) {
+        if (!boulderx::last_decline_reason().empty()) {
+            m_mesh_generator_status =
+                QStringLiteral("Boulder · Zenith declined: %1")
+                    .arg(QString::fromStdString(boulderx::last_decline_reason()));
+            m_mesh_generator_declined = true;
+        } else {
+            m_mesh_generator_status = QStringLiteral("Zenith");
+        }
+    } else {
+        m_mesh_generator_status = QStringLiteral("Boulder (v1 slab)");
     }
     if (bin.empty()) return false;
 
@@ -6275,6 +6511,15 @@ bool Viewport3DWidget::mesh_edit_mouse_press(QMouseEvent* e) {
     }
     if (e->button() == Qt::RightButton) {
         if (m_mesh_hover_vertex >= 0 && m_mesh_points.size() > 3) {
+            // Mirror the erase for the per-node relief before dropping the node,
+            // or the depth arrays drift out of lockstep with the polygon and
+            // mesh_sync_relief_to_polygon() has to re-derive the tail from the
+            // vanilla depths. Same pairing contract as mobile and the studio.
+            if (m_mesh_front_z.size() == m_mesh_points.size() &&
+                m_mesh_back_z.size() == m_mesh_points.size()) {
+                m_mesh_front_z.erase(m_mesh_front_z.begin() + m_mesh_hover_vertex);
+                m_mesh_back_z.erase(m_mesh_back_z.begin() + m_mesh_hover_vertex);
+            }
             m_mesh_points.erase(m_mesh_points.begin() + m_mesh_hover_vertex);
             m_mesh_drag_point = -1;   // indices shifted — drop any stale drag
             m_mesh_dragging = false;
@@ -6290,6 +6535,16 @@ bool Viewport3DWidget::mesh_edit_mouse_press(QMouseEvent* e) {
             const double len2 = dx*dx + dy*dy;
             double t = len2 > 1e-12 ? ((lx - ax)*dx + (ly - ay)*dy) / len2 : 0.0;
             t = std::clamp(t, 0.0, 1.0);
+            // The new node inherits its PREDECESSOR's depth, which is also what
+            // reads best: a vertex added to an edge continues that edge rather
+            // than denting it. Without this the arrays were one short and the
+            // whole sheet fell back to a uniform slab on the next generate.
+            if (m_mesh_front_z.size() == (size_t)m_mesh_points.size() &&
+                m_mesh_back_z.size() == (size_t)m_mesh_points.size() &&
+                a < (int)m_mesh_front_z.size()) {
+                m_mesh_front_z.insert(m_mesh_front_z.begin() + b, m_mesh_front_z[a]);
+                m_mesh_back_z.insert(m_mesh_back_z.begin() + b, m_mesh_back_z[a]);
+            }
             m_mesh_points.insert(m_mesh_points.begin() + b, {ax + dx*t, ay + dy*t});
             m_mesh_drag_point = b;    // grab the new node right away
             m_mesh_dragging = true;
@@ -6383,6 +6638,11 @@ bool Viewport3DWidget::mesh_edit_key(QKeyEvent* e) {
     }
     if (e->key() == Qt::Key_Delete || e->key() == Qt::Key_Backspace) {
         if (m_mesh_hover_vertex >= 0 && m_mesh_points.size() > 3) {
+            if (m_mesh_front_z.size() == m_mesh_points.size() &&
+                m_mesh_back_z.size() == m_mesh_points.size()) {
+                m_mesh_front_z.erase(m_mesh_front_z.begin() + m_mesh_hover_vertex);
+                m_mesh_back_z.erase(m_mesh_back_z.begin() + m_mesh_hover_vertex);
+            }
             m_mesh_points.erase(m_mesh_points.begin() + m_mesh_hover_vertex);
             m_mesh_drag_point = -1;
             m_mesh_dragging = false;
@@ -6520,6 +6780,19 @@ void Viewport3DWidget::draw_mesh_edit_overlay() {
     QFont hint_f = p.font();
     hint_f.setPixelSize(11); hint_f.setBold(false);
     p.setFont(hint_f);
+    if (!m_mesh_generator_status.isEmpty()) {
+        // The mesh on screen was produced by this generator. Amber marks the one
+        // case that matters: BoulderX was asked for, declined, and Boulder
+        // answered with a single depth pair for the whole sheet — the object's
+        // relief is gone, and before this line the only evidence was the terrain
+        // quietly going flat.
+        p.setPen(m_mesh_generator_declined
+                     ? QColor(255, 190, 90, 255)
+                     : (m_mesh_generator_status == QStringLiteral("Zenith")
+                            ? QColor(150, 255, 170, 255)
+                            : QColor(200, 205, 215, 255)));
+        p.drawText(QPointF(w - 330.0, 60.0), m_mesh_generator_status);
+    }
     p.setPen(m_mesh_snap > 0.0 ? QColor(150, 255, 170, 255) : QColor(200, 205, 215, 255));
     p.drawText(QPointF(w - 210.0, 42.0),
                m_mesh_snap > 0.0

@@ -77,9 +77,16 @@ winding.
 
 ## 4. Round hats — domes on platforms
 
-**Engine:** `InsertRoundHatVertices` + `InsertCapForRoundHat` close the ends
-of a surface with a rounded cap; `GenerateSurfaceMeshWithRoundHat` builds the
-top fan.
+> The names here come from the engine's rim functions, which are a *different*
+> feature: `InsertRoundHatVertices` / `InsertCapForRoundHat` sweep and close the
+> rounded RIM of a MeshType 1 slab, and no shipped ground object contains a dome
+> (doc 09 §4). The `Hat` dome below is Ruby's own authoring construct — boulder
+> emits it into `Hat[` blocks and scene objects, and BoulderX reproduces it — so
+> read this section as "the generator's Hat feature", not as a port of those two
+> symbols.
+
+**Ruby:** `Platform.hats` → each `Hat{x, y, radius, height}` is appended to
+the platform's polygon as a semi-circle dome:
 
 **Ruby:** `Platform.hats` → each `Hat{x, y, radius, height}` is appended to
 the platform's polygon as a semi-circle dome:
@@ -90,7 +97,8 @@ samples = 10 arc points:
     point = (x + radius·cos θ, y + height·sin θ)
 ```
 
-Defaults (radius 60, height 40) match the observed game ranges (r: 40–80,
+Defaults (radius 60, height 40) match the ranges the parameter fields are
+handed in shipped scenes (`HatWidthOffset`/`HatHeight` neighbours r: 40–80,
 h: 20–40). The dome is part of the platform polygon → the same
 ground-object builder emits it — collision, texture mapping and geometry all
 stay consistent.
@@ -192,7 +200,7 @@ spawn.x = first platform's left edge X + 80   (slightly inside)
 | Noise | `Caver::Random` (LCG) | splitmix64 (§1) |
 | Surface | `GenerateSurfaceMesh` | `make_heightfield_polygon` (§2) |
 | Jitter | `HorizNoise` param | `apply_horiz_noise` (§3) |
-| Caps | `InsertRoundHatVertices`, `InsertCapForRoundHat` | `Hat` dome (§4) |
+| Rim | `InsertRoundHatVertices`, `InsertCapForRoundHat` | `Hat` dome (§4) |
 | Mesher | `Caver::GroundMeshGenerator` | **boulder** (reused) (§5) |
 | Water | `WaterMeshComponent` layout | `build_water_object` (§6) |
 | Bounds | root field 3 (fixed32 ×4) | `build_bounds_payload` (§7) |

@@ -61,6 +61,63 @@ Item {
     property string topTexture: "fire_grass"
     property string frontTexture: "graveyard_ground"
 
+    // ── Terrain relief (Z) ─────────────────────────────────────────────────
+    //
+    // The sheet is drafted on the XY plane, so Z cannot be drawn on it: without
+    // this, every node shares one depth and the exported mesh is a flat plate.
+    // "Randomise" gives each node its own depth inside this range — a correlated
+    // walk, so neighbouring nodes stay near each other and the result reads as
+    // rolling ground rather than a saw — and "Flatten" puts it back to a uniform
+    // slab. The seed is shown so a relief you liked can be reproduced.
+    property real reliefFront: 45.0
+    property real reliefBack: 45.0
+    /// Seed of the relief currently in the model, or 0 when there is no seed that
+    /// reproduces it. A LOADED sheet's per-node Z comes from the file, so it has
+    /// no seed: see loadedRelief.
+    property int reliefSeed: 0
+
+    /// True when the per-node Z currently in the model came out of a FILE rather
+    /// than out of randomiseRelief(). Such relief has no seed, and pretending
+    /// otherwise (the old `reliefSeed = Date.now()` on load) both made the relief
+    /// button advertise a number that regenerates a DIFFERENT surface and made
+    /// the next randomise derive from that fake value -- so opening a sheet and
+    /// touching relief replaced the file's own curving with a fresh randomised
+    /// map instead of keeping it.
+    property bool loadedRelief: false
+
+    /// Generator this sheet is authored for. It decides the .swdm DIALECT on
+    /// export: with relief (or BoulderX selected) the sheet is written as format
+    /// v2, which stores one depth per node and which Boulder therefore cannot
+    /// open. A uniform sheet in Boulder mode stays v1, readable by both.
+    ///
+    /// The fallback matches boulderx::ground_generator()'s own default, so the
+    /// bridge being unavailable cannot silently select the other generator.
+    property string generatorId: (typeof rubySettings !== "undefined" && rubySettings)
+                                 ? rubySettings.groundGenerator : "boulder"
+    /// Generator component fields carried into the sheet (engine defaults).
+    property int meshType: 1
+    property int randomSeed: 1291618994
+    /// Last sheet path read or written, so Load/Export do not need retyping.
+    property string sheetPath: ""
+
+    Connections {
+        target: (typeof androidContext !== "undefined" && androidContext) ? androidContext : null
+        function onFilePicked(tag, path) {
+            if (tag === "mesh_sheet") {
+                root.sheetPath = path
+                root.loadSheet()
+            }
+        }
+    }
+    /// Dome hats read out of a sheet, carried back out on export.
+    ///
+    /// A dome stands ON the surface, which a 2D canvas cannot express and this
+    /// view therefore does not edit — but it must not DROP them either: opening
+    /// a level's ground sheet and re-exporting it has to leave the level's domes
+    /// where they were. Each entry is { x, y, radius, height }.
+    property var domeHats: []
+    readonly property int domeHatCount: root.domeHats ? root.domeHats.length : 0
+
     // ── Canvas view transform ──────────────────────────────────────────────
     property real zoomScale: 0.85
     property real panOffsetX: 0.0
@@ -193,7 +250,7 @@ Item {
         var out = []
         for (var i = 0; i < nodes.count; ++i) {
             var p = nodes.get(i)
-            out.push({ x: p.px, y: p.py })
+            out.push({ x: p.px, y: p.py, front: p.fz, back: p.bz })
         }
         return out
     }
@@ -209,10 +266,23 @@ Item {
         redoStack = []
     }
 
+    // Per-node depth for a node entering the ring. A node inserted while relief
+    // is applied inherits its neighbour's depth, so inserting a vertex does not
+    // punch a flat step into sculpted terrain.
+    function depthForNeighbour(index) {
+        if (index >= 0 && index < nodes.count) {
+            var p = nodes.get(index)
+            return { f: p.fz, b: p.bz }
+        }
+        return { f: root.maxDepth, b: root.minDepth }
+    }
+
     function restore(list) {
         nodes.clear()
         for (var i = 0; i < list.length; ++i)
-            nodes.append({ px: list[i].x, py: list[i].y })
+            nodes.append({ px: list[i].x, py: list[i].y,
+                           fz: list[i].front !== undefined ? list[i].front : root.maxDepth,
+                           bz: list[i].back !== undefined ? list[i].back : root.minDepth })
         if (selectedPoint >= nodes.count) selectedPoint = nodes.count - 1
         canvas.requestPaint()
     }
@@ -242,9 +312,11 @@ Item {
     }
 
     function resetTo(list) {
+        root.domeHats = []
         nodes.clear()
-        for (var i = 0; i < list.length; ++i)
-            nodes.append({ px: list[i].x, py: list[i].y })
+        for (var i = 0; i < list.length; ++i)                nodes.append({ px: list[i].x, py: list[i].y, fz: root.maxDepth, bz: root.minDepth })
+        root.reliefSeed = 0
+        root.loadedRelief = false
         undoStack = []
         redoStack = []
         selectedPoint = list.length > 0 ? 0 : -1
@@ -255,16 +327,18 @@ Item {
     /// for undo — the live state if omitted.
     function insertPointAt(index, wx, wy, before) {
         var i = Math.max(0, Math.min(nodes.count, index))
+        var d = depthForNeighbour(i > 0 ? i - 1 : 0)
         pushUndo(before)
-        nodes.insert(i, { px: snapValue(wx), py: snapValue(wy) })
+        nodes.insert(i, { px: snapValue(wx), py: snapValue(wy), fz: d.f, bz: d.b })
         selectedPoint = i
         canvas.requestPaint()
         buzz(15)
     }
 
     function appendPoint(wx, wy) {
+        var d = depthForNeighbour(nodes.count - 1)
         pushUndo()
-        nodes.append({ px: snapValue(wx), py: snapValue(wy) })
+        nodes.append({ px: snapValue(wx), py: snapValue(wy), fz: d.f, bz: d.b })
         selectedPoint = nodes.count - 1
         canvas.requestPaint()
         buzz(15)
@@ -1129,7 +1203,9 @@ Item {
                     width: parent.width
                     text: root.selectedPoint >= 0
                           ? ("X " + Math.round(nodes.get(root.selectedPoint).px) +
-                             "\nY " + Math.round(nodes.get(root.selectedPoint).py))
+                             "\nY " + Math.round(nodes.get(root.selectedPoint).py) +
+                             "\nZ " + Math.round(nodes.get(root.selectedPoint).fz) +
+                             " / " + Math.round(nodes.get(root.selectedPoint).bz))
                           : ""
                     font.family: Theme.fontFamilyMono
                     font.pixelSize: Theme.dp(Theme.fontSm)
@@ -1252,6 +1328,99 @@ Item {
                     }
                 }
 
+                Rectangle { height: 1; width: parent.width; color: Theme.borderSubtle }
+
+                // ── Terrain relief (Z) ──────────────────────────────────────
+                // The sheet is 2D, so a node's depth cannot be drawn on it. These
+                // two fields are the range the randomiser shapes relief inside,
+                // and they are deliberately separate from Depth min/max: relief
+                // reshapes the terrain without changing how thick the slab is.
+                Text {
+                    text: qsTr("TERRAIN RELIEF (Z)")
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    font.weight: Font.Bold
+                    font.letterSpacing: 1.1
+                    color: Theme.textMuted
+                }
+
+                Row {
+                    width: parent.width
+                    spacing: Theme.dp(6)
+                    Text {
+                        text: qsTr("Randomise +Z")
+                        color: Theme.textMuted
+                        font.pixelSize: Theme.dp(Theme.fontSm)
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    ThemedField {
+                        width: Theme.dp(72)
+                        text: "" + root.reliefFront
+                        onEditingFinished: root.reliefFront = Math.abs(parseFloat(text) || 0.0)
+                    }
+                }
+
+                Row {
+                    width: parent.width
+                    spacing: Theme.dp(6)
+                    Text {
+                        text: qsTr("Randomise -Z")
+                        color: Theme.textMuted
+                        font.pixelSize: Theme.dp(Theme.fontSm)
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    ThemedField {
+                        width: Theme.dp(72)
+                        text: "" + root.reliefBack
+                        onEditingFinished: root.reliefBack = Math.abs(parseFloat(text) || 0.0)
+                    }
+                }
+
+                Row {
+                    width: parent.width
+                    spacing: Theme.dp(6)
+
+                    Button {
+                        width: (parent.width - Theme.dp(6)) * 0.62
+                        // A loaded sheet's relief is the file's, so there is no
+                        // seed to show -- labelling it "Z <n>" claimed the loaded
+                        // curving came from a randomiser it never ran through.
+                        text: root.loadedRelief ? qsTr("Z (loaded)")
+                                                : (root.reliefSeed > 0
+                                                   ? qsTr("Z %1").arg(root.reliefSeed)
+                                                   : qsTr("Randomise Z"))
+                        font.pixelSize: Theme.dp(Theme.fontXs)
+                        onClicked: root.randomiseRelief()
+                    }
+
+                    Button {
+                        width: (parent.width - Theme.dp(6)) * 0.38
+                        text: qsTr("Flatten")
+                        font.pixelSize: Theme.dp(Theme.fontXs)
+                        enabled: root.hasRelief
+                        onClicked: root.flattenRelief()
+                    }
+                }
+
+                Text {
+                    width: parent.width
+                    text: qsTr("Sculpted Z is exported as a Zenith sheet (format v2). Boulder cannot open a sheet with per-node Z.")
+                    wrapMode: Text.WordWrap
+                    color: Theme.textMuted
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                }
+
+                // Domes are geometry this 2D canvas cannot draw, so they are
+                // reported rather than edited — and carried through on export,
+                // never dropped.
+                Text {
+                    width: parent.width
+                    visible: root.domeHatCount > 0
+                    text: qsTr("%1 dome hat(s) preserved from this sheet").arg(root.domeHatCount)
+                    wrapMode: Text.WordWrap
+                    color: Theme.textMuted
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                }
+
                 Row {
                     width: parent.width
                     spacing: Theme.dp(6)
@@ -1291,6 +1460,50 @@ Item {
                     width: parent.width
                     text: root.frontTexture
                     onEditingFinished: root.frontTexture = text.trim()
+                }
+
+                Rectangle { height: 1; width: parent.width; color: Theme.borderSubtle }
+
+                // ── Sheet file ──────────────────────────────────────────────
+                // Load reads BOTH dialects: an older boulder sheet arrives as a
+                // uniform slab, a BoulderX sheet keeps its per-node Z. Export
+                // writes v2 whenever there is relief to keep.
+                Text {
+                    text: qsTr("SHEET FILE")
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    font.weight: Font.Bold
+                    font.letterSpacing: 1.1
+                    color: Theme.textMuted
+                }
+
+                Row {
+                    width: parent.width
+                    spacing: Theme.dp(Theme.spacingXs)
+
+                    ThemedField {
+                        width: parent.width - Theme.dp(36) - Theme.dp(Theme.spacingXs)
+                        text: root.sheetPath
+                        onEditingFinished: root.sheetPath = text.trim()
+                    }
+
+                    IconButton {
+                        anchors.verticalCenter: parent.verticalCenter
+                        iconName: "folder-open"
+                        variant: "soft"
+                        buttonSize: Theme.dp(36)
+                        onClicked: {
+                            if (typeof androidContext !== "undefined" && androidContext && androidContext.supported) {
+                                androidContext.pickFile("mesh_sheet", "*/*")
+                            }
+                        }
+                    }
+                }
+
+                Button {
+                    width: parent.width
+                    text: qsTr("Load sheet")
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    onClicked: root.loadSheet()
                 }
 
                 Rectangle { height: 1; width: parent.width; color: Theme.borderSubtle }
@@ -1360,29 +1573,165 @@ Item {
     }
 
     // ========================================================================
-    //  Export
+    //  Terrain relief (Z)
     // ========================================================================
+    //
+    // Both actions write the per-node depths (fz/bz) the export carries, and go
+    // through the SAME randomiser the in-scene mesh editor uses
+    // (boulderx::randomise_node_depths via the tools bridge), so a sheet and a
+    // live edit with the same seed produce the same terrain.
+
+    /// True when the sheet currently carries per-node relief. This is also what
+    /// makes an export a BoulderX-only (v2) sheet — the depth it would lose is
+    /// the depth Boulder's format has nowhere to put.
+    readonly property bool hasRelief: reliefSeed > 0 || loadedRelief
+
+    function randomiseRelief() {
+        if (pointCount < 3) {
+            toast.show(qsTr("A sheet needs at least 3 vertices"))
+            return
+        }
+        if (typeof rubyToolsBridge === "undefined" || !rubyToolsBridge) {
+            toast.show(qsTr("Relief needs the tools bridge"))
+            return
+        }
+        var front = root.reliefFront > 0 ? root.reliefFront : Math.abs(root.maxDepth)
+        var back = root.reliefBack > 0 ? root.reliefBack : Math.abs(root.minDepth)
+        if (!(front > 0)) front = 45.0
+        if (!(back > 0)) back = 45.0
+
+        // Seed sequence owned here, not in C++: the seed shown on the button is
+        // the one that reproduces this exact terrain when typed back in. Loaded
+        // relief has no such seed (loadedRelief), so it starts a fresh sequence
+        // instead of deriving from a stand-in value.
+        var seed = root.reliefSeed > 0
+                   ? ((root.reliefSeed * 1664525 + 1013904223) % 2147483647)
+                   : (Date.now() % 2147483647)
+        if (seed <= 0) seed = 1
+
+        var shaped = rubyToolsBridge.randomiseTerrainRelief(root.toList(), front, back, seed)
+        if (!shaped || shaped.length !== nodes.count) {
+            toast.show(qsTr("Relief generation failed"))
+            return
+        }
+        pushUndo()
+        for (var i = 0; i < shaped.length; ++i) {
+            nodes.setProperty(i, "fz", shaped[i].front)
+            nodes.setProperty(i, "bz", shaped[i].back)
+        }
+        root.reliefSeed = seed
+        root.loadedRelief = false
+        canvas.requestPaint()
+        toast.show(qsTr("Randomised Z %1 · %2 / -%3").arg(seed).arg(front).arg(back))
+        root.buzz(30)
+    }
+
+    function flattenRelief() {
+        if (!root.hasRelief && pointCount === 0) return
+        pushUndo()
+        for (var i = 0; i < nodes.count; ++i) {
+            nodes.setProperty(i, "fz", root.maxDepth)
+            nodes.setProperty(i, "bz", root.minDepth)
+        }
+        root.reliefSeed = 0
+        root.loadedRelief = false
+        canvas.requestPaint()
+        toast.show(qsTr("Z flattened to a uniform slab"))
+        root.buzz(20)
+    }
+
+    // ========================================================================
+    //  Sheet file — export / load
+    // ========================================================================
+    function defaultSheetPath() {
+        if (root.sheetPath.length > 0) return root.sheetPath
+        if (typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.currentPath)
+            return rubyFileModel.currentPath + "/custom_terrain.swdm"
+        return "/sdcard/Swordigo/mesh_" + Date.now() + ".swdm"
+    }
+
     function doExport() {
         if (pointCount < 3) {
             toast.show(qsTr("A sheet needs at least 3 vertices"))
             return
         }
-        var outPath = "/sdcard/Swordigo/mesh_" + Date.now() + ".swdm"
-        if (typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.currentPath)
-            outPath = rubyFileModel.currentPath + "/custom_terrain.swdm"
-
         if (typeof rubyToolsBridge === "undefined" || !rubyToolsBridge) {
             toast.show(qsTr("Export bridge unavailable"))
             return
         }
-        var ok = rubyToolsBridge.exportSwdm(outPath, root.toList(), root.minDepth, root.maxDepth,
-                                            root.topTexture, root.frontTexture, root.surfaceWidth, 0.0)
-        if (ok) {
-            toast.show(qsTr("Exported → %1").arg(outPath))
+        var path = root.defaultSheetPath()
+        var res = rubyToolsBridge.exportGroundMeshSheet({
+            "path": path,
+            "points": root.toList(),
+            "minDepth": root.minDepth,
+            "maxDepth": root.maxDepth,
+            "surfaceWidth": root.surfaceWidth,
+            "topTexture": root.topTexture,
+            "frontTexture": root.frontTexture,
+            "meshType": root.meshType,
+            "randomSeed": root.randomSeed,
+            "generator": root.generatorId,
+            // Read back out of the sheet, never invented here: see domeHats.
+            "domeHats": root.domeHats,
+            "identifier": "ground"
+        })
+        if (res && res.ok) {
+            root.sheetPath = path
+            toast.show(res.message)
             root.buzz(30)
         } else {
-            toast.show(qsTr("Export failed"))
+            toast.show((res && res.message) ? res.message : qsTr("Export failed"))
         }
+    }
+
+    // Reads EITHER dialect: an older boulder sheet opens as a uniform slab, a
+    // BoulderX sheet opens with its per-node Z intact. Nothing is downgraded — a
+    // v2 sheet stays v2 because its relief is what the file is.
+    function loadSheet() {
+        if (typeof rubyToolsBridge === "undefined" || !rubyToolsBridge) {
+            toast.show(qsTr("Load bridge unavailable"))
+            return
+        }
+        var path = root.sheetPath.length > 0 ? root.sheetPath : root.defaultSheetPath()
+        var res = rubyToolsBridge.importGroundMeshSheet(path)
+        if (!res || !res.ok) {
+            toast.show((res && res.message) ? res.message : qsTr("Could not load the sheet"))
+            return
+        }
+        var pts = res.points
+        if (!pts || pts.length < 3) {
+            toast.show(qsTr("That sheet has fewer than 3 vertices"))
+            return
+        }
+        pushUndo()
+        restore(pts)
+        root.sheetPath = path
+        root.minDepth = res.minDepth
+        root.maxDepth = res.maxDepth
+        root.surfaceWidth = res.surfaceWidth
+        root.meshType = res.meshType
+        root.randomSeed = res.randomSeed
+        root.topTexture = res.topTexture
+        root.frontTexture = res.frontTexture
+        // Domes are geometry this view cannot draw, so they are held verbatim for
+        // the next export instead of being regenerated.
+        root.domeHats = res.domeHats ? res.domeHats : []
+        // A loaded BoulderX sheet keeps its relief (so it re-exports as v2); a
+        // v1 sheet is uniformly flat, so there is no relief to claim.
+        //
+        // That relief is the FILE's per-node Z (restore() already put it in the
+        // model), so it has no seed -- reliefSeed stays 0 and loadedRelief marks
+        // where it came from. Inventing a seed here was what let a load followed
+        // by any relief action replace the file's curving with a new random map.
+        var varied = false
+        for (var i = 1; i < pts.length; ++i)
+            if (Math.abs(pts[i].front - pts[0].front) > 1e-6) varied = true
+        root.reliefSeed = 0
+        root.loadedRelief = varied
+        root.reliefFront = Math.abs(res.maxDepth)
+        root.reliefBack = Math.abs(res.minDepth)
+        toast.show(res.message)
+        root.buzz(30)
     }
 
     // ========================================================================

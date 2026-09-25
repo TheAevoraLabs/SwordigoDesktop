@@ -89,6 +89,13 @@ public:
     /// Gracefully move task to back (minimize without killing)
     Q_INVOKABLE void moveToBack();
 
+    /// Android Storage Access Framework folder & file pickers
+    Q_INVOKABLE void pickFolder(const QString& tag);
+    Q_INVOKABLE void pickFile(const QString& tag, const QString& filter = QStringLiteral("*/*"));
+
+    /// Open standalone native code editor activity
+    Q_INVOKABLE void openCodeEditor(const QString& filePath);
+
     void updateInsets(int top, int bottom, int left, int right);
     void handleFileOpen(const QString& path);
 
@@ -96,6 +103,8 @@ signals:
     void orientationPolicyChanged();
     void insetsChanged();
     void fileOpenRequested(const QString& path);
+    void folderPicked(const QString& tag, const QString& path);
+    void filePicked(const QString& tag, const QString& path);
 
 private:
     bool applyPolicy(int androidOrientation, const QString& name);
