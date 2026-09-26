@@ -47,6 +47,7 @@
 #include "input_config.h"
 #include "data_path.h"
 #include "fbo_scaler.h"
+#include "ffp_forward.h"   // ffp::set_quality — the layer that owns the lighting
 #include "platform/launcher_config.h"
 #include "platform/mod_manager.h"
 
@@ -3024,6 +3025,27 @@ void SwordfareGUI::draw_graphics_options_modal(PostFXState& state) {
                     ImGui::SetNextItemWidth(170);
                     ImGui::SliderFloat("Bloom Intensity##blmi", &state.bloom_intensity, 0.0f, 1.5f, "Glow %.2f");
 
+                    // ============ UI/HUD exemption (removable) ============
+                    // Delete this checkbox to drop the control; the feature itself is
+                    // PostFXState::ui_exempt plus the two mask reads in fbo_scaler.cpp
+                    // and the u_ui_mask/u_ui_exempt uniforms in composite.glsl and
+                    // bloom_extract.glsl. Nothing else reads the field.
+                    ImGui::Checkbox("Keep UI/HUD out of the light pass##blmui",
+                                    &state.ui_exempt);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "The GL bridge stamps every orthographic (2D) draw - HUD, text,\n"
+                            "prompts, buttons - into the scene stencil as 1, and the 3D\n"
+                            "world as 0. With this on:\n"
+                            "  * the bloom extract ignores those pixels, so a round bubble\n"
+                            "    no longer grows a square halo of glow around it;\n"
+                            "  * the composite writes them through untouched, instead of\n"
+                            "    relighting HUD sprites with the 3D light handshake.\n\n"
+                            "Off = the old behaviour, where UI pixels are bloomed and\n"
+                            "shaded exactly like world geometry.");
+                    }
+                    // ============= END UI/HUD exemption =============
+
                     // ============ BEGIN bloom-emitter-key controls ============
                     // Removable: delete this block, the four bloom_emitter_* fields in
                     // PostFXState, the uniform upload in fbo_scaler.cpp and the gate in
@@ -3058,6 +3080,50 @@ void SwordfareGUI::draw_graphics_options_modal(PostFXState& state) {
                         ImGui::SliderFloat("Bloom Threshold##blmt", &state.bloom_threshold, 0.5f, 1.0f, "Cutoff %.2f");
                     }
                     // ============= END bloom-emitter-key controls =============
+                }
+
+                // ── Lighting model: the layer that OWNS the lighting ──────────
+                // This is the fixed-function translation layer in ffp_forward.cpp,
+                // and it is the only thing that decides what the scene's shading
+                // is. Until now it was settable ONLY through the
+                // SWORDIGO_FFP_LIGHTING environment variable, which meant the
+                // heaviest path in the renderer - level 4, per-fragment lighting
+                // plus a derived normal map on EVERY draw - could not be turned
+                // down from the UI and did not appear in the config at all.
+                // A change applies on the next draw (the level is a uniform, so no
+                // shader rebuild and no restart) and is written back to the config.
+                {
+                    static const char* kLightingNames[] = {
+                        "0  Off - untouched fixed-function",
+                        "1  Translate - GLES1 parity (per-vertex)",
+                        "2  Per-fragment lighting + normals",
+                        "3  + Parallax occlusion mapping",
+                        "4  + Cook-Torrance GGX PBR (heaviest)",
+                    };
+                    // Show what is actually in effect: the stored choice if there is
+                    // one, otherwise whatever the layer resolved for itself.
+                    int live = state.ffp_lighting_level >= 0 ? state.ffp_lighting_level
+                                                             : ffp::quality();
+                    if (live < 0) live = 0;
+                    if (live > 4) live = 4;
+                    ImGui::SetNextItemWidth(255);
+                    if (ImGui::Combo("Lighting model##ffplot", &live,
+                                     kLightingNames, IM_ARRAYSIZE(kLightingNames))) {
+                        state.ffp_lighting_level = live;
+                        ffp::set_quality(live);
+                        postfx_save_lighting_level(live);
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "Which shading model the layer that owns the lighting uses.\n"
+                            "Level 4 is the default and the heaviest: per-fragment lighting\n"
+                            "and a derived normal map on every draw, which is the first\n"
+                            "thing to turn down when the frame is slow. Level 2 keeps\n"
+                            "per-fragment lighting and drops parallax/GGX, level 1 is\n"
+                            "vanilla per-vertex parity, level 0 leaves the guest's\n"
+                            "fixed-function path untouched.\n\n"
+                            "Saved to postfx_config.json as \"ffp_lighting_level\".");
+                    }
                 }
 
                 ImGui::Columns(1);

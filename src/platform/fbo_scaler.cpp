@@ -12,8 +12,12 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <string>
+#include <vector>
+#include <algorithm>
 #include "graphics/LightManager.h"
 #include "graphics/TextureAwareMapper.h"
+#include "platform/ffp_forward.h"   // the layer that owns lighting; see PostFXState::ffp_lighting_level
 
 // ============================================================
 //  FBO + Multi-Pass Post-Processing Pipeline
@@ -120,6 +124,8 @@ static GLint loc_godrays_far = -1;
 static GLint loc_bloom_extract_tex = -1;
 static GLint loc_bloom_extract_threshold = -1;
 static GLint loc_bloom_extract_tex_size = -1;
+static GLint loc_bloom_extract_ui_mask = -1;
+static GLint loc_bloom_extract_ui_exempt = -1;
 // Authored-emitter bloom key. See src/shaders/graphics/bloom_extract.glsl.
 static GLint loc_bloom_extract_emitter_keyed = -1;
 static GLint loc_bloom_extract_emitter_count = -1;
@@ -163,6 +169,8 @@ static GLint loc_comp_water_surface = -1;
 static GLint loc_comp_water_valid = -1;
 static GLint loc_comp_time = -1;
 static GLint loc_comp_ui_pass = -1;
+static GLint loc_comp_ui_mask = -1;
+static GLint loc_comp_ui_exempt = -1;
 
 // g_prog_postfx uniforms
 static GLint loc_postfx_tex = -1;
@@ -204,6 +212,19 @@ static GLint loc_comp_player_world    = -1; // vec3 — hero world-space positio
 static GLint loc_comp_modelview       = -1; // mat4 — current modelview shadow
 static GLint loc_comp_projection      = -1; // mat4 — current projection shadow
 static GLint loc_comp_light_model_amb = -1; // vec4 — glLightModel ambient
+
+// ── Dynamic light buffer (the level's own point lights) ────────────────────
+// How many of the frame's collected lights the composite accumulates per pixel.
+// LightManager can hold 32, but the shader pays for every entry it loops over
+// and only a handful can matter on one screen, so this is where the cost is
+// bounded. MUST match MAX_DYNAMIC_LIGHTS in composite.glsl (a uniform array's
+// size is part of the interface: if these disagree the uniform is not found and
+// the whole feature silently does nothing).
+static const int MAX_DYNAMIC_LIGHTS = 8;
+static GLint loc_comp_light_count = -1;  // int      — live u_lights[] entries
+static GLint loc_comp_lights      = -1;  // vec4[8]  — xyz = EYE-space pos, w = reach
+static GLint loc_comp_light_color = -1;  // vec4[8]  — rgb = linear colour, a = intensity
+static GLint loc_comp_light_atten = -1;  // vec3[8]  — engine's (kc, kl, kq)
 
 // ======================= SHADER SOURCES =======================
 
@@ -802,6 +823,17 @@ uniform sampler2D u_tex;
 uniform float u_threshold;        // luminance cutoff; legacy path only
 uniform vec2  u_tex_size;
 
+// --- UI/HUD exclusion -------------------------------------------------------
+// u_ui_mask is the scene FBO's DEPTH24_STENCIL8 attachment: .r is depth, .g is
+// stencil, and the GL bridge stamps every orthographic draw (2D HUD, text,
+// sprites) with stencil 1 and the 3D world with 0. The extract runs BEFORE the
+// composite, so without this the composite's own UI exemption protects only the
+// UI's pixels and a bright HUD sprite still blooms outward into world pixels -
+// which is exactly a square glow around a round UI bubble. u_ui_exempt = 0
+// disables the mask.
+uniform sampler2D u_ui_mask;
+uniform float u_ui_exempt;
+
 // --- authored-emitter key, uploaded from BiomeTable::kEmitterPalette ---------
 uniform float u_emitter_keyed;    // 0 = luminance only, 1 = authored-emitter key
 uniform int   u_emitter_count;
@@ -927,12 +959,22 @@ void main() {
     // Local mean over the whole 13-tap footprint.
     float local_luma = luma709(a + b + c + d + e + f + g + h + i + j + k + l + m) / 13.0;
 
+    // 1.0 where this pixel is 3D world, 0.0 where it is 2D UI/HUD. The stencil
+    // is an 8-bit integer, so stencil 1 arrives as 1/255 = 0.0039 - NOT 1.0.
+    // Comparing against 1.0 would be a silent no-op that looks like the mask
+    // simply not working, so test "any non-zero stencil". An all-zero stencil
+    // leaves every pixel as world, i.e. exactly the previous behaviour.
+    float ui_needed = 1.0;
+    if (u_ui_exempt > 0.5) {
+        ui_needed = (texture(u_ui_mask, v_uv).g < 0.002) ? 1.0 : 0.0;
+    }
+
     // Threshold each individual box
-    vec3 box0 = (d + e + i + j) * 0.25;
-    vec3 box1 = (a + b + g + f) * 0.25;
-    vec3 box2 = (b + c + h + g) * 0.25;
-    vec3 box3 = (f + g + l + k) * 0.25;
-    vec3 box4 = (g + h + m + l) * 0.25;
+    vec3 box0 = (d + e + i + j) * 0.25 * ui_needed;
+    vec3 box1 = (a + b + g + f) * 0.25 * ui_needed;
+    vec3 box2 = (b + c + h + g) * 0.25 * ui_needed;
+    vec3 box3 = (f + g + l + k) * 0.25 * ui_needed;
+    vec3 box4 = (g + h + m + l) * 0.25 * ui_needed;
 
     if (u_emitter_keyed > 0.5) {
         box0 = emitter_sample(box0, local_luma);
@@ -1011,7 +1053,28 @@ uniform float u_reflection_intensity; // 0-1
 uniform vec3  u_water_surface;
 uniform float u_water_valid;
 uniform float u_time;                 // animated ripples
-uniform float u_ui_pass;              // 0 or 1 (bypasses postfx for UI)
+uniform float u_ui_pass;              // 0 or 1 (bypasses the whole pass for UI)
+// The same stencil mask the bloom extract reads: a DEPTH24_STENCIL8 sample puts
+// depth in .r and the stencil in .g, and the GL bridge stamps every orthographic
+// (2D) draw - HUD, text, sprites - with stencil 1 and the 3D world with 0.
+uniform sampler2D u_ui_mask;
+uniform float u_ui_exempt;
+
+// ── The level's own point lights, collected per frame ───────────────────────
+// KEEP IN STEP with the same block in src/shaders/graphics/composite.glsl.
+// Fed from LightManager, which the GL bridge populates when a LightComponent
+// places its light (see jni_bridge_arm64.cpp). xyz is the EYE-space position and
+// w is the reach; u_light_atten carries the engine's own (kc, kl, kq), so the
+// falloff evaluated below is the level's authored curve and not an inverse-square
+// invented here.
+// MAX_DYNAMIC_LIGHTS must match the constant of the same name in fbo_scaler.cpp:
+// an array size is part of the uniform interface, and a mismatch means the
+// uniform is not found and this whole path silently does nothing.
+#define MAX_DYNAMIC_LIGHTS 8
+uniform int  u_light_count;
+uniform vec4 u_lights[MAX_DYNAMIC_LIGHTS];
+uniform vec4 u_light_color[MAX_DYNAMIC_LIGHTS];
+uniform vec3 u_light_atten[MAX_DYNAMIC_LIGHTS];
 
 in vec2 v_uv;
 out vec4 FragColor;
@@ -1242,13 +1305,34 @@ vec3 compute_pbr_shading(vec3 albedo, vec3 normal, Material mat) {
     vec3 specular = (D * G * F) / max(4.0 * NoV * NoL, 0.001);
     specular = clamp(specular, vec3(0.0), vec3(1.5));
     
-    vec3 result = (diffuse + specular * 3.14159265) * light_color * (0.28 + 0.72 * NoL);
-    
-    // Base ambient preserves the engine's original pre-lit details
-    vec3 ambient = albedo * (u_light_model_amb.rgb * 0.5 + 0.5);
-    
-    // Smoothly blend PBR shading with original bright albedo for dynamic response + visibility
-    vec3 final_color = mix(albedo * 0.95 + specular * 0.25, result + ambient * 0.20, 0.52);
+    // ── Modulate. Do NOT replace. ────────────────────────────────────────
+    // KEEP IN STEP with the same block in src/shaders/graphics/composite.glsl.
+    // This used to return a whole replacement lighting solution, mixed 52% over
+    // the rendered frame:
+    //     final_color = mix(albedo * 0.95 + specular * 0.25,
+    //                       (diffuse + specular * pi) * light_color * (0.28 + 0.72*NoL)
+    //                       + ambient * 0.20,
+    //                       0.52);
+    // Two things were wrong with that, and together they are why the High preset
+    // reads as blown plastic next to Medium, which never enables this path:
+    //   * It re-lit pixels that already carry the guest's own lighting - the
+    //     level's authored GL_LIGHT0..7 are applied by the translation layer and
+    //     the level bakes light into its textures. That is the same stacking
+    //     defect the non-PBR branch below was fixed for; switching PBR on just
+    //     turned it back on for the presets that enable it.
+    //   * The specular term was clamped to 1.5 and then multiplied by pi, so a
+    //     single glint contributed up to 4.71 into a 0..1 image, and the 0.52 mix
+    //     put about half of that onto every highlight. Mid-tones then sat near
+    //     1.0 and everything bright ran into the tone curve's asymptote.
+    // What the BRDF is allowed to contribute here is a bounded highlight: a
+    // sheen whose strength comes from roughness (a smooth surface glints, a
+    // rough one does not) scaled by metalness and tinted by the live light.
+    // light_color is deliberately the luminance-floored tint computed above, so
+    // a dimly lit cave still produces a visible sheen instead of nothing.
+    // The diffuse term and the ambient term are intentionally unused: the frame
+    // already has both of them, applied correctly and per pixel, from the level.
+    vec3 highlight = specular * (0.35 * (1.0 - mat.roughness)) * (1.0 + mat.metalness);
+    vec3 final_color = albedo + clamp(highlight, vec3(0.0), vec3(0.5)) * light_color * 0.30;
     
     if (mat.emissive > 0.5) {
         final_color = max(final_color, albedo * 1.35);
@@ -1362,8 +1446,123 @@ vec3 ACESFilm(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
+// --- Tone curve discipline ---------------------------------------------------
+// KEEP IN STEP with the same block in src/shaders/graphics/composite.glsl.
+// ACES Narkowicz above is a SCENE-referred curve, and it is being applied here
+// to a DISPLAY-referred signal: the game framebuffer is already sRGB-encoded and
+// already has its lighting baked in. Two consequences, both of which are visible
+// as the complaints "dark is too dark" and "bright is too bright":
+//
+//  * The toe. For small x the fit collapses to (b*x)/e = 0.03x/0.14 ~ 0.21x, so
+//    a pixel at 0.02 leaves at 0.012 and a cave floor loses ~80% of its value.
+//    The game's unlit areas are exactly the pixels that live in that toe, so the
+//    crush lands on the regions that were already darkest.
+//  * The asymptote. The fit is past 0.98 by x=5 and reaches 1.0 near x=6, and the
+//    additive terms below (god rays, and bloom * intensity * 2.5 on emissives)
+//    can push a torch core far beyond that. Core and fringe then both pin to
+//    white and the glow reads as a flat disc - "bloom is not filled" - because
+//    there is no gradient left for the curve to resolve.
+//
+// So keep ACES for its shoulder and fade it out below the toe knee, and give the
+// additive terms their own asymptotic shoulder before the curve (add_glow).
+const float TONEMAP_TOE   = 0.18;  // below this input luma, stay linear
+const float GLOW_HEADROOM = 1.60;  // additive 'stop' before the highlight rolloff
+
+float tm_luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 tonemap(vec3 x) {
+    vec3 curve  = ACESFilm(x * 1.06);
+    float  knee = smoothstep(0.0, TONEMAP_TOE, tm_luma(x));
+    return mix(x, curve, knee);
+}
+
+// Additive light is folded in with a shoulder instead of straight into the
+// curve's asymptote: monotonic, so a brighter emitter still comes out brighter,
+// but 1x and 6x glow no longer both arrive at 1.0.
+vec3 add_glow(vec3 sum, vec3 glow) {
+    glow = max(glow, vec3(0.0));
+    return sum + glow / (1.0 + tm_luma(glow) / GLOW_HEADROOM);
+}
+
+// ── The level's lights, accumulated per pixel ───────────────────────────────
+// KEEP IN STEP with the same block in src/shaders/graphics/composite.glsl.
+// The frame arriving here is ALREADY LIT (see the note in main()), so this must
+// not shade it again - that stacking is what made the High preset look blown.
+// What the level's lights add is their own glow: the part the guest's per-vertex
+// pipeline cannot express at all, because a Gouraud light is evaluated at
+// VERTICES. A torch's falloff across a large floor quad is simply not present in
+// that data, which is why the glow around a flame reads as a hard-edged disc
+// instead of a gradient. Reconstructing it per pixel is additive and is bounded
+// by add_glow() below, so it fills the halo rather than flattening what is under
+// it.
+vec3 accumulate_engine_lights(vec2 uv) {
+    if (u_light_count <= 0) return vec3(0.0);
+
+    float aspect = u_tex_size.x / max(u_tex_size.y, 1.0);
+    vec3 accum = vec3(0.0);
+
+    for (int i = 0; i < MAX_DYNAMIC_LIGHTS; ++i) {
+        if (i >= u_light_count) break;
+
+        float reach = u_lights[i].w;
+        if (reach <= 0.0) continue;
+
+        // EYE space -> clip. No modelview: the stored position is already through
+        // the one the fixed-function pipeline lit with.
+        vec4 clip = u_projection * vec4(u_lights[i].xyz, 1.0);
+        if (clip.w <= 1e-4) continue;
+        vec2 light_uv = (clip.xy / clip.w) * 0.5 + 0.5;
+
+        // Screen-space reach in UV, from the same projection scale the host used
+        // to rank the light. Axis-aligned scale only, deliberately: a reach is a
+        // sphere, so its screen span comes from the projection's scale terms and
+        // not from any rotation.
+        float r_uv = max(abs(u_projection[0][0] * reach / clip.w),
+                         abs(u_projection[1][1] * reach / clip.w)) * 0.5;
+        if (r_uv <= 1e-6) continue;
+
+        // Normalised screen distance: 1.0 exactly at the light's reach.
+        vec2 d = (uv - light_uv) * vec2(aspect, 1.0);
+        float nd = length(d) / r_uv;
+        if (nd >= 1.0) continue;
+
+        // The level's OWN falloff, from the component's authored attenuation:
+        // 1 / (kc + kl*wd + kq*wd^2), normalised to 1 at the centre, with wd the
+        // world distance recovered from the screen distance. This is what makes a
+        // light fall off over its authored range instead of an invented one.
+        float kc = max(u_light_atten[i].x, 1e-4);
+        float kl = u_light_atten[i].y;
+        float kq = u_light_atten[i].z;
+        float wd = nd * reach;
+        float att = kc / (kc + kl * wd + kq * wd * wd);
+        if (att <= 0.001) continue;
+
+        // Soften the outer edge, so the cutoff cannot draw a visible rim where nd
+        // crosses 1 - that rim is the hard-edged disc this replaces.
+        att *= smoothstep(1.0, 0.72, nd);
+
+        accum += u_light_color[i].rgb * (u_light_color[i].a * att);
+    }
+    return accum;
+}
+
 void main() {
+    // ---- UI/HUD passthrough --------------------------------------------------
+    // Two ways in. u_ui_pass bypasses the entire pass (a frame with no 3D draw
+    // at all). The stencil mask does it per PIXEL inside a mixed frame, which is
+    // what the split has to be: relighting a HUD sprite with the 3D light
+    // handshake is wrong, and the UI has to be written here rather than left to
+    // whatever the destination buffer already held - otherwise the region the
+    // composite skips shows up as a stale rectangle exactly where the UI is.
+    // The stencil is an 8-bit integer, so stencil 1 arrives normalised as
+    // 1/255 = 0.0039, not 1.0; the test is "any non-zero stencil".
     if (u_ui_pass > 0.5) {
+        FragColor = texture(u_scene, v_uv);
+        return;
+    }
+    if (u_ui_exempt > 0.5 && texture(u_ui_mask, v_uv).g >= 0.002) {
         FragColor = texture(u_scene, v_uv);
         return;
     }
@@ -1391,11 +1590,26 @@ void main() {
     if (u_pbr_enabled > 0.5) {
         scene = compute_pbr_shading(albedo, normal, mat);
     } else {
-        vec2 live_dir = (u_light0_diffuse.r + u_light0_diffuse.g + u_light0_diffuse.b > 0.05)
-                         ? compute_light_dir_ss() : u_shadow_light_dir;
-        vec3 light_dir_3d = normalize(vec3(live_dir, -u_shadow_sun_z));
-        float diff = clamp(dot(normal, light_dir_3d), 0.0, 1.0);
-        scene = albedo * (0.88 + 0.24 * diff);
+        // ── Do NOT re-light an already-lit frame ────────────────────────────
+        // KEEP IN STEP with the same block in src/shaders/graphics/composite.glsl.
+        // The pixels arriving here are lit already: the guest is fixed-function
+        // GLES1, so its own lighting (the engine's real GL_LIGHT0..7 with real
+        // positions and colours) is reproduced either by the translation layer
+        // in ffp_forward.cpp or by the driver's fixed-function pipeline, and the
+        // game bakes level lighting into the level textures on top of that.
+        //
+        // This branch used to apply a SECOND model to those pixels, and it was a
+        // near-constant one: (0.88 + 0.24*diff) spans only 0.88..1.12, so it
+        // could not produce lighting - all it did was multiply whatever the real
+        // lighting had produced by a number close to 1, flattening the contrast
+        // and washing out the shading. That is the "flat vanilla lighting" and
+        // the double-lighting report: the upgrade path was lighting the scene
+        // and this was flattening it straight afterwards, in the same frame.
+        //
+        // Pass the rendered frame through untouched. Relighting stays available,
+        // but it is opt-in and explicit (u_pbr_enabled), never a default on top
+        // of a frame that already has its light baked in.
+        scene = albedo;
     }
     
     // Apply SSAO (skip for lava/emissive)
@@ -1443,18 +1657,24 @@ void main() {
         vec3 rays = texture(u_godrays, v_uv).rgb;
         vec3 tint = vec3(u_gr_tint_r, u_gr_tint_g, u_gr_tint_b);
         tint = mix(tint, u_light0_diffuse.rgb, 0.25);
-        scene += rays * tint;
+        scene = add_glow(scene, rays * tint);
     }
     
     // Apply Bloom (additive glow)
     if (u_bloom_enabled > 0.5) {
         vec3 bloom = texture(u_bloom, v_uv).rgb;
         float boost = mat.emissive > 0.5 ? 2.5 : 1.0; // Emissive boost for Lava
-        scene += bloom * u_bloom_intensity * boost;
+        scene = add_glow(scene, bloom * u_bloom_intensity * boost);
+    }
+
+    // The level's own lights, filling in the glow the per-vertex pipeline cannot
+    // express. Bounded by add_glow(), so this cannot blow the frame out.
+    if (u_light_count > 0) {
+        scene = add_glow(scene, accumulate_engine_lights(v_uv));
     }
     
-    // --- ACES Filmic Tonemapping & Highlight Rolloff ---
-    scene = ACESFilm(scene * 1.06);
+    // --- Filmic tonemapping, toe bypassed for display-referred input ---
+    scene = tonemap(scene);
     
     // --- Saturation & Vibrance Tuning ---
     float luma2 = dot(scene, vec3(0.2126, 0.7152, 0.0722));
@@ -1814,6 +2034,8 @@ bool fbo_init(int game_w, int game_h) {
         loc_bloom_extract_tex       = glGetUniformLocation(g_prog_bloom_extract, "u_tex");
         loc_bloom_extract_threshold = glGetUniformLocation(g_prog_bloom_extract, "u_threshold");
         loc_bloom_extract_tex_size  = glGetUniformLocation(g_prog_bloom_extract, "u_tex_size");
+        loc_bloom_extract_ui_mask   = glGetUniformLocation(g_prog_bloom_extract, "u_ui_mask");
+        loc_bloom_extract_ui_exempt = glGetUniformLocation(g_prog_bloom_extract, "u_ui_exempt");
         loc_bloom_extract_emitter_keyed    = glGetUniformLocation(g_prog_bloom_extract, "u_emitter_keyed");
         loc_bloom_extract_emitter_count    = glGetUniformLocation(g_prog_bloom_extract, "u_emitter_count");
         loc_bloom_extract_emitter          = glGetUniformLocation(g_prog_bloom_extract, "u_emitter[0]");
@@ -1856,6 +2078,12 @@ bool fbo_init(int game_w, int game_h) {
         loc_comp_water_valid   = glGetUniformLocation(g_prog_composite, "u_water_valid");
         loc_comp_time             = glGetUniformLocation(g_prog_composite, "u_time");
         loc_comp_ui_pass          = glGetUniformLocation(g_prog_composite, "u_ui_pass");
+        loc_comp_ui_mask          = glGetUniformLocation(g_prog_composite, "u_ui_mask");
+        loc_comp_ui_exempt        = glGetUniformLocation(g_prog_composite, "u_ui_exempt");
+        loc_comp_light_count      = glGetUniformLocation(g_prog_composite, "u_light_count");
+        loc_comp_lights           = glGetUniformLocation(g_prog_composite, "u_lights[0]");
+        loc_comp_light_color      = glGetUniformLocation(g_prog_composite, "u_light_color[0]");
+        loc_comp_light_atten      = glGetUniformLocation(g_prog_composite, "u_light_atten[0]");
     }
     if (g_prog_postfx) {
         loc_postfx_tex                  = glGetUniformLocation(g_prog_postfx, "u_tex");
@@ -2117,6 +2345,24 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         if (loc_bloom_extract_tex_size != -1) {
             glUniform2f(loc_bloom_extract_tex_size, (float)g_quarter_w, (float)g_quarter_h);
         }
+        // ── UI/HUD exclusion ────────────────────────────────────────────────────
+        // The 3D world is stencil 0 and every orthographic (2D) draw is stencil
+        // 1 in the scene FBO's DEPTH24_STENCIL8 attachment. Feeding that mask to
+        // the extract is what stops a bright HUD sprite from blooming out into
+        // the world pixels around it - the "square halo around a round bubble"
+        // that the composite's own UI exemption cannot prevent, because the
+        // extract runs first. Texture unit 1 is otherwise unused in this pass.
+        // If g_fbo_depth_tex is 0 the sampled mask reads zero everywhere, i.e.
+        // every pixel stays world, which is the previous behaviour.
+        if (loc_bloom_extract_ui_mask != -1) {
+            glUniform1i(loc_bloom_extract_ui_mask, 1);
+        }
+        if (loc_bloom_extract_ui_exempt != -1) {
+            glUniform1f(loc_bloom_extract_ui_exempt, (postfx && postfx->ui_exempt) ? 1.0f : 0.0f);
+        }
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_fbo_depth_tex);
+        glActiveTexture(GL_TEXTURE0);
         // ── Authored-emitter key ────────────────────────────────────────────────
         // The bloom key is the CURRENT biome's own point-light colours, from the
         // same authoritative record the water pass uses. Every vanilla glow is a
@@ -2445,16 +2691,125 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
             if (loc_comp_projection     != -1)
                 glUniformMatrix4fv(loc_comp_projection, 1, GL_FALSE, safe_projection);
         }
+
+        // ── Dynamic lights: the level's own point lights, per pixel ───────────
+        // LightManager is fed by the glLightfv publish path in
+        // jni_bridge_arm64.cpp, which fires when a LightComponent places its light
+        // and hands over the component's authored colour, position and attenuation
+        // triple. This is the first consumer that buffer has ever had: before
+        // this it was cleared at the top of every frame and thrown away empty, and
+        // the shader lit the scene from a single GL-state guess instead.
+        //
+        // Adaptivity. 32 lights can be collected, but only a handful can matter on
+        // one screen and the shader pays for every entry it loops over, so the
+        // candidates are ranked by the reach they actually have on screen - their
+        // projected radius, damped by how far off-centre they are - and only the
+        // best MAX_DYNAMIC_LIGHTS are uploaded. A torch behind the camera or one
+        // whose reach is smaller than a pixel is still collected, and must not
+        // cost a loop iteration in every pixel of the frame.
+        if (loc_comp_light_count != -1 || loc_comp_lights != -1) {
+            struct Cand { float score; int index; };
+            Cand  cands[LightManager::MAX_LIGHTS];
+            int   n_cand = 0;
+
+            const auto& collected = LightManager::Instance().GetActiveLights();
+            const float* P = g_current_projection;
+
+            for (size_t i = 0; i < collected.size() && n_cand < int(LightManager::MAX_LIGHTS); ++i) {
+                const EnginePointLight& L = collected[i];
+                if (L.radius <= 0.0f || L.intensity <= 0.0f) continue;  // global light
+
+                // The stored position is EYE space (see EnginePointLight), so the
+                // projection alone takes it to clip space - no modelview.
+                const float cx = P[0] * L.position[0] + P[4] * L.position[1] + P[8]  * L.position[2] + P[12];
+                const float cy = P[1] * L.position[0] + P[5] * L.position[1] + P[9]  * L.position[2] + P[13];
+                const float cw = P[3] * L.position[0] + P[7] * L.position[1] + P[11] * L.position[2] + P[15];
+                if (cw <= 1e-4f) continue;      // at or behind the eye plane
+
+                const float ndc_x = cx / cw;
+                const float ndc_y = cy / cw;
+                // 1.35 rather than 1.0: a light just off-screen still spills onto
+                // the edge of the frame, and dropping it there is a visible pop.
+                if (std::fabs(ndc_x) > 1.35f || std::fabs(ndc_y) > 1.35f) continue;
+
+                // Screen-space reach: the projection's scale terms applied to one
+                // reach, divided by the same w. Rotation is irrelevant here because
+                // a reach is a sphere, so the axis-aligned scale is the right one.
+                const float r_ndc = std::max(std::fabs(P[0] * L.radius / cw),
+                                             std::fabs(P[5] * L.radius / cw));
+                if (r_ndc < 2.0f / float(std::max(1, g_game_h))) continue;  // sub-pixel
+
+                const float off_centre = std::sqrt(ndc_x * ndc_x + ndc_y * ndc_y);
+                cands[n_cand].score = r_ndc / (1.0f + off_centre);
+                cands[n_cand].index = int(i);
+                ++n_cand;
+            }
+
+            // Most on-screen reach first, then keep the best MAX_DYNAMIC_LIGHTS.
+            std::sort(cands, cands + n_cand, [](const Cand& a, const Cand& b) {
+                return a.score > b.score;
+            });
+            int picked = 0;
+            {
+                picked = std::min(n_cand, MAX_DYNAMIC_LIGHTS);
+
+                float pos_buf[MAX_DYNAMIC_LIGHTS * 4] = {0.0f};
+                float col_buf[MAX_DYNAMIC_LIGHTS * 4] = {0.0f};
+                float att_buf[MAX_DYNAMIC_LIGHTS * 3] = {0.0f};
+                for (int k = 0; k < picked; ++k) {
+                    const EnginePointLight& L = collected[size_t(cands[k].index)];
+                    pos_buf[k * 4 + 0] = L.position[0];
+                    pos_buf[k * 4 + 1] = L.position[1];
+                    pos_buf[k * 4 + 2] = L.position[2];
+                    pos_buf[k * 4 + 3] = L.radius;
+                    col_buf[k * 4 + 0] = L.color[0];
+                    col_buf[k * 4 + 1] = L.color[1];
+                    col_buf[k * 4 + 2] = L.color[2];
+                    col_buf[k * 4 + 3] = L.intensity;
+                    att_buf[k * 3 + 0] = L.attenuation[0];
+                    att_buf[k * 3 + 1] = L.attenuation[1];
+                    att_buf[k * 3 + 2] = L.attenuation[2];
+                }
+                if (loc_comp_lights != -1 && picked > 0) {
+                    glUniform4fv(loc_comp_lights, picked, pos_buf);
+                    glUniform4fv(loc_comp_light_color, picked, col_buf);
+                    glUniform3fv(loc_comp_light_atten, picked, att_buf);
+                }
+            }
+            // Always uploaded, including 0: a stale count from last frame would
+            // make the shader accumulate lights that are no longer in the level.
+            if (loc_comp_light_count != -1) {
+                glUniform1i(loc_comp_light_count, picked);
+            }
+        }
         
-        // Hardware Stencil Isolation:
-        // Only shade 3D world pixels where stencil == 0.
-        // 2D UI / HUD / text (stencil == 1) remains untouched and razor-sharp!
-        glEnable(GL_STENCIL_TEST);
-        glStencilFunc(GL_EQUAL, 0, 0xFF);
-        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-        glStencilMask(0x00);
+        // ── UI/HUD isolation, now PER PIXEL inside the shader ───────────────────
+        // This was a hardware stencil test (GL_EQUAL, ref 0) that skipped UI
+        // pixels and left them to whatever the pre-blit above had put in
+        // g_postfx_fbo. That holds only while the target is exactly the blit and
+        // the previous frame's footprint still lines up - when it does not, the
+        // skipped region surfaces as a stale rectangle exactly where the UI is.
+        // Testing in the shader and WRITING the passthrough pixel is strictly
+        // stronger: this pass then defines every pixel of its target this frame,
+        // and the world/UI split stays per-pixel rather than per-draw.
+        // Unit 5 is free here (0 scene, 1 ao, 2 godrays, 3 bloom, 4 depth).
+        if (loc_comp_ui_mask != -1) {
+            glUniform1i(loc_comp_ui_mask, 5);
+        }
+        if (loc_comp_ui_exempt != -1) {
+            glUniform1f(loc_comp_ui_exempt, (postfx && postfx->ui_exempt) ? 1.0f : 0.0f);
+        }
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, g_fbo_depth_tex);
+        glActiveTexture(GL_TEXTURE0);
+        // The whole-frame bypass stays off: it would key off the 2D-frame
+        // counters, which are deliberately not trusted for suppression (see the
+        // comment on g_frame_has_ortho/g_frame_has_perspective). Uploaded
+        // explicitly so a future writer of this uniform cannot half-enable it.
+        if (loc_comp_ui_pass != -1) {
+            glUniform1f(loc_comp_ui_pass, 0.0f);
+        }
         draw_fsq();
-        glDisable(GL_STENCIL_TEST);
 
         final_tex = g_postfx_tex;
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -3171,6 +3526,13 @@ bool postfx_load_custom_json(PostFXState& state) {
                 return 0.0f;
             }
         };
+        auto parse_int = [](const std::string& s) -> int {
+            try {
+                return std::stoi(s);
+            } catch (...) {
+                return -1;
+            }
+        };
 
         if (key == "enabled") state.enabled = parse_bool(val_str);
         else if (key == "vignette") state.vignette = parse_bool(val_str);
@@ -3210,6 +3572,16 @@ bool postfx_load_custom_json(PostFXState& state) {
         else if (key == "outline_thickness") state.outline_thickness = parse_float(val_str);
         else if (key == "outline_intensity") state.outline_intensity = parse_float(val_str);
         else if (key == "outline_depth_threshold") state.outline_depth_threshold = parse_float(val_str);
+        // UI/HUD exemption from the bloom extract and the composite (stencil mask).
+        else if (key == "ui_exempt") state.ui_exempt = parse_bool(val_str);
+        // Fixed-function translation lighting level. Pushed to the layer that
+        // owns lighting immediately, so loading the config is enough to change
+        // it: no restart, and no shader rebuild, because ffp_forward uploads the
+        // level as a uniform on every draw.
+        else if (key == "ffp_lighting_level") state.ffp_lighting_level = parse_int(val_str);
+    }
+    if (state.ffp_lighting_level >= 0) {
+        ffp::set_quality(state.ffp_lighting_level);
     }
     return true;
 }
@@ -3284,9 +3656,86 @@ void postfx_save_default_json() {
         << "  \"outlines\": false,\n"
         << "  \"outline_thickness\": 1.0,\n"
         << "  \"outline_intensity\": 0.7,\n"
-        << "  \"outline_depth_threshold\": 0.002\n"
+        << "  \"outline_depth_threshold\": 0.002,\n\n"
+        << "  // --- UI/HUD exemption (scene stencil mask) ---\n"
+        << "  // true = the bloom extract skips HUD/2D pixels, so a round HUD sprite no\n"
+        << "  //        longer grows a square halo of glow, and the composite writes them\n"
+        << "  //        through instead of relighting them with the 3D light handshake.\n"
+        << "  \"ui_exempt\": true,\n\n"
+        << "  // --- Lighting model (the fixed-function translation layer) ---\n"
+        << "  // Which shading model the layer that OWNS lighting uses:\n"
+        << "  //   0  untouched fixed-function          1  GLES1 parity (per-vertex)\n"
+        << "  //   2  + per-fragment lighting + normals 3  + parallax occlusion mapping\n"
+        << "  //   4  + Cook-Torrance GGX PBR\n"
+        << "  // 4 is the heaviest: per-fragment lighting AND a derived normal map on\n"
+        << "  // EVERY draw, which is the first thing to lower when the frame is slow.\n"
+        << "  // 2 keeps per-fragment lighting and drops POM/GGX. -1 means this key has\n"
+        << "  // not been set, and the SWORDIGO_FFP_LIGHTING variable (or the layer's\n"
+        << "  // own default) decides instead.\n"
+        << "  \"ffp_lighting_level\": -1\n"
         << "}\n";
     out.close();
+}
+
+// ---------------------------------------------------------------------------
+//  Persist one key in place: the lighting level
+// ---------------------------------------------------------------------------
+// postfx_save_default_json() writes a template of fixed defaults, so it cannot
+// record a choice made at runtime - reloading the config after it would just put
+// the defaults back. This rewrites the single line that carries the key and
+// leaves everything else byte-for-byte as it was, so a hand-commented config
+// survives a GUI change. If the key is absent (an older config written before it
+// existed) it is inserted before the closing brace.
+bool postfx_save_lighting_level(int level) {
+    const char* home = std::getenv("HOME");
+    if (!home) return false;
+    std::filesystem::path config_path = std::filesystem::path(home) / ".local" /
+                                        "share" / "swordigo-desktop" / "shaders" /
+                                        "postfx_config.json";
+
+    std::vector<std::string> lines;
+    {
+        std::ifstream in(config_path);
+        std::string line;
+        while (std::getline(in, line)) lines.push_back(line);
+    }
+    // No file yet: let the template writer create one that already has the key.
+    if (lines.empty()) {
+        postfx_save_default_json();
+        std::ifstream in(config_path);
+        std::string line;
+        while (std::getline(in, line)) lines.push_back(line);
+        if (lines.empty()) return false;
+    }
+
+    const std::string key = "\"ffp_lighting_level\"";
+    const std::string entry = key + ": " + std::to_string(level) + ",";
+
+    bool replaced = false;
+    for (auto& l : lines) {
+        if (l.find(key) != std::string::npos) {
+            size_t indent = l.find_first_not_of(" \t");
+            if (indent == std::string::npos) indent = 0;
+            const bool had_comma = l.find(',') != std::string::npos;
+            l = l.substr(0, indent) + entry;
+            if (!had_comma) l.pop_back();   // last key in the object: no comma
+            replaced = true;
+            break;
+        }
+    }
+    if (!replaced) {
+        for (size_t i = lines.size(); i-- > 0; ) {
+            if (lines[i].find('}') != std::string::npos) {
+                lines.insert(lines.begin() + static_cast<long>(i), "  " + entry);
+                break;
+            }
+        }
+    }
+
+    std::ofstream out(config_path);
+    if (!out.is_open()) return false;
+    for (const auto& l : lines) out << l << "\n";
+    return true;
 }
 
 const char* postfx_preset_name(PostFXPreset p) {

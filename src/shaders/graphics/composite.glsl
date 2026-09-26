@@ -53,7 +53,27 @@ uniform float u_reflection_intensity; // 0-1
 uniform vec3  u_water_surface;
 uniform float u_water_valid;
 uniform float u_time;                 // animated ripples
-uniform float u_ui_pass;              // 0 or 1 (bypasses postfx for UI)
+uniform float u_ui_pass;              // 0 or 1 (bypasses the whole pass for UI)
+// The same stencil mask the bloom extract reads: a DEPTH24_STENCIL8 sample puts
+// depth in .r and the stencil in .g, and the GL bridge stamps every orthographic
+// (2D) draw - HUD, text, sprites - with stencil 1 and the 3D world with 0.
+uniform sampler2D u_ui_mask;
+uniform float u_ui_exempt;
+
+// ── The level's own point lights, collected per frame ───────────────────────
+// Fed from LightManager, which the GL bridge populates when a LightComponent
+// places its light (see jni_bridge_arm64.cpp). xyz is the EYE-space position and
+// w is the reach; u_light_atten carries the engine's own (kc, kl, kq), so the
+// falloff evaluated below is the level's authored curve and not an inverse-square
+// invented here.
+// MAX_DYNAMIC_LIGHTS must match the constant of the same name in fbo_scaler.cpp:
+// an array size is part of the uniform interface, and a mismatch means the
+// uniform is not found and this whole path silently does nothing.
+#define MAX_DYNAMIC_LIGHTS 8
+uniform int  u_light_count;
+uniform vec4 u_lights[MAX_DYNAMIC_LIGHTS];
+uniform vec4 u_light_color[MAX_DYNAMIC_LIGHTS];
+uniform vec3 u_light_atten[MAX_DYNAMIC_LIGHTS];
 
 in vec2 v_uv;
 out vec4 FragColor;
@@ -311,9 +331,33 @@ vec3 compute_pbr_shading(vec3 albedo, vec3 normal, Material mat) {
     vec3 specular = (D * G * F) / max(4.0 * NoV * NoL, 0.001);
     specular = clamp(specular, vec3(0.0), vec3(1.5));
     
-    vec3 result = (diffuse + specular * 3.14159265) * light_color * (0.28 + 0.72 * NoL);
-    vec3 ambient = albedo * (u_light_model_amb.rgb * 0.5 + 0.5);
-    vec3 final_color = mix(albedo * 0.95 + specular * 0.25, result + ambient * 0.20, 0.52);
+    // ── Modulate. Do NOT replace. ────────────────────────────────────────
+    // This used to return a whole replacement lighting solution, mixed 52% over
+    // the rendered frame:
+    //     final_color = mix(albedo * 0.95 + specular * 0.25,
+    //                       (diffuse + specular * pi) * light_color * (0.28 + 0.72*NoL)
+    //                       + ambient * 0.20,
+    //                       0.52);
+    // Two things were wrong with that, and together they are why the High preset
+    // reads as blown plastic next to Medium, which never enables this path:
+    //   * It re-lit pixels that already carry the guest's own lighting - the
+    //     level's authored GL_LIGHT0..7 are applied by the translation layer and
+    //     the level bakes light into its textures. That is the same stacking
+    //     defect the non-PBR branch below was fixed for; switching PBR on just
+    //     turned it back on for the presets that enable it.
+    //   * The specular term was clamped to 1.5 and then multiplied by pi, so a
+    //     single glint contributed up to 4.71 into a 0..1 image, and the 0.52 mix
+    //     put about half of that onto every highlight. Mid-tones then sat near
+    //     1.0 and everything bright ran into the tone curve's asymptote.
+    // What the BRDF is allowed to contribute here is a bounded highlight: a
+    // sheen whose strength comes from roughness (a smooth surface glints, a
+    // rough one does not) scaled by metalness and tinted by the live light.
+    // light_color is deliberately the luminance-floored tint computed above, so
+    // a dimly lit cave still produces a visible sheen instead of nothing.
+    // The diffuse term and the ambient term are intentionally unused: the frame
+    // already has both of them, applied correctly and per pixel, from the level.
+    vec3 highlight = specular * (0.35 * (1.0 - mat.roughness)) * (1.0 + mat.metalness);
+    vec3 final_color = albedo + clamp(highlight, vec3(0.0), vec3(0.5)) * light_color * 0.30;
     
     if (mat.emissive > 0.5) {
         final_color = max(final_color, albedo * 1.35);
@@ -415,8 +459,127 @@ vec3 ACESFilm(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
+// --- Tone curve discipline ---------------------------------------------------
+// ACES Narkowicz above is a SCENE-referred curve, and it is being applied here
+// to a DISPLAY-referred signal: the game framebuffer is already sRGB-encoded and
+// already has its lighting baked in. Two consequences, both of which are visible
+// as the complaints "dark is too dark" and "bright is too bright":
+//
+//  * The toe. For small x the fit collapses to (b*x)/e = 0.03x/0.14 ~ 0.21x, so
+//    a pixel at 0.02 leaves at 0.012 and a cave floor loses ~80% of its value.
+//    The game's unlit areas are exactly the pixels that live in that toe, so the
+//    crush lands on the regions that were already darkest.
+//  * The asymptote. The fit is past 0.98 by x=5 and reaches 1.0 near x=6, and the
+//    additive terms below (god rays, and bloom * intensity * 2.5 on emissives)
+//    can push a torch core far beyond that. Core and fringe then both pin to
+//    white and the glow reads as a flat disc - "bloom is not filled" - because
+//    there is no gradient left for the curve to resolve.
+//
+// So keep ACES for its shoulder and fade it out below the toe knee, and give the
+// additive terms their own asymptotic shoulder before the curve (add_glow).
+const float TONEMAP_TOE   = 0.18;  // below this input luma, stay linear
+const float GLOW_HEADROOM = 1.60;  // additive 'stop' before the highlight rolloff
+
+float tm_luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 tonemap(vec3 x) {
+    vec3 curve  = ACESFilm(x * 1.06);
+    float  knee = smoothstep(0.0, TONEMAP_TOE, tm_luma(x));
+    return mix(x, curve, knee);
+}
+
+// Additive light is folded in with a shoulder instead of straight into the
+// curve's asymptote: monotonic, so a brighter emitter still comes out brighter,
+// but 1x and 6x glow no longer both arrive at 1.0.
+vec3 add_glow(vec3 sum, vec3 glow) {
+    glow = max(glow, vec3(0.0));
+    return sum + glow / (1.0 + tm_luma(glow) / GLOW_HEADROOM);
+}
+
+// ── The level's lights, accumulated per pixel ───────────────────────────────
+// The frame arriving here is ALREADY LIT (see the note in main()), so this must
+// not shade it again - that stacking is what made the High preset look blown.
+// What the level's lights add is their own glow: the part the guest's per-vertex
+// pipeline cannot express at all, because a Gouraud light is evaluated at
+// VERTICES. A torch's falloff across a large floor quad is simply not present in
+// that data, which is why the glow around a flame reads as a hard-edged disc
+// instead of a gradient. Reconstructing it per pixel is additive and is bounded
+// by add_glow() below, so it fills the halo rather than flattening what is under
+// it.
+//
+// Known limitation: there is no depth test against the light. A light whose
+// reach extends past a wall will glow through it, because converting the light's
+// clip-space depth and the shader's linearised depth into one comparable space
+// needs a convention neither side currently pins down, and guessing one here
+// would trade a visible glow-through for invisible wrong occlusion.
+vec3 accumulate_engine_lights(vec2 uv) {
+    if (u_light_count <= 0) return vec3(0.0);
+
+    float aspect = u_tex_size.x / max(u_tex_size.y, 1.0);
+    vec3 accum = vec3(0.0);
+
+    for (int i = 0; i < MAX_DYNAMIC_LIGHTS; ++i) {
+        if (i >= u_light_count) break;
+
+        float reach = u_lights[i].w;
+        if (reach <= 0.0) continue;
+
+        // EYE space -> clip. No modelview: the stored position is already through
+        // the one the fixed-function pipeline lit with.
+        vec4 clip = u_projection * vec4(u_lights[i].xyz, 1.0);
+        if (clip.w <= 1e-4) continue;
+        vec2 light_uv = (clip.xy / clip.w) * 0.5 + 0.5;
+
+        // Screen-space reach in UV, from the same projection scale the host used
+        // to rank the light. Axis-aligned scale only, deliberately: a reach is a
+        // sphere, so its screen span comes from the projection's scale terms and
+        // not from any rotation.
+        float r_uv = max(abs(u_projection[0][0] * reach / clip.w),
+                         abs(u_projection[1][1] * reach / clip.w)) * 0.5;
+        if (r_uv <= 1e-6) continue;
+
+        // Normalised screen distance: 1.0 exactly at the light's reach.
+        vec2 d = (uv - light_uv) * vec2(aspect, 1.0);
+        float nd = length(d) / r_uv;
+        if (nd >= 1.0) continue;
+
+        // The level's OWN falloff, from the component's authored attenuation:
+        // 1 / (kc + kl*wd + kq*wd^2), normalised to 1 at the centre, with wd the
+        // world distance recovered from the screen distance. This is what makes a
+        // light fall off over its authored range instead of an invented one.
+        float kc = max(u_light_atten[i].x, 1e-4);
+        float kl = u_light_atten[i].y;
+        float kq = u_light_atten[i].z;
+        float wd = nd * reach;
+        float att = kc / (kc + kl * wd + kq * wd * wd);
+        if (att <= 0.001) continue;
+
+        // Soften the outer edge, so the cutoff cannot draw a visible rim where nd
+        // crosses 1 - that rim is the hard-edged disc this replaces.
+        att *= smoothstep(1.0, 0.72, nd);
+
+        accum += u_light_color[i].rgb * (u_light_color[i].a * att);
+    }
+    return accum;
+}
+
 void main() {
+    // ---- UI/HUD passthrough --------------------------------------------------
+    // Two ways in. u_ui_pass bypasses the entire pass (a frame with no 3D draw
+    // at all). The stencil mask does it per PIXEL inside a mixed frame, which is
+    // what the split has to be: relighting a HUD sprite with the 3D light
+    // handshake is wrong, and the UI has to be written here rather than left to
+    // whatever the destination buffer already held - otherwise the region the
+    // composite skips shows up as a stale rectangle exactly where the UI is.
+    // The stencil is an 8-bit integer, so stencil 1 arrives normalised as
+    // 1/255 = 0.0039, not 1.0; the test is "any non-zero stencil".
     if (u_ui_pass > 0.5) {
+        FragColor = texture(u_scene, v_uv);
+        return;
+    }
+    if (u_ui_exempt > 0.5 && texture(u_ui_mask, v_uv).g >= 0.002) {
         FragColor = texture(u_scene, v_uv);
         return;
     }
@@ -442,11 +605,25 @@ void main() {
     if (u_pbr_enabled > 0.5) {
         scene = compute_pbr_shading(albedo, normal, mat);
     } else {
-        vec2 live_dir = (u_light0_diffuse.r + u_light0_diffuse.g + u_light0_diffuse.b > 0.05)
-                         ? compute_light_dir_ss() : u_shadow_light_dir;
-        vec3 light_dir_3d = normalize(vec3(live_dir, -u_shadow_sun_z));
-        float diff = clamp(dot(normal, light_dir_3d), 0.0, 1.0);
-        scene = albedo * (0.88 + 0.24 * diff);
+        // ── Do NOT re-light an already-lit frame ────────────────────────────
+        // The pixels arriving here are lit already: the guest is fixed-function
+        // GLES1, so its own lighting (the engine's real GL_LIGHT0..7 with real
+        // positions and colours) is reproduced either by the translation layer
+        // in ffp_forward.cpp or by the driver's fixed-function pipeline, and the
+        // game bakes level lighting into the level textures on top of that.
+        //
+        // This branch used to apply a SECOND model to those pixels, and it was a
+        // near-constant one: (0.88 + 0.24*diff) spans only 0.88..1.12, so it
+        // could not produce lighting - all it did was multiply whatever the real
+        // lighting had produced by a number close to 1, flattening the contrast
+        // and washing out the shading. That is the "flat vanilla lighting" and
+        // the double-lighting report: the upgrade path was lighting the scene
+        // and this was flattening it straight afterwards, in the same frame.
+        //
+        // Pass the rendered frame through untouched. Relighting stays available,
+        // but it is opt-in and explicit (u_pbr_enabled), never a default on top
+        // of a frame that already has its light baked in.
+        scene = albedo;
     }
     
     // Apply SSAO
@@ -494,18 +671,24 @@ void main() {
         vec3 rays = texture(u_godrays, v_uv).rgb;
         vec3 tint = vec3(u_gr_tint_r, u_gr_tint_g, u_gr_tint_b);
         tint = mix(tint, u_light0_diffuse.rgb, 0.25);
-        scene += rays * tint;
+        scene = add_glow(scene, rays * tint);
     }
     
     // Bloom
     if (u_bloom_enabled > 0.5) {
         vec3 bloom = texture(u_bloom, v_uv).rgb;
         float boost = mat.emissive > 0.5 ? 2.5 : 1.0;
-        scene += bloom * u_bloom_intensity * boost;
+        scene = add_glow(scene, bloom * u_bloom_intensity * boost);
+    }
+
+    // The level's own lights, filling in the glow the per-vertex pipeline cannot
+    // express. Bounded by add_glow(), so this cannot blow the frame out.
+    if (u_light_count > 0) {
+        scene = add_glow(scene, accumulate_engine_lights(v_uv));
     }
     
-    // ACES Filmic Tonemapping
-    scene = ACESFilm(scene * 1.06);
+    // Filmic tonemapping with the toe bypassed for display-referred input
+    scene = tonemap(scene);
     
     // Saturation & Vibrance Tuning
     float luma2 = dot(scene, vec3(0.2126, 0.7152, 0.0722));

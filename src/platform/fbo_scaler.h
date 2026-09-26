@@ -104,7 +104,36 @@ struct PostFXState {
                                            // unclipped emitter measures 1.00
     float bloom_emitter_contrast = 1.12f;  // local-brightness ratio floor
     float bloom_emitter_gain     = 1.60f;  // weight scale (buffer clamps at 1.0)
-    
+
+    // --- UI/HUD exclusion from the bloom extract and the composite ----------
+    // ON (default): the extract and the composite both read the scene FBO's
+    // DEPTH24_STENCIL8 attachment, where the GL bridge stamps every orthographic
+    // (2D) draw with stencil 1 and the 3D world with 0. UI pixels are then
+    // excluded from the bloom at its source (no square halo around round HUD
+    // sprites) and passed through the composite untouched instead of being
+    // relit by the 3D light handshake. OFF: previous behaviour.
+    bool  ui_exempt              = true;
+
+    // --- Fixed-function translation lighting level --------------------------
+    // The layer that OWNS the lighting is ffp_forward.cpp: it reproduces the
+    // guest's own GLES1 lighting (real GL_LIGHT0..7, real positions and colours)
+    // and is the only thing the value below changes. Until now the only way to
+    // set it was the SWORDIGO_FFP_LIGHTING environment variable, so the heaviest
+    // path in the renderer - level 4 adds a derived normal map and a GGX
+    // specular term to EVERY draw - was unreachable from the UI and absent from
+    // the config file entirely.
+    //
+    //   -1  unset: leave the layer alone; its own default (PBR) or the env var
+    //       decides. Kept so an existing install does not change behaviour just
+    //       because this key is absent.
+    //    0  OFF        untouched fixed-function
+    //    1  TRANSLATE  GLES1 parity (per-vertex Gouraud)
+    //    2  PERFRAG    + per-fragment lighting + derived tangent-space normals
+    //    3  POM        + parallax occlusion mapping
+    //    4  PBR        + Cook-Torrance GGX
+    // Applied live by postfx_load_custom_json and by the GUI control.
+    int ffp_lighting_level = -1;
+
     bool shadows = false;
     float shadow_intensity = 0.5f;       // shadow darkness (0=none, 1=pitch black)
     float shadow_softness = 0.003f;      // blur radius for soft shadow edges
@@ -168,6 +197,13 @@ void postfx_apply_preset(PostFXState& state, PostFXPreset preset);
 const char* postfx_preset_name(PostFXPreset p);
 
 bool postfx_load_custom_json(PostFXState& state);
+
+// Rewrite just the "ffp_lighting_level" key in the config in place, so a level
+// chosen in the GUI survives a restart. postfx_save_default_json() cannot do
+// this: it writes a fixed template of defaults, not the state the user is in.
+// Every other line - including the user's own comments and hand edits - is left
+// exactly as found.
+bool postfx_save_lighting_level(int level);
 void postfx_save_default_json();
 
 bool fbo_init(int game_w, int game_h);

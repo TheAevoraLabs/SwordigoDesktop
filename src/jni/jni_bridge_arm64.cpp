@@ -32,6 +32,7 @@ extern "C" const char* sre_resolve_symbol(uint64_t addr);
 #include <fstream>
 #include <cstring>
 #include <cmath>
+#include "graphics/LightManager.h"   // dynamic light buffer fed below
 #include <cstdlib>
 #include <cstdio>
 #include <wctype.h>
@@ -6151,12 +6152,55 @@ static void bridge_glLightfv(void* emu_ptr) {
 
     // Mirror the same values into the FBO postfx handshake.
     switch (pname) {
-        case GL_POSITION:
+        case GL_POSITION: {
             if (g_display_active) glGetLightfv(light, GL_POSITION, g_frame_lights[li].position);
+
+            // ── Publish the light to the dynamic light buffer ────────────────
+            // LightManager::InterceptNativeLight() had no caller anywhere in the
+            // tree, so the buffer it feeds was cleared at the top of every frame
+            // (fbo_scaler.cpp, fbo_begin_game) and thrown away empty. This is the
+            // call the engine makes when a LightComponent (re)places its light, so
+            // publishing here gives one entry per light per frame rather than one
+            // per draw. Only GL_POSITION publishes: ambient/diffuse alone are set
+            // by passes that are not light components.
+            if (g_display_active) {
+                // The engine states a component's authored range through the
+                // fixed-function attenuation triple, which is why the triple is
+                // tracked below. The radius is DERIVED from it, not invented:
+                // GL attenuates as 1/(kc + kl*d + kq*d^2), so solving that for the
+                // distance at which a light has fallen to 1/50 of full strength
+                // gives the distance at which it stops mattering on screen.
+                const float kc = g_frame_light_attenuation[li][0];
+                const float kl = g_frame_light_attenuation[li][1];
+                const float kq = g_frame_light_attenuation[li][2];
+                const float kFifty = 50.0f;   // 1/50 = 2% of full strength
+                float reach = 0.0f;           // 0 = no distance term: a global light
+                if (kq > 1e-6f) {
+                    reach = (-kl + std::sqrt(std::max(0.0f, kl * kl + 4.0f * kq * (kFifty - kc))))
+                            / (2.0f * kq);
+                } else if (kl > 1e-6f) {
+                    reach = (kFifty - kc) / kl;
+                }
+                // position is EYE space (glGetLightfv above), i.e. already through
+                // the modelview the fixed-function pipeline lights with. 
+                const float* Lp = g_frame_lights[li].position;
+                const float* Ld = g_frame_lights[li].diffuse;
+                LightManager::Instance().InterceptNativeLight(
+                    Lp[0], Lp[1], Lp[2], Ld[0], Ld[1], Ld[2], reach, li + 1,
+                    kc, kl, kq);
+            }
             break;
+        }
         case GL_AMBIENT:  memcpy(g_frame_lights[li].ambient,  params, 16); break;
         case GL_DIFFUSE:  memcpy(g_frame_lights[li].diffuse,  params, 16); break;
         case GL_SPECULAR: memcpy(g_frame_lights[li].specular, params, 16); break;
+        // The component's authored range, as the engine publishes it. None of
+        // these three was tracked before, so g_frame_light_attenuation kept its
+        // {1,0,0} defaults for every light in every frame and nothing downstream
+        // could recover a real falloff from the state handshake.
+        case GL_CONSTANT_ATTENUATION:  g_frame_light_attenuation[li][0] = params[0]; break;
+        case GL_LINEAR_ATTENUATION:    g_frame_light_attenuation[li][1] = params[0]; break;
+        case GL_QUADRATIC_ATTENUATION: g_frame_light_attenuation[li][2] = params[0]; break;
         default: break;
     }
 }

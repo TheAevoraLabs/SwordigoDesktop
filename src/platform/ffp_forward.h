@@ -41,21 +41,35 @@
 //      Anything the guest never touches then matches vanilla by construction,
 //      and the matrices are queried from the driver per draw rather than
 //      re-derived from a shadow that host-side code can desynchronise.
-//   4. Parity is the default. Level 1 (`TRANSLATE`) reproduces the GLES1
-//      lighting equation **per vertex** (Gouraud), which is what the hardware
-//      fixed-function path does, so captures of level 1 must match vanilla.
-//      Per-fragment lighting, derived normal maps, parallax and GGX are opt-in
-//      levels on top of that verified base.
+//   4. Level 1 (`TRANSLATE`) reproduces the GLES1 lighting equation **per
+//      vertex** (Gouraud), which is what the hardware fixed-function path does,
+//      so captures of level 1 must match vanilla. Per-fragment lighting, derived
+//      normal maps, parallax and GGX are levels on top of that verified base.
+//
+//      The DEFAULT IS LEVEL 4 (PBR), not level 1. That is what init_from_env()
+//      sets, and it is deliberately spelled out here because this comment used to
+//      claim the opposite - "parity is the default, 2..4 are opt-in" - while the
+//      code unconditionally enabled the whole per-fragment normal-map + GGX
+//      stack on every draw whenever SWORDIGO_FFP_LIGHTING was unset. A stale
+//      comment that disagrees with the code is worse than no comment: it makes
+//      an unconditional behaviour look like an opt-in, so nobody looks for it
+//      when the frame is expensive or the lighting is doubled.
+//
+//      Level 4 lights the scene AND is the heaviest path (per-fragment lighting
+//      plus a derived normal map per draw), so it is the level to lower first if
+//      the frame is slow: SWORDIGO_FFP_LIGHTING=2 keeps per-fragment lighting
+//      and drops POM/GGX, =1 is vanilla Gouraud parity, =0 is untouched
+//      fixed-function.
 //   5. Every draw is counted with the reason it was not translated, so a
 //      regression is a log line with a number on it rather than a screenshot.
 //
 //  TOGGLES
 //  -------
 //    SWORDIGO_FFP_LIGHTING = 0  vanilla fixed-function (no translation)
-//                            1  TRANSLATE, GLES1 parity (Gouraud lighting)  [default]
+//                            1  TRANSLATE, GLES1 parity (Gouraud lighting)
 //                            2  + per-fragment lighting + derived normal maps
 //                            3  + parallax occlusion mapping
-//                            4  + Cook-Torrance GGX PBR
+//                            4  + Cook-Torrance GGX PBR                  [default]
 //    SWORDIGO_FFP_SCOPE=lit    only translate lit 3D geometry (escape hatch;
 //                              default "all" translates every draw)
 //    SWORDIGO_FFP_TONEMAP      none (default) | aces
@@ -82,10 +96,10 @@ namespace ffp {
 
 enum Quality {
     OFF       = 0,  // vanilla fixed-function
-    TRANSLATE = 1,  // full GLES1 -> GL 3.3 translation, parity-grade (default)
+    TRANSLATE = 1,  // full GLES1 -> GL 3.3 translation, parity-grade
     PERFRAG   = 2,  // + per-fragment lighting + derived tangent-space normals
     POM       = 3,  // + parallax occlusion mapping
-    PBR       = 4,  // + Cook-Torrance GGX on derived roughness/metallic
+    PBR       = 4,  // + Cook-Torrance GGX on derived roughness/metallic [default]
 };
 
 void init_from_env();
