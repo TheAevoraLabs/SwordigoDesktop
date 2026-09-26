@@ -66,6 +66,29 @@ bool g_text_input_pending_result = false; // Set by zenity thread when dialog cl
 // --- Frame Statistics ---
 FrameStats g_frame_stats;
 
+// --- SRE13 texture identity telemetry (see jni_bridge.h; additive, removable) ---
+Sre13TextureTelemetry g_sre13_tex_telemetry;
+
+// Flat snapshot for consumers that do not include jni_bridge.h.
+// platform/swordfare_gui.cpp deliberately declares its JNI-side dependencies as
+// local extern "C" (see get_guest_heap_size_64 above it) rather than including
+// this header, and the F3 debug panel is one of those consumers. Mirrors that
+// existing pattern instead of teaching the GUI about FrameStats' header.
+//
+// out[0] bind_calls, [1] identified, [2] unique_names,
+// out[3] trusted,     [4] rejected,   [5] level_generation
+//
+// Delete alongside the struct once texture identity is settled.
+extern "C" void sre13_tex_telemetry_snapshot(uint32_t out[6]) {
+    if (!out) return;
+    out[0] = g_sre13_tex_telemetry.bind_calls;
+    out[1] = g_sre13_tex_telemetry.identified;
+    out[2] = g_sre13_tex_telemetry.unique_names;
+    out[3] = g_sre13_tex_telemetry.trusted;
+    out[4] = g_sre13_tex_telemetry.rejected;
+    out[5] = g_sre13_tex_telemetry.level_generation;
+}
+
 // --- Handle Management (shared between ARM32 and ARM64 bridges) ---
 std::unordered_map<uint32_t, void*> g_handle_to_ptr;
 std::unordered_map<void*, uint32_t> g_ptr_to_handle;

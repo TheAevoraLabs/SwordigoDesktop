@@ -216,6 +216,11 @@ if (BUILD_TESTING)
     target_link_libraries(scene_text_recovery_test PRIVATE filerift swpod OpenGL::GL)
     add_test(NAME scene_text_recovery_test COMMAND scene_text_recovery_test)
 
+    # NOTE: scene_material_report is NOT declared here. It is a diagnostic tool,
+    # not a test, so it lives in cmake/components/swfmt_swpod.cmake next to swpod.
+    # Declaring it inside this BUILD_TESTING block (which defaults to OFF) made it
+    # silently unreachable in a normal configure.
+
     # Direct scene boot: the libc++ std::string contract the Ruby Touch runner relies on
     # when it swaps CaverShell's boot-scene field in CaverShell::InitView.
     #

@@ -319,6 +319,8 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
     if (strstr(filename, ".scene") != NULL) {
         extern void reset_void_fill_color(void);
         reset_void_fill_color();
+        extern void texture_aware_mapper_on_scene_open(const char* sceneName);
+        texture_aware_mapper_on_scene_open(filename);
     }
 
     char resolved[512];

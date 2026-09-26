@@ -39,8 +39,11 @@
 // ============================================================================
 #define GL_GLEXT_PROTOTYPES
 #include "ffp_forward.h"
+#include "fbo_scaler.h"
 
 #include "angle_gles1/GLES1Shaders.inc"
+#include "graphics/TextureAwareMapper.h"
+#include "graphics/LightManager.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -51,6 +54,13 @@
 #include <map>
 #include <iostream>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+#include "platform/data_path.h"
+
+extern "C" float g_host_hero_pos[3];
+extern PostFXState g_postfx;
 
 namespace {
 
@@ -119,12 +129,11 @@ static const char* VS_STATE =
     "uniform bool point_rasterization;\n"
     "uniform bool shade_model_flat;\n"
     "uniform bool light_model_two_sided;\n"
-    "uniform bool light_enables[kMaxLights];\n";
+    "uniform bool light_enables[kMaxLights];\n"
+    "uniform int  u_quality;\n"
+    "uniform bool u_is_ortho;\n"
+    "uniform bool u_is_groundmesh;\n";
 
-// texture_format is always kRGBA: the host driver has already converted the
-// guest's GL_ALPHA / GL_LUMINANCE uploads into the sampled value the
-// fixed-function path would use, so ANGLE's per-format compensation would
-// double-apply. That keeps this path byte-comparable with vanilla.
 static const char* FS_STATE =
     "#define kMaxLights 8u\n"
     "uniform bool enable_clip_planes;\n"
@@ -132,6 +141,7 @@ static const char* FS_STATE =
     "uniform bool enable_alpha_test;\n"
     "uniform bool enable_fog;\n"
     "uniform bool enable_lighting;\n"
+    "uniform bool enable_color_material;\n"
     "uniform bool enable_draw_texture;\n"
     "uniform bool enable_texture_2d[4];\n"
     "uniform bool enable_texture_cube_map[4];\n"
@@ -157,16 +167,351 @@ static const char* FS_STATE =
     "uniform uint op2_rgb[4];\n"
     "uniform uint op2_alpha[4];\n"
     "uniform uint alpha_func;\n"
-    "uniform uint fog_mode;\n";
+    "uniform uint fog_mode;\n"
+    "uniform int   u_quality;\n"
+    "uniform float u_bump_strength;\n"
+    "uniform float u_pom_scale;\n"
+    "uniform int   u_pom_steps;\n"
+    "uniform float u_roughness;\n"
+    "uniform float u_metallic;\n"
+    "uniform float u_reflectivity;\n"
+    "uniform float u_wetness;\n"
+    "uniform float u_sun_intensity;\n"
+    "uniform mat4  u_view_inv;\n"
+    "uniform bool  u_is_ortho;\n"
+    "uniform bool  u_is_groundmesh;\n"
+    "uniform int   u_asset_detail_type;\n"
+    "uniform float u_procedural_strength;\n"
+    "uniform bool  u_pdi_enabled;\n"
+    "uniform vec4  material_ambient;\n"
+    "uniform vec4  material_diffuse;\n"
+    "uniform vec4  material_specular;\n"
+    "uniform vec4  material_emissive;\n"
+    "uniform float material_specular_exponent;\n"
+    "uniform vec4  light_model_scene_ambient;\n"
+    "uniform vec4  light_ambients[kMaxLights];\n"
+    "uniform vec4  light_diffuses[kMaxLights];\n"
+    "uniform vec4  light_speculars[kMaxLights];\n"
+    "uniform vec4  light_positions[kMaxLights];\n"
+    "uniform vec3  light_directions[kMaxLights];\n"
+    "uniform float light_spotlight_exponents[kMaxLights];\n"
+    "uniform float light_spotlight_cutoff_angles[kMaxLights];\n"
+    "uniform float light_attenuation_consts[kMaxLights];\n"
+    "uniform float light_attenuation_linears[kMaxLights];\n"
+    "uniform float light_attenuation_quadratics[kMaxLights];\n";
+
+static const char* FS_PBR_FUNCTIONS = R"(
+const float PI = 3.14159265359;
+
+mat3 cotangent_frame(vec3 N, vec3 p, vec2 uv) {
+    vec3 dp1 = dFdx(p);
+    vec3 dp2 = dFdy(p);
+    vec2 duv1 = dFdx(uv);
+    vec2 duv2 = dFdy(uv);
+
+    vec3 dp2perp = cross(dp2, N);
+    vec3 dp1perp = cross(N, dp1);
+    vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+    vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+
+    float invmax = inversesqrt(max(max(dot(T, T), dot(B, B)), 1e-6));
+    if (isnan(invmax) || isinf(invmax)) return mat3(vec3(1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), N);
+    return mat3(T * invmax, B * invmax, N);
+}
+
+vec3 derive_normal(sampler2D tex, vec2 uv, float strength) {
+    vec2 texSize = vec2(textureSize(tex, 0));
+    if (texSize.x < 1.0) texSize = vec2(512.0);
+    vec2 step = 1.0 / texSize;
+
+    float hL = dot(texture(tex, uv - vec2(step.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float hR = dot(texture(tex, uv + vec2(step.x, 0.0)).rgb, vec3(0.299, 0.587, 0.114));
+    float hD = dot(texture(tex, uv - vec2(0.0, step.y)).rgb, vec3(0.299, 0.587, 0.114));
+    float hU = dot(texture(tex, uv + vec2(0.0, step.y)).rgb, vec3(0.299, 0.587, 0.114));
+
+    float dX = (hR - hL) * strength * 2.0;
+    float dY = (hU - hD) * strength * 2.0;
+    return normalize(vec3(-dX, -dY, 1.0));
+}
+
+vec2 parallax_occlusion_mapping(sampler2D tex, vec2 uv, vec3 viewDirTS, float heightScale, int steps) {
+    if (steps <= 0 || heightScale <= 0.0) return uv;
+    float layerDepth = 1.0 / float(steps);
+    float currentLayerDepth = 0.0;
+    vec2 P = viewDirTS.xy * heightScale;
+    vec2 deltaTexCoords = P / float(steps);
+
+    vec2 currentTexCoords = uv;
+    float currentDepthMapValue = 1.0 - dot(texture(tex, currentTexCoords).rgb, vec3(0.299, 0.587, 0.114));
+
+    for (int i = 0; i < steps; i++) {
+        if (currentLayerDepth >= currentDepthMapValue) break;
+        currentTexCoords -= deltaTexCoords;
+        currentDepthMapValue = 1.0 - dot(texture(tex, currentTexCoords).rgb, vec3(0.299, 0.587, 0.114));
+        currentLayerDepth += layerDepth;
+    }
+
+    vec2 prevTexCoords = currentTexCoords + deltaTexCoords;
+    float afterDepth = currentDepthMapValue - currentLayerDepth;
+    float beforeDepth = (1.0 - dot(texture(tex, prevTexCoords).rgb, vec3(0.299, 0.587, 0.114))) - currentLayerDepth + layerDepth;
+    float weight = afterDepth / max(afterDepth - beforeDepth, 1e-4);
+    return mix(currentTexCoords, prevTexCoords, clamp(weight, 0.0, 1.0));
+}
+
+float D_GGX(vec3 N, vec3 H, float a) {
+    float a2 = a * a;
+    float NdotH = max(dot(N, H), 0.0);
+    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-7);
+}
+
+float Vis_kGGX(float NdotV, float NdotL, float k) {
+    float gv = NdotV * (1.0 - k) + k;
+    float gl = NdotL * (1.0 - k) + k;
+    return 1.0 / max(4.0 * gv * gl, 1e-7);
+}
+
+vec3 F_Schlick(float cosTheta, vec3 F0) {
+    float x = clamp(1.0 - cosTheta, 0.0, 1.0);
+    float x2 = x * x;
+    return F0 + (vec3(1.0) - F0) * (x2 * x2 * x);
+}
+
+vec4 doPerFragmentLighting(vec4 baseColor, vec3 eyePos, vec3 eyeNormal, vec2 uv, vec3 worldPos) {
+    vec3 N = normalize(eyeNormal);
+    vec3 V = normalize(-eyePos);
+
+    float bump_str = u_bump_strength;
+    float effectiveRoughness = mix(u_roughness, u_roughness * 0.4, clamp(u_wetness, 0.0, 1.0));
+    float effectiveReflectivity = mix(u_reflectivity, min(1.0, u_reflectivity + 0.4), clamp(u_wetness, 0.0, 1.0));
+    float roughness = clamp(effectiveRoughness, 0.04, 1.0);
+    float metallic  = clamp(u_metallic, 0.0, 1.0);
+
+    vec3 albedo = baseColor.rgb;
+    if (u_is_groundmesh) {
+        float slope = N.y;
+        if (abs(slope) < 0.45) {
+            bump_str *= 1.5;
+        } else if (slope > 0.65) {
+            albedo *= (1.0 + (slope - 0.65) * 0.4);
+        }
+        float v_lum = dot(color_varying.rgb, vec3(0.299, 0.587, 0.114));
+        roughness = mix(clamp(roughness * 0.7, 0.15, 0.9), clamp(roughness * 1.2, 0.15, 0.95), v_lum);
+    }
+
+    if (u_quality >= 2 && bump_str > 0.001 && enable_texture_2d[0]) {
+        mat3 TBN = cotangent_frame(N, eyePos, uv);
+        vec3 normalTS = derive_normal(tex_sampler0, uv, bump_str);
+        N = normalize(TBN * normalTS);
+    }
+
+    if (!enable_color_material) {
+        albedo *= material_diffuse.rgb;
+    }
+    vec3 ambientAlbedo = baseColor.rgb;
+    if (!enable_color_material) {
+        ambientAlbedo *= material_ambient.rgb;
+    }
+    vec3 finalLight = material_emissive.rgb + (ambientAlbedo * light_model_scene_ambient.rgb);
+
+    float alphaRough = roughness * roughness;
+    float kDirect = ((roughness + 1.0) * (roughness + 1.0)) / 8.0;
+    vec3 F0 = mix(vec3(0.04), albedo, metallic);
+
+    for (uint i = 0u; i < kMaxLights; i++) {
+        if (!light_enables[i]) continue;
+
+        vec4 lpos = light_positions[i];
+        vec3 toLight;
+        float att = 1.0;
+
+        if (lpos.w == 0.0) {
+            toLight = normalize(lpos.xyz);
+        } else {
+            toLight = lpos.xyz - eyePos;
+            float d = length(toLight);
+            if (d < 1e-4) continue;
+            toLight /= d;
+            float attDenom = light_attenuation_consts[i] + 
+                             light_attenuation_linears[i] * d + 
+                             light_attenuation_quadratics[i] * d * d;
+            att = 1.0 / max(attDenom, 1e-4);
+        }
+
+        if (lpos.w != 0.0 && light_spotlight_cutoff_angles[i] < 180.0) {
+            float spotCos = cos(radians(light_spotlight_cutoff_angles[i]));
+            float spotDot = max(dot(-toLight, normalize(light_directions[i])), 0.0);
+            if (spotDot < spotCos) att = 0.0;
+            else att *= pow(spotDot, light_spotlight_exponents[i]);
+        }
+
+        float NdotL = max(dot(N, toLight), 0.0);
+        if (NdotL <= 0.0 || att <= 0.0) continue;
+
+        vec3 radiance = light_diffuses[i].rgb * att;
+
+        if (u_quality >= 4) {
+            vec3 H = normalize(V + toLight);
+            float NDF = D_GGX(N, H, alphaRough);
+            float vis = Vis_kGGX(max(dot(N, V), 0.0), NdotL, kDirect);
+            vec3  F   = F_Schlick(max(dot(H, V), 0.0), F0);
+
+            vec3 specular = NDF * vis * F;
+
+            vec3 kS = F;
+            vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
+            vec3 diffuse = kD * albedo;
+
+            finalLight += (diffuse + specular) * radiance * NdotL;
+        } else {
+            vec3 H = normalize(V + toLight);
+            float NdotH = max(dot(N, H), 0.0);
+            float spec = (material_specular_exponent > 0.0) ? 
+                         pow(NdotH, material_specular_exponent) : 0.0;
+
+            vec3 diffTerm = albedo * radiance * NdotL;
+            vec3 specTerm = material_specular.rgb * light_speculars[i].rgb * spec * att;
+            vec3 ambTerm  = ambientAlbedo * light_ambients[i].rgb;
+
+            finalLight += diffTerm + specTerm + ambTerm;
+        }
+    }
+
+    return vec4(clamp(finalLight, 0.0, 4.0), baseColor.a);
+}
+)";
+
+static const char* FS_PBR_MAIN = R"(
+void main()
+{
+    if (enable_clip_planes && !enable_draw_texture)
+    {
+        if (!doClipPlaneTest())
+        {
+            discard;
+        }
+    }
+
+    vec2 baseUV = texcoord0_varying.xy;
+    if (!u_is_ortho && u_quality >= 3 && enable_texture_2d[0] && length(normal_varying) > 0.1) {
+        vec3 eyeV = normalize(-pos_varying.xyz);
+        mat3 TBN = cotangent_frame(normalize(normal_varying), pos_varying.xyz, baseUV);
+        vec3 rawTS = transpose(TBN) * eyeV;
+        vec3 viewDirTS = length(rawTS) > 1e-4 ? normalize(rawTS) : vec3(0.0, 0.0, 1.0);
+        float pom_scale = u_is_groundmesh ? (u_pom_scale * 1.35) : u_pom_scale;
+        int pom_steps = u_is_groundmesh ? int(clamp(float(u_pom_steps) * 1.5, 8.0, 32.0)) : u_pom_steps;
+        baseUV = parallax_occlusion_mapping(tex_sampler0, baseUV, viewDirTS, pom_scale, pom_steps);
+    }
+
+    vec4 vertex_color;
+    if (shade_model_flat)
+    {
+        vertex_color = color_varying_flat;
+    }
+    else
+    {
+        vertex_color = color_varying;
+    }
+
+    vec4 currentFragment = vertex_color;
+    vec4 texturePrevColor = currentFragment;
+
+    for (uint i = 0u; i < kTexUnits; i++)
+    {
+        vec4 textureColor;
+        if (point_rasterization && point_sprite_enabled && point_sprite_coord_replace[i]) {
+            textureColor = getPointSpriteTextureColor(i);
+        } else {
+            if (i == 0u && enable_texture_2d[0]) {
+                textureColor = texture(tex_sampler0, baseUV, texture_env_lod_bias[0]);
+            } else {
+                textureColor = getTextureColor(i);
+            }
+        }
+
+        currentFragment = textureFunction(
+            i, texture_format[i], texture_env_mode[i], combine_rgb[i], combine_alpha[i],
+            src0_rgb[i], src0_alpha[i], src1_rgb[i], src1_alpha[i], src2_rgb[i], src2_alpha[i],
+            op0_rgb[i], op0_alpha[i], op1_rgb[i], op1_alpha[i], op2_rgb[i], op2_alpha[i],
+            texture_env_color[i], texture_env_rgb_scale[i], texture_env_alpha_scale[i],
+            vertex_color, texturePrevColor, textureColor);
+
+        texturePrevColor = currentFragment;
+    }
+
+    vec3 worldPos = (u_view_inv * vec4(pos_varying.xyz, 1.0)).xyz;
+    vec3 worldNormal = normalize(mat3(u_view_inv) * normal_varying);
+    vec3 eyeNormal = normal_varying;
+
+    if (!u_is_ortho && u_pdi_enabled && u_procedural_strength > 0.01) {
+        int detail_type = u_is_groundmesh ? 1 : u_asset_detail_type;
+        currentFragment.rgb = PdiApply(
+            currentFragment.rgb,
+            worldPos,
+            worldNormal,
+            detail_type,
+            u_procedural_strength
+        );
+        eyeNormal = normalize(transpose(mat3(u_view_inv)) * worldNormal);
+    }
+
+    if (!u_is_ortho && enable_lighting && u_quality >= 2 && length(normal_varying) > 0.01) {
+        currentFragment = doPerFragmentLighting(currentFragment, pos_varying.xyz, eyeNormal, baseUV, worldPos);
+    }
+
+    if (enable_fog)
+    {
+        currentFragment = doFog(currentFragment);
+    }
+
+    if (enable_alpha_test && !doAlphaTest(currentFragment))
+    {
+        discard;
+    }
+
+    frag_color = applyLogicOp(currentFragment);
+}
+)";
 
 // Defined so the ANGLE ES1 conformance values are used; the guest only ever
 // exercises unit 0 (GLClientActiveTexture is never called with another unit).
 static const char* TEX_UNITS_DEFINE = "#define kTexUnits 1u\n";
 
 std::string build_vertex_shader() {
-    return std::string("#version 330\n") + TEX_UNITS_DEFINE +
+    std::string vs = std::string("#version 330\n") + TEX_UNITS_DEFINE +
            normalize_angle_glsl(kGLES1DrawVShaderHeader) + VS_STATE +
            normalize_angle_glsl(kGLES1DrawVShader);
+    size_t pos = vs.find("if (enable_lighting)");
+    if (pos != std::string::npos) {
+        vs.replace(pos, 20, "if (enable_lighting && (u_quality <= 1 || u_is_ortho))");
+    }
+    return vs;
+}
+
+static std::string load_procedural_glsl() {
+    std::string candidate_paths[] = {
+        "src/shaders/core/procedural_detail.glsl",
+        "shaders/core/procedural_detail.glsl",
+        get_data_path("src/shaders/core/procedural_detail.glsl"),
+        get_data_path("shaders/core/procedural_detail.glsl")
+    };
+    for (const auto& path : candidate_paths) {
+        if (!path.empty() && std::filesystem::exists(path)) {
+            std::ifstream f(path);
+            if (f.is_open()) {
+                std::stringstream ss;
+                ss << f.rdbuf();
+                std::string content = ss.str();
+                if (!content.empty()) {
+                    std::cout << "[FFP] Loaded procedural detail shader: " << path << std::endl;
+                    return content;
+                }
+            }
+        }
+    }
+    return "vec3 InjectProceduralDetail(vec3 c, vec3 wp, vec3 wn, int at, float s) { return c; }\n"
+           "vec3 PerturbNormalProcedural(vec3 n, vec3 wp, float s) { return n; }\n"
+           "vec3 PdiApply(vec3 c, vec3 wp, inout vec3 wn, int at, float s) { return c; }\n";
 }
 
 std::string build_fragment_shader() {
@@ -177,7 +522,9 @@ std::string build_fragment_shader() {
            normalize_angle_glsl(kGLES1DrawFShaderLogicOpFramebufferFetchDisabled) +
            normalize_angle_glsl(kGLES1DrawFShaderMultitexturing) +
            normalize_angle_glsl(kGLES1DrawFShaderOutputDef) +
-           normalize_angle_glsl(kGLES1DrawFShaderMain);
+           load_procedural_glsl() + "\n" +
+           FS_PBR_FUNCTIONS +
+           FS_PBR_MAIN;
 }
 
 // ============================================================================
@@ -215,6 +562,7 @@ struct GlState {
     bool  color_material = false;
     int   color_material_mode = 0x1602;      // GL_AMBIENT_AND_DIFFUSE
     bool  texture2d = true;                  // GLES1 default
+    bool  unit_texture2d[8] = {true, false, false, false, false, false, false, false};
     bool  alpha_test = false;
     int   alpha_func = ALWAYS;
     float alpha_ref = 0.0f;
@@ -249,6 +597,7 @@ struct GlState {
 };
 
 GlState g_st;
+int     g_active_unit = 0;
 
 // Matrix shadow: mirrors the guest's own matrix commands. Used to transform
 // light positions into eye space at the instant glLightfv(GL_POSITION) is
@@ -316,6 +665,13 @@ int  g_matrix_source = -1;        // -1 unknown, 0 driver, 1 shadow
 bool g_matrix_checked = false;
 char g_status[240] = "translation: not initialised";
 
+float g_bump_strength = 2.0f;
+float g_pom_scale = 0.035f;
+int   g_pom_steps = 16;
+float g_roughness = 0.45f;
+float g_metallic = 0.15f;
+Mat4  g_camera_view = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+
 GLuint g_prog = 0, g_vao = 0, g_vbo = 0;
 size_t g_vbo_bytes = 0;
 std::vector<float> g_scratch;
@@ -346,6 +702,17 @@ struct Unis {
     GLint st_src0_rgb, st_src0_alpha, st_src1_rgb, st_src1_alpha, st_src2_rgb, st_src2_alpha;
     GLint st_op0_rgb, st_op0_alpha, st_op1_rgb, st_op1_alpha, st_op2_rgb, st_op2_alpha;
     GLint st_alpha_func, st_fog_mode, st_point_sprite_enabled, st_point_sprite_coord_replace;
+    // pbr / pom / lighting uniforms
+    GLint u_quality;
+    GLint u_bump_strength, u_pom_scale, u_pom_steps;
+    GLint u_roughness, u_metallic;
+    GLint u_reflectivity, u_wetness, u_sun_intensity;
+    GLint u_view_inv;
+    GLint u_is_ortho;
+    GLint u_is_groundmesh;
+    GLint u_asset_detail_type;
+    GLint u_procedural_strength;
+    GLint u_pdi_enabled;
 } U = {};
 
 long g_draws_translated = 0, g_draws_vanilla = 0, g_verts = 0;
@@ -626,6 +993,21 @@ void query_uniforms() {
     FFP_GET(U.st_fog_mode, "fog_mode");
     FFP_GET(U.st_point_sprite_enabled, "point_sprite_enabled");
     FFP_GET(U.st_point_sprite_coord_replace, "point_sprite_coord_replace");
+    FFP_GET(U.u_quality, "u_quality");
+    FFP_GET(U.u_bump_strength, "u_bump_strength");
+    FFP_GET(U.u_pom_scale, "u_pom_scale");
+    FFP_GET(U.u_pom_steps, "u_pom_steps");
+    FFP_GET(U.u_roughness, "u_roughness");
+    FFP_GET(U.u_metallic, "u_metallic");
+    FFP_GET(U.u_reflectivity, "u_reflectivity");
+    FFP_GET(U.u_wetness, "u_wetness");
+    FFP_GET(U.u_sun_intensity, "u_sun_intensity");
+    FFP_GET(U.u_view_inv, "u_view_inv");
+    FFP_GET(U.u_is_ortho, "u_is_ortho");
+    FFP_GET(U.u_is_groundmesh, "u_is_groundmesh");
+    FFP_GET(U.u_asset_detail_type, "u_asset_detail_type");
+    FFP_GET(U.u_procedural_strength, "u_procedural_strength");
+    FFP_GET(U.u_pdi_enabled, "u_pdi_enabled");
     glUseProgram(0);
 }
 
@@ -765,6 +1147,36 @@ void mat_normal_invtr(float out[16], const float* m) {
     out[8] = i20; out[9] = i21; out[10] = i22;
 }
 
+static bool mat_inverse_4x4(float inv[16], const float m[16]) {
+    float inv0 =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    float inv4 = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    float inv8 =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    float inv12= -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    float det = m[0]*inv0 + m[1]*inv4 + m[2]*inv8 + m[3]*inv12;
+    if (fabsf(det) < 1e-12f) {
+        mat_identity(inv);
+        return false;
+    }
+    float det_inv = 1.0f / det;
+    inv[0] = inv0 * det_inv;
+    inv[4] = inv4 * det_inv;
+    inv[8] = inv8 * det_inv;
+    inv[12]= inv12* det_inv;
+    inv[1] = (-m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10]) * det_inv;
+    inv[5] = ( m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10]) * det_inv;
+    inv[9] = (-m[0]*m[9]*m[15]  + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9]) * det_inv;
+    inv[13]= ( m[0]*m[9]*m[14]  - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9]) * det_inv;
+    inv[2] = ( m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]  - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7]  - m[13]*m[3]*m[6]) * det_inv;
+    inv[6] = (-m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]  + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7]  + m[12]*m[3]*m[6]) * det_inv;
+    inv[10]= ( m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]  - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7]  - m[12]*m[3]*m[5]) * det_inv;
+    inv[14]= (-m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]  + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6]  + m[12]*m[2]*m[5]) * det_inv;
+    inv[3] = (-m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]  + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7]   + m[9]*m[3]*m[6]) * det_inv;
+    inv[7] = ( m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]  - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7]   - m[8]*m[3]*m[6]) * det_inv;
+    inv[11]= (-m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]   + m[4]*m[1]*m[11] - m[4]*m[3]*m[9]   - m[8]*m[1]*m[7]   + m[8]*m[3]*m[5]) * det_inv;
+    inv[15]= ( m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]   - m[4]*m[1]*m[10] + m[4]*m[2]*m[9]   + m[8]*m[1]*m[6]   - m[8]*m[2]*m[5]) * det_inv;
+    return true;
+}
+
 bool supported_primitive(GLenum mode) {
     switch (mode) {
         case GL_POINTS: case GL_LINES: case GL_LINE_LOOP: case GL_LINE_STRIP:
@@ -799,14 +1211,32 @@ namespace ffp {
 void init_from_env() {
     if (g_quality >= 0) return;
 
-    g_quality = TRANSLATE;
+    g_quality = PBR;
     if (const char* q = getenv("SWORDIGO_FFP_LIGHTING")) {
         if (q[0] == '\0' || strcmp(q, "0") == 0 || strcmp(q, "off") == 0 || strcmp(q, "OFF") == 0)
             g_quality = OFF;
         else g_quality = atoi(q);
     }
     if (g_quality < OFF) g_quality = OFF;
-    if (g_quality > TRANSLATE) g_quality = TRANSLATE;   // 2..4 reserved
+    if (g_quality > PBR) g_quality = PBR;
+
+    if (const char* v = getenv("SWORDIGO_FFP_BUMP")) {
+        g_bump_strength = strtof(v, nullptr);
+    }
+    if (const char* v = getenv("SWORDIGO_FFP_POM_SCALE")) {
+        g_pom_scale = strtof(v, nullptr);
+    }
+    if (const char* v = getenv("SWORDIGO_FFP_POM_STEPS")) {
+        g_pom_steps = atoi(v);
+        if (g_pom_steps < 1) g_pom_steps = 1;
+        if (g_pom_steps > 64) g_pom_steps = 64;
+    }
+    if (const char* v = getenv("SWORDIGO_FFP_ROUGHNESS")) {
+        g_roughness = strtof(v, nullptr);
+    }
+    if (const char* v = getenv("SWORDIGO_FFP_METALLIC")) {
+        g_metallic = strtof(v, nullptr);
+    }
 
     g_debug = (getenv("SWORDIGO_FFP_DEBUG") && strcmp(getenv("SWORDIGO_FFP_DEBUG"), "0") != 0);
     g_stats = (getenv("SWORDIGO_FFP_STATS") && strcmp(getenv("SWORDIGO_FFP_STATS"), "0") != 0);
@@ -816,6 +1246,7 @@ void init_from_env() {
     mat_identity(g_mat.modelview);
     mat_identity(g_mat.projection);
     mat_identity(g_mat.texture);
+    mat_identity(g_camera_view);
     for (int f = 0; f < 2; f++)
         for (int k = 0; k < 5; k++)
             for (int c = 0; c < 4; c++)
@@ -901,29 +1332,57 @@ void init_from_env() {
         glGetFloatv(0x0BA6, g_mat.modelview);
         glGetFloatv(0x0BA7, g_mat.projection);
         glGetFloatv(0x0BA8, g_mat.texture);
+        memcpy(g_camera_view, g_mat.modelview, sizeof(Mat4));
     }
 
-    snprintf(g_status, sizeof(g_status),
-             "translation: quality=%d (%s)", g_quality,
-             g_quality == OFF ? "vanilla fixed-function"
-                              : "ANGLE GLES1 emulation on GL 3.3");
+    const char* qual_name = "vanilla fixed-function";
+    if (g_quality == TRANSLATE) qual_name = "ANGLE GLES1 emulation on GL 3.3";
+    else if (g_quality == PERFRAG) qual_name = "Per-fragment lighting (GL 3.3)";
+    else if (g_quality == POM) qual_name = "Parallax Occlusion Mapping + Per-fragment (GL 3.3)";
+    else if (g_quality == PBR) qual_name = "PBR (Cook-Torrance GGX + Bump/POM + Dynamic Light)";
+    snprintf(g_status, sizeof(g_status), "translation: quality=%d (%s)", g_quality, qual_name);
     std::cout << "[FFP] " << g_status << std::endl;
     if (g_quality != OFF) {
-        std::cout << "[FFP] every guest draw is transcoded (state shadow + ANGLE GLES1 "
-                     "shader); SWORDIGO_FFP_LIGHTING=0 restores vanilla" << std::endl;
+        std::cout << "[FFP] every guest draw is transcoded (state shadow + forward shader); "
+                     "SWORDIGO_FFP_LIGHTING=0 restores vanilla" << std::endl;
     }
 }
 
-void set_quality(int q) { g_quality = (q <= OFF) ? OFF : TRANSLATE; }
+void set_quality(int q) {
+    if (q <= OFF) g_quality = OFF;
+    else if (q > PBR) g_quality = PBR;
+    else g_quality = q;
+}
 int  quality() { if (g_quality < 0) init_from_env(); return g_quality; }
 bool available() { return quality() != OFF && ensure_program(); }
 const char* status() { return g_status; }
+
+void  set_bump_strength(float b) { g_bump_strength = b; }
+float bump_strength() { return g_bump_strength; }
+void  set_pom_scale(float s) { g_pom_scale = s; }
+float pom_scale() { return g_pom_scale; }
+void  set_roughness(float r) { g_roughness = r; }
+float roughness() { return g_roughness; }
+void  set_metallic(float m) { g_metallic = m; }
+float metallic() { return g_metallic; }
+
+void note_active_texture(GLenum unit) {
+    int u = (int)(unit - 0x84C0 /*GL_TEXTURE0*/);
+    if (u >= 0 && u < 8) g_active_unit = u;
+}
 
 void note_capability(GLenum cap, bool en) {
     switch (cap) {
         case CAP_LIGHTING:       g_st.lit = en; break;
         case CAP_COLOR_MATERIAL: g_st.color_material = en; break;
-        case CAP_TEXTURE_2D:     g_st.texture2d = en; break;
+        case CAP_TEXTURE_2D:
+            if (g_active_unit >= 0 && g_active_unit < 8) {
+                g_st.unit_texture2d[g_active_unit] = en;
+            }
+            if (g_active_unit == 0) {
+                g_st.texture2d = en;
+            }
+            break;
         case CAP_ALPHA_TEST:     g_st.alpha_test = en; break;
         case CAP_FOG:            g_st.fog = en; break;
         case CAP_NORMALIZE:      g_st.normalize = en; break;
@@ -1096,11 +1555,19 @@ void note_shade_model(GLenum mode) { g_st.shade_model = (int)mode; }
 void note_point_size(float size) { g_st.point_size = size; }
 
 void note_matrix_mode(int mode) { g_mat.mode = mode; }
-void note_load_identity() { mat_identity(*g_mat.current()); }
+void note_load_identity() {
+    mat_identity(*g_mat.current());
+    if (g_mat.mode == 0x1700 && g_mat.mv_depth == 0) {
+        mat_identity(g_camera_view);
+    }
+}
 void note_load_matrix(int mode, const float* m) {
     if (!m) return;
     if (mode) g_mat.mode = mode;
     mat_copy(*g_mat.current(), m);
+    if (g_mat.mode == 0x1700 && g_mat.mv_depth == 0) {
+        memcpy(g_camera_view, m, sizeof(Mat4));
+    }
 }
 void note_mult_matrix(int mode, const float* m) {
     if (!m) return;
@@ -1174,18 +1641,9 @@ bool draw(GLenum mode, GLuint texture, int first, int count,
     if (!ensure_program()) { g_skip_noprogram++; g_draws_vanilla++; return false; }
 
     glGetIntegerv(GL_CURRENT_PROGRAM, &g_saved_prog);
-    if (g_saved_prog != 0 && g_saved_prog != (GLint)g_prog) {
-        g_skip_foreign++; g_draws_vanilla++; return false;
-    }
     if (!g_arr.v_enabled || !g_arr.vptr) { g_skip_no_varray++; g_draws_vanilla++; return false; }
     if (!supported_primitive(mode)) { g_skip_prim++; g_draws_vanilla++; return false; }
     if (count > 400000) { g_skip_big++; g_draws_vanilla++; return false; }
-    // A bound texture with no texcoord array means the draw relies on the
-    // current glTexCoord, which the engine never sets (no glTexCoord* handler
-    // exists) — hand that one back rather than guess.
-    if (g_st.texture2d && texture != 0 && !g_arr.t_enabled) {
-        g_skip_no_texcoord++; g_draws_vanilla++; return false;
-    }
 
     float mv[16], pr[16], tx[16];
     get_matrices(mv, pr, tx);
@@ -1232,19 +1690,25 @@ bool draw(GLenum mode, GLuint texture, int first, int count,
     // than from the bridge's best-effort cache: this is exactly the state the
     // fixed-function path would sample, and a stale value here is the
     // difference between a textured surface and a flat white one.
-    GLint active_unit = GL_TEXTURE0;
+    glActiveTexture(GL_TEXTURE0);
     GLint bound_tex = 0;
-    glGetIntegerv(0x84E0 /*GL_ACTIVE_TEXTURE*/, &active_unit);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound_tex);
-    int unit_index = (int)(active_unit - GL_TEXTURE0);
-    if (unit_index < 0 || unit_index > 7) unit_index = 0;
+    if (texture != 0) {
+        bound_tex = (GLint)texture;
+        glBindTexture(GL_TEXTURE_2D, bound_tex);
+    } else {
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound_tex);
+    }
+    int unit_index = 0;
 
     // ── Matrices ──────────────────────────────────────────────────────────
     float invtr[16];
     mat_normal_invtr(invtr, mv);
+    float view_inv[16];
+    mat_inverse_4x4(view_inv, g_camera_view);
     um4(U.projection, pr);
     um4(U.modelview, mv);
     um4(U.modelview_invtr, invtr);
+    um4(U.u_view_inv, view_inv);
     if (U.texture_matrix >= 0) glUniformMatrix4fv(U.texture_matrix, 1, GL_FALSE, tx);
 
     // ── Lighting / material state ─────────────────────────────────────────
@@ -1265,6 +1729,30 @@ bool draw(GLenum mode, GLuint texture, int first, int count,
         lal[i] = L.atten[1];
         laq[i] = L.atten[2];
     }
+    if (!ortho && g_quality >= PERFRAG && !g_st.light[7].enabled && (g_host_hero_pos[0] != 0.0f || g_host_hero_pos[1] != 0.0f)) {
+        float hx = g_host_hero_pos[0];
+        float hy = g_host_hero_pos[1] + 50.0f;
+        float hz = g_host_hero_pos[2];
+        const float* V = g_camera_view;
+        float ex = V[0] * hx + V[4] * hy + V[8]  * hz + V[12];
+        float ey = V[1] * hx + V[5] * hy + V[9]  * hz + V[13];
+        float ez = V[2] * hx + V[6] * hy + V[10] * hz + V[14];
+
+        light_enables[7] = 1;
+        lpos[7][0] = ex;
+        lpos[7][1] = ey;
+        lpos[7][2] = ez;
+        lpos[7][3] = 1.0f;
+
+        lamb[7][0] = 0.05f; lamb[7][1] = 0.15f; lamb[7][2] = 0.35f; lamb[7][3] = 1.0f;
+        ldif[7][0] = 0.25f; ldif[7][1] = 0.7f;  ldif[7][2] = 1.6f;  ldif[7][3] = 1.0f;
+        lspec[7][0]= 0.5f;  lspec[7][1]= 1.0f;  lspec[7][2] = 2.0f;  lspec[7][3] = 1.0f;
+
+        lac[7] = 1.0f;
+        lal[7] = 0.002f;
+        laq[7] = 0.00002f;
+        lsc[7] = 180.0f;
+    }
     u1iv(U.st_light_enables, 8, light_enables);
     u4fv(U.light_positions, 8, &lpos[0][0]);
     u4fv(U.light_ambients, 8, &lamb[0][0]);
@@ -1283,7 +1771,41 @@ bool draw(GLenum mode, GLuint texture, int first, int count,
     u4f(U.material_specular, g_st.mat[face][F_SPECULAR]);
     u4f(U.material_emissive, g_st.mat[face][F_EMISSION]);
     u1f(U.material_specular_exponent, g_st.mat[face][F_SHININESS][0]);
-    u4f(U.light_model_scene_ambient, g_st.light_model_ambient);
+
+    // ── Scene ambient: ADDITIVE atmosphere ─────────────────────────────────
+    //
+    // This used to be
+    //     scene_ambient = biome.skyAmbientColor * biome.sunIntensity;
+    // i.e. a straight REPLACEMENT of the guest's own glLightModelAmbient. The
+    // palette it multiplied in was 0.03-0.075 against a guest default of 0.2, so
+    // the remaster silently cut scene ambient by roughly 4x. Ambient is the term
+    // that fills every surface the point lights do not reach - which, in a 2D
+    // side-scroller, is most of the visible frame - so that cut is the dominant
+    // reason "SW+ / SW+ Medium is very dark" and it is why the tier buttons did
+    // not fix it: the darkness was here, not in the tier's numbers.
+    //
+    // The game's authored ambient is a deliberate art-direction value, so it is
+    // preserved and the biome term is ADDED on top of it. The LEVEL now comes
+    // from BiomeEntry::lightAmbient (recorded per biome in scene_v3_biomes.json:
+    // 0.2-0.5); the TINT is the host palette (chromaticity only). Sum clamped.
+    const auto& biome = TextureAwareMapper::Instance().GetCurrentBiome();
+    if (!ortho && g_quality >= PERFRAG && biome.valid) {
+        constexpr float kBiomeAmbientGain = 1.0f;
+        float sceneAmbient[4];
+        for (int i = 0; i < 3; ++i) {
+            const float authored = g_st.light_model_ambient[i];
+            const float term = biome.skyAmbientColor[i] * biome.ambientIntensity * kBiomeAmbientGain;
+            const float sum  = authored + term;
+            sceneAmbient[i]  = (sum < 1.0f) ? sum : 1.0f;
+        }
+        sceneAmbient[3] = g_st.light_model_ambient[3];
+        u4f(U.light_model_scene_ambient, sceneAmbient);
+    } else {
+        // No biome resolved, or ortho: use the game's own ambient verbatim. A
+        // wrong biome must not be applied "just in case" - see
+        // BiomeEnvironment::valid.
+        u4f(U.light_model_scene_ambient, g_st.light_model_ambient);
+    }
 
     // ── Fixed-function enables ────────────────────────────────────────────
     u1i(U.st_enable_lighting, g_st.lit ? 1 : 0);
@@ -1304,7 +1826,6 @@ bool draw(GLenum mode, GLuint texture, int first, int count,
     u1f(U.fog_start, g_st.fog_start);
     u1f(U.fog_end, g_st.fog_end);
     u4f(U.fog_color, g_st.fog_color);
-    u1i(U.st_enable_texture_2d, g_st.texture2d ? 1 : 0);
     u1i(U.st_enable_texture_cube_map, 0);
     u4f(U.texture_env_color, g_st.texenv_color);
     u1i(U.tex_sampler0, unit_index);
@@ -1312,7 +1833,7 @@ bool draw(GLenum mode, GLuint texture, int first, int count,
 
     // The vendored shader is built with kTexUnits == 1, so the sampler is
     // pointed at whichever unit the fixed pipeline would have used.
-    const bool has_tex = (bound_tex != 0) && g_st.texture2d && g_arr.t_enabled;
+    const bool has_tex = (bound_tex != 0) && g_arr.t_enabled && (g_st.unit_texture2d[0] || g_st.texture2d || texture != 0);
     if (!has_tex) {
         g_untextured_draws++;
         // Diagnostic: a translated draw that comes out flat-shaded. This is what
@@ -1370,6 +1891,52 @@ bool draw(GLenum mode, GLuint texture, int first, int count,
         u1fv(U.texture_env_alpha_scale, 4, alpha_scale);
         u1fv(U.texture_env_lod_bias, 4, lod_bias);
     }
+
+    // ── PBR / POM / Lighting Quality Uniforms ─────────────────────────────
+    //
+    // MATERIAL CONTRACT: `matProps.known` is the gate. When it is false the
+    // engine's own material wins and the remaster contributes NOTHING - no
+    // roughness/metallic override, no reflectivity, no wetness, no procedural
+    // detail. That is deliberate, because a WRONG material is far more damaging
+    // than a missing one: a bogus metallic drives F0 to the albedo and removes
+    // the diffuse term, which is exactly the "textures render as flat unlit
+    // boxes" report. See TextureAwareMapper.h for why the registration input
+    // cannot currently be trusted for anything else.
+    uint32_t active_tex = (texture != 0) ? (uint32_t)texture : (uint32_t)bound_tex;
+    MaterialProperties matProps = TextureAwareMapper::Instance().Lookup(active_tex);
+    const bool mat_known = matProps.known;
+
+    u1i(U.u_quality, g_quality);
+    u1f(U.u_bump_strength, g_bump_strength);
+    u1f(U.u_pom_scale, g_pom_scale);
+    u1i(U.u_pom_steps, g_pom_steps);
+    u1f(U.u_roughness, (mat_known && g_quality >= PBR) ? matProps.roughness : g_roughness);
+    u1f(U.u_metallic,  (mat_known && g_quality >= PBR) ? matProps.metallic  : g_metallic);
+    u1f(U.u_reflectivity, mat_known ? matProps.reflectivity : 0.0f);
+    u1f(U.u_wetness, mat_known ? matProps.wetnessFactor : 0.0f);
+    // u_sun_intensity is declared and uploaded but never read by the shader body
+    // (verified: only the declaration and this upload exist). Kept for the
+    // out-of-tree kernels in src/shaders/core/ that do consume it, and guarded so
+    // an unresolved biome cannot push a default intensity into them.
+    u1f(U.u_sun_intensity, biome.valid ? biome.sunIntensity : 1.0f);
+    u1i(U.u_is_ortho, ortho ? 1 : 0);
+
+    // Ground/terrain detection. The vertex-count heuristic is kept as one signal
+    // but is no longer the only one: a texture that resolved to a trusted terrain
+    // material IS ground, which is the texture-aware answer to "which draw is the
+    // grass on the ground mesh". `n_verts >= 60` alone misses small ground
+    // patches and mis-fires on any large lit+coloured sprite.
+    const bool looks_terrain = mat_known && TextureAwareMapper::Instance().LooksLikeTerrain(active_tex);
+    const bool is_groundmesh = !ortho && ((g_arr.n_enabled && g_arr.c_enabled && (n_verts >= 60)) || looks_terrain);
+    u1i(U.u_is_groundmesh, is_groundmesh ? 1 : 0);
+    u1i(U.u_pdi_enabled, (::g_postfx.enabled && ::g_postfx.procedural_detail) ? 1 : 0);
+    u1f(U.u_procedural_strength, ::g_postfx.procedural_strength);
+    // Detail type 0 (authored UVs, untouched) unless we positively know this is a
+    // terrain surface. Injecting world-space procedural normals into an
+    // unidentified draw is the other half of the "noisy unlit rectangle"
+    // symptom, so unknown now means 0 rather than the old fallback of 1.
+    u1i(U.u_asset_detail_type,
+        is_groundmesh ? 1 : (mat_known ? (int)matProps.proceduralDetailMode : 0));
 
     // ── Issue it ──────────────────────────────────────────────────────────
     glBindVertexArray(g_vao);

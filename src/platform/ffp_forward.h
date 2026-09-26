@@ -94,6 +94,15 @@ int  quality();
 bool available();
 const char* status();
 
+void  set_bump_strength(float b);
+float bump_strength();
+void  set_pom_scale(float s);
+float pom_scale();
+void  set_roughness(float r);
+float roughness();
+void  set_metallic(float m);
+float metallic();
+
 // ── State shadow: fixed-function enables ───────────────────────────────────
 // The bridge forwards every glEnable/glDisable here. The module keeps its own
 // copy so it never has to query the driver inside a draw, and so state the
@@ -120,6 +129,7 @@ void note_fogf(GLenum pname, float v);
 void note_fogi(GLenum pname, int mode);
 void note_fogfv(GLenum pname, const float* v);
 void note_texenv(GLenum pname, int iparam, const float* fparam);
+void note_active_texture(GLenum unit);
 void note_alpha_func(GLenum func, float ref);
 void note_shade_model(GLenum mode);
 void note_point_size(float size);

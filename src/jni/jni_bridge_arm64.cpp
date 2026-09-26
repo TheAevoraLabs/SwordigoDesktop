@@ -72,6 +72,7 @@ namespace fs = std::filesystem;
 extern so_module_arm64 g_sre_mod;
 extern so_module_arm64 g_main_mod_64;
 extern uint8_t* g_guest_memory;
+extern ElfLoaderArm64* g_loader_64;
 #include <cerrno>
 #ifndef _WIN32
 #include <sys/socket.h>
@@ -7018,7 +7019,19 @@ static GLuint g_controls_hidden_tex = 0;       // Modified copy with controls ze
 
 // From asset_manager.c — diagnostic only. Asset opens and GL uploads are not
 // one-to-one, so this must not be used as authoritative upload ownership.
-extern "C" { extern char g_last_opened_asset[256]; }
+extern "C" {
+    extern char g_last_opened_asset[256];
+    extern void texture_aware_mapper_on_texture_registered(uint32_t textureId, const char* assetName);
+    extern void texture_aware_mapper_on_scene_open(const char* sceneName);
+    // Gate counters. MUST be declared here, at namespace scope inside this
+    // extern "C" block: the definition in TextureAwareMapper.cpp is in that
+    // file's extern "C" block, so a plain C++ declaration looks for a mangled
+    // name that does not exist and the executable fails to link. A linkage
+    // specification is also not allowed at block scope, so it cannot be
+    // declared next to its call site.
+    extern void texture_aware_mapper_get_stats(uint32_t* registered, uint32_t* trusted,
+                                               uint32_t* rejected);
+}
 
 // Control regions in 1024x1024 pixel space (parsed from ui_game_atlas_2x.atlas)
 // Format: {x, y, w, h} — these are the touch button sprite regions to zero out
@@ -7155,6 +7168,7 @@ static void bridge_gl_draw_arrays(void* emu_ptr) {
     // per-fragment forward shader for this single draw and restore the previous
     // program afterwards. Everything else (sprites, UI, particles, unlit props)
     // falls through to the untouched fixed-function path.
+    ffp_publish_arrays(emu);
     if (!ffp::draw(mode, (GLuint)g_frame_stats.last_bound_texture, (int)first, (int)count,
                    nullptr, 0)) {
         glDrawArrays(mode, first, count);
@@ -7334,6 +7348,7 @@ static void bridge_gl_draw_elements(void* emu_ptr) {
         // Indexed variant of the forward per-fragment lighting pass (see
         // bridge_gl_draw_arrays). The client vertex/normal/color/texcoord arrays
         // are unaffected, so only the program binding changes for this draw.
+        ffp_publish_arrays(emu);
         if (!ffp::draw(mode, (GLuint)g_frame_stats.last_bound_texture, 0, (int)count,
                        (const void*)(memory + indices_ptr), (GLenum)type)) {
             glDrawElements(mode, count, type, (const void*)(memory + indices_ptr));
@@ -7540,6 +7555,114 @@ static void bridge_gl_bind_texture(void* emu_ptr) {
         }
         g_current_batch_state.texture_id = tex_id;
     }
+
+    // SRE13 texture awareness: inspect bound texture name from guest RenderingContext::BindTexture hook
+    if (tex_id != 0 && g_sre_mod.base_addr != 0 && g_guest_memory != nullptr) {
+        static int s_pending_tex_set_dump = 0;
+        static uint64_t s_sre_tex_name_va = 0;
+        static uint64_t s_sre_tex_id_va = 0;
+        static bool s_sre_tex_syms_resolved = false;
+        if (!s_sre_tex_syms_resolved && g_loader_64) {
+            s_sre_tex_name_va = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_last_bound_texture_name");
+            s_sre_tex_id_va = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_last_bound_texture_id");
+            if (s_sre_tex_name_va != 0 && s_sre_tex_id_va != 0) {
+                s_sre_tex_syms_resolved = true;
+            }
+        }
+        if (s_sre_tex_syms_resolved) {
+            uint32_t sre_id = *(volatile uint32_t*)(g_guest_memory + s_sre_tex_id_va);
+            if (sre_id == tex_id) {
+                const char* sre_name = (const char*)(g_guest_memory + s_sre_tex_name_va);
+                if (sre_name && sre_name[0] != '\0') {
+                    texture_aware_mapper_on_texture_registered(tex_id, sre_name);
+                }
+            }
+        }
+
+        // SRE13 scene awareness: update active biome when scene changes
+        static uint64_t s_sre_cur_scene_va = 0;
+        static uint64_t s_sre_uniq_names_va = 0;
+        static uint64_t s_sre_uniq_count_va = 0;
+        static uint64_t s_sre_bind_calls_va = 0;
+        static uint64_t s_sre_ident_calls_va = 0;
+        static bool s_sre_scene_sym_resolved = false;
+        static char s_last_observed_scene[128] = {0};
+        if (!s_sre_scene_sym_resolved && g_loader_64) {
+            s_sre_cur_scene_va     = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_current_scene_name");
+            s_sre_uniq_names_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_texture_unique_names");
+            s_sre_uniq_count_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_texture_unique_count");
+            s_sre_bind_calls_va    = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_texture_bind_calls");
+            s_sre_ident_calls_va   = g_loader_64->get_symbol_vaddr(&g_sre_mod, "g_sre_texture_identified_calls");
+            if (s_sre_cur_scene_va != 0) s_sre_scene_sym_resolved = true;
+        }
+        if (s_sre_scene_sym_resolved) {
+            const char* cur_scene = (const char*)(g_guest_memory + s_sre_cur_scene_va);
+            if (cur_scene && cur_scene[0] != '\0' && strncmp(s_last_observed_scene, cur_scene, 127) != 0) {
+                strncpy(s_last_observed_scene, cur_scene, 127);
+                s_last_observed_scene[127] = '\0';
+                texture_aware_mapper_on_scene_open(s_last_observed_scene);
+
+                // Report what the level actually binds, a moment after it starts.
+                // This is the measurement that replaces "we assume texture
+                // identity works": the names printed are read out of guest
+                // memory, so if the offsets in texture_layout.h were wrong the
+                // list would be empty rather than plausible.
+                //
+                // The distinct-texture set is cleared BY THE GUEST, in the
+                // Scene_LoadFromFile hook, and this code must never clear it by
+                // calling into the guest. Doing that here used to be a raw host
+                // call - ((void(*)(void))(g_guest_memory + vaddr))() - which
+                // executes ARM64 guest bytes as host x86-64 and killed the
+                // process with SIGSEGV about a level into the game. The host
+                // reads guest DATA through g_guest_memory + vaddr; only the
+                // emulator (g_emulator_64->call) may run guest CODE.
+                ++g_sre13_tex_telemetry.level_generation;
+                // Counted in glBindTexture CALLS, because this runs inside the
+                // bind bridge, not once per frame. A level binds thousands, so
+                // 2000 is a fraction of a frame in and the names are in place.
+                s_pending_tex_set_dump = 2000;
+                printf("[SRE13] scene '%s' -> texture-identity set will be dumped "
+                       "%d binds after load\n", s_last_observed_scene, s_pending_tex_set_dump);
+            }
+
+            if (s_pending_tex_set_dump > 0 && --s_pending_tex_set_dump == 0) {
+                const uint32_t binds = s_sre_bind_calls_va
+                    ? *(volatile uint32_t*)(g_guest_memory + s_sre_bind_calls_va) : 0u;
+                const uint32_t ident = s_sre_ident_calls_va
+                    ? *(volatile uint32_t*)(g_guest_memory + s_sre_ident_calls_va) : 0u;
+                const uint32_t count = s_sre_uniq_count_va
+                    ? *(volatile uint32_t*)(g_guest_memory + s_sre_uniq_count_va) : 0u;
+                g_sre13_tex_telemetry.bind_calls   = binds;
+                g_sre13_tex_telemetry.identified   = ident;
+                g_sre13_tex_telemetry.unique_names = count;
+                g_sre13_tex_telemetry.resolved     = true;
+                g_sre13_tex_telemetry.has_level    = true;
+                {
+                    // What the trust gate did with those names. `trusted` counts
+                    // identities that produced a real material override, so if
+                    // this stays 0 while unique_names climbs, the channel works
+                    // but the gate is refusing everything - a different bug from
+                    // a broken layout, and the pair of numbers tells them apart.
+                    // Called through the C bridge because this translation unit
+                    // deliberately does not include the mapper's C++ header.
+                    uint32_t reg = 0, tru = 0, rej = 0;
+                    texture_aware_mapper_get_stats(&reg, &tru, &rej);
+                    g_sre13_tex_telemetry.trusted  = tru;
+                    g_sre13_tex_telemetry.rejected = rej;
+                }
+                printf("[SRE13] texture identity for '%s': %u binds, %u identified, %u distinct\n",
+                       s_last_observed_scene, binds, ident, count);
+                if (ident == 0 && binds > 0) {
+                    printf("[SRE13] WARNING: %u binds but ZERO identified - the Caver::Texture\n"
+                           "        offsets in sre13/hooks/texture_layout.h do not match this build.\n", binds);
+                }
+                for (uint32_t i = 0; i < count && i < 96u; ++i) {
+                    const char* nm = (const char*)(g_guest_memory + s_sre_uniq_names_va + (uint64_t)i * 32u);
+                    printf("[SRE13]   texture[%u] %s\n", i, nm);
+                }
+            }
+        }
+    }
 #ifdef VULKAN_BACKEND
     if (g_graphics_api == GraphicsAPI::VULKAN) {
         g_vk_backend.bind_texture(target, tex_id);
@@ -7613,6 +7736,22 @@ static void bridge_gl_tex_image_2d(void* emu_ptr) {
             g_frame_stats.last_bound_texture, width, height, internalformat,
             g_last_opened_asset, pixels, width * height * bpp
         );
+        /* REMOVED: texture_aware_mapper_on_texture_registered(
+         *              g_frame_stats.last_bound_texture, g_last_opened_asset);
+         *
+         * This paired a GL texture name with whatever asset file the manager
+         * happened to OPEN last. The two are unrelated in general - a deferred
+         * upload, a hovered UI element or an atlas read leaves
+         * g_last_opened_asset pointing at some other file - so the identity was
+         * wrong by construction. It is not merely a no-op either: the mapper's
+         * RegisterTextureName() ERASES the entry for that texture id when the
+         * name fails its trust gate, so this call actively DELETED correct
+         * identities established by the real channel below.
+         *
+         * Texture identity now comes from Caver::RenderingContext::BindTexture
+         * (sre13/hooks/RenderingContext.c), which reads the name off the very
+         * Texture object the guest is binding. Do not reintroduce a pairing of
+         * "bound GL name" with "last opened asset". */
 
         /* Tag the controls atlas only once. g_last_opened_asset is global and
          * can be stale when deferred texture uploads occur; repeatedly tagging
@@ -7799,6 +7938,22 @@ static void bridge_gl_compressed_tex_image_2d(void* emu_ptr) {
             g_frame_stats.last_bound_texture, width, height, GL_RGBA,
             g_last_opened_asset, rgba.data(), rgba.size()
         );
+        /* REMOVED: texture_aware_mapper_on_texture_registered(
+         *              g_frame_stats.last_bound_texture, g_last_opened_asset);
+         *
+         * This paired a GL texture name with whatever asset file the manager
+         * happened to OPEN last. The two are unrelated in general - a deferred
+         * upload, a hovered UI element or an atlas read leaves
+         * g_last_opened_asset pointing at some other file - so the identity was
+         * wrong by construction. It is not merely a no-op either: the mapper's
+         * RegisterTextureName() ERASES the entry for that texture id when the
+         * name fails its trust gate, so this call actively DELETED correct
+         * identities established by the real channel below.
+         *
+         * Texture identity now comes from Caver::RenderingContext::BindTexture
+         * (sre13/hooks/RenderingContext.c), which reads the name off the very
+         * Texture object the guest is binding. Do not reintroduce a pairing of
+         * "bound GL name" with "last opened asset". */
         std::cout << "[ETC1] Decoded " << width << "x" << height << " texture (" 
                   << (block_w * block_h) << " blocks)" << std::endl;
     } else if (internalformat == 0x8C00 || internalformat == 0x8C01 ||
@@ -7823,6 +7978,22 @@ static void bridge_gl_compressed_tex_image_2d(void* emu_ptr) {
             g_frame_stats.last_bound_texture, width, height, GL_RGBA,
             g_last_opened_asset, rgba.data(), rgba.size()
         );
+        /* REMOVED: texture_aware_mapper_on_texture_registered(
+         *              g_frame_stats.last_bound_texture, g_last_opened_asset);
+         *
+         * This paired a GL texture name with whatever asset file the manager
+         * happened to OPEN last. The two are unrelated in general - a deferred
+         * upload, a hovered UI element or an atlas read leaves
+         * g_last_opened_asset pointing at some other file - so the identity was
+         * wrong by construction. It is not merely a no-op either: the mapper's
+         * RegisterTextureName() ERASES the entry for that texture id when the
+         * name fails its trust gate, so this call actively DELETED correct
+         * identities established by the real channel below.
+         *
+         * Texture identity now comes from Caver::RenderingContext::BindTexture
+         * (sre13/hooks/RenderingContext.c), which reads the name off the very
+         * Texture object the guest is binding. Do not reintroduce a pairing of
+         * "bound GL name" with "last opened asset". */
         std::cout << "[PVRTC] Decoded " << width << "x" << height << " texture (format=0x" 
                   << std::hex << internalformat << std::dec << ")" << std::endl;
     } else {
@@ -8839,6 +9010,7 @@ static void bridge_gl_active_texture(void* emu_ptr) {
     }
 #endif
     if (g_display_active) glActiveTexture(emu->get_reg(0));
+    ffp::note_active_texture((GLenum)emu->get_reg(0));
 }
 
 static void bridge_gl_client_active_texture(void* emu_ptr) {

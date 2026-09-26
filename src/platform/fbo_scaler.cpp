@@ -6,11 +6,14 @@
 #include "platform/data_path.h"
 #include "jni/gl_render_state.h"   // GL state handshake — written by bridge, read here
 #include <iostream>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include "graphics/LightManager.h"
+#include "graphics/TextureAwareMapper.h"
 
 // ============================================================
 //  FBO + Multi-Pass Post-Processing Pipeline
@@ -94,7 +97,11 @@ static GLint loc_ssao_far_plane = -1;
 
 // g_prog_blur uniforms
 static GLint loc_blur_tex = -1;
+static GLint loc_blur_depth = -1;
 static GLint loc_blur_direction = -1;
+static GLint loc_blur_use_depth = -1;
+static GLint loc_blur_near_plane = -1;
+static GLint loc_blur_far_plane = -1;
 
 // g_prog_godrays uniforms
 static GLint loc_godrays_tex = -1;
@@ -104,10 +111,23 @@ static GLint loc_godrays_intensity = -1;
 static GLint loc_godrays_decay = -1;
 static GLint loc_godrays_density = -1;
 static GLint loc_godrays_exposure = -1;
+static GLint loc_godrays_tex_size = -1;
+static GLint loc_godrays_time = -1;
+static GLint loc_godrays_near = -1;
+static GLint loc_godrays_far = -1;
 
 // g_prog_bloom_extract uniforms
 static GLint loc_bloom_extract_tex = -1;
 static GLint loc_bloom_extract_threshold = -1;
+static GLint loc_bloom_extract_tex_size = -1;
+// Authored-emitter bloom key. See src/shaders/graphics/bloom_extract.glsl.
+static GLint loc_bloom_extract_emitter_keyed = -1;
+static GLint loc_bloom_extract_emitter_count = -1;
+static GLint loc_bloom_extract_emitter = -1;
+static GLint loc_bloom_extract_emitter_luma = -1;
+static GLint loc_bloom_extract_emitter_sat = -1;
+static GLint loc_bloom_extract_emitter_contrast = -1;
+static GLint loc_bloom_extract_emitter_gain = -1;
 
 // g_prog_composite uniforms
 static GLint loc_comp_scene = -1;
@@ -139,6 +159,8 @@ static GLint loc_comp_tex_size = -1;
 static GLint loc_comp_pbr_enabled = -1;
 static GLint loc_comp_reflections_enabled = -1;
 static GLint loc_comp_reflection_intensity = -1;
+static GLint loc_comp_water_surface = -1;
+static GLint loc_comp_water_valid = -1;
 static GLint loc_comp_time = -1;
 static GLint loc_comp_ui_pass = -1;
 
@@ -186,7 +208,7 @@ static GLint loc_comp_light_model_amb = -1; // vec4 — glLightModel ambient
 // ======================= SHADER SOURCES =======================
 
 static const char* VERT_SRC = R"GLSL(
-#version 330
+#version 430 core
 layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec2 a_uv;
 out vec2 v_uv;
@@ -201,7 +223,7 @@ void main() {
 // combined with a perspective projection (FOV=20°, near=50, far=20000)
 // to correctly position the portal quad in screen space.
 static const char* VERT_PORTAL = R"GLSL(
-#version 330
+#version 430 core
 layout(location = 0) in vec2 a_pos;   // -1..1 quad corners
 layout(location = 1) in vec2 a_uv;    // 0..1
 uniform mat4 u_mv_matrix;             // model-view matrix from game Draw call
@@ -243,7 +265,7 @@ void main() {
 // ----- Portal Quad Fragment Shader -----
 // Samples the portal texture with animated UV swirl.
 static const char* FRAG_PORTAL = R"GLSL(
-#version 330
+#version 430 core
 uniform sampler2D u_portal_tex;
 uniform vec3  u_color;         // portal tint color
 uniform float u_time;          // animation time
@@ -302,7 +324,7 @@ void main() {
 )GLSL";
 
 static const char* FRAG_SHARP_BILINEAR = R"GLSL(
-#version 330
+#version 430 core
 uniform sampler2D u_tex;
 uniform vec2 u_tex_size;
 uniform vec2 u_out_size;
@@ -320,7 +342,7 @@ void main() {
 )GLSL";
 
 static const char* FRAG_NEAREST = R"GLSL(
-#version 330
+#version 430 core
 uniform sampler2D u_tex;
 uniform vec2 u_tex_size;
 uniform vec2 u_out_size;
@@ -333,7 +355,7 @@ void main() {
 )GLSL";
 
 static const char* FRAG_CRT = R"GLSL(
-#version 330
+#version 430 core
 uniform sampler2D u_tex;
 uniform vec2 u_tex_size;
 uniform vec2 u_out_size;
@@ -360,7 +382,7 @@ void main() {
 
 // ----- Tier 1 PostFX (color effects in single pass) -----
 static const char* FRAG_POSTFX = R"GLSL(
-#version 330
+#version 430 core
 uniform sampler2D u_tex;
 uniform sampler2D u_depth_tex;  // depth buffer for outlines
 uniform vec2 u_tex_size;
@@ -481,228 +503,466 @@ void main() {
 }
 )GLSL";
 
-// ----- God Rays (screen-space radial blur from sun position) -----
-// Sun is positioned ABOVE the screen at (0.5, 1.1) — invisible, but rays emanate down
-// from there, creating the impression of a powerful overhead sun.
+// ----- 3D Screen-Space Volumetric Raymarching (Godot 4 / Unreal SSVR) -----
+// Real 3D depth-tested volumetric shafts with Henyey-Greenstein anisotropic phase scattering,
+// Interleaved Gradient Noise jittering, depth-buffer occlusion testing, and extinction falloff.
 static const char* FRAG_GODRAYS = R"GLSL(
-#version 330
-uniform sampler2D u_tex;      // scene color
-uniform sampler2D u_depth;    // depth texture
-uniform vec2 u_sun_pos;       // sun position in UV space (can be off-screen, e.g. 0.5, 1.1)
-uniform float u_intensity;    // overall intensity
-uniform float u_decay;        // per-sample decay
-uniform float u_density;      // sample spacing
-uniform float u_exposure;     // final exposure multiply
+#version 430 core
+uniform sampler2D u_tex;        // scene color
+uniform sampler2D u_depth;      // depth texture (GL_DEPTH24_STENCIL8)
+uniform vec2 u_sun_pos;         // sun position in UV space (e.g. 0.5, 1.1)
+uniform float u_intensity;      // overall intensity
+uniform float u_decay;          // per-step transmittance decay
+uniform float u_density;        // step density/stride
+uniform float u_exposure;       // final exposure multiply
+uniform vec2 u_tex_size;        // render target resolution
+uniform float u_time;           // animation time
+uniform float u_near;           // near plane (50.0)
+uniform float u_far;            // far plane (20000.0)
+
 in vec2 v_uv;
 out vec4 FragColor;
 
-float rand(vec2 co) {
-    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+// Jorge Jimenez Interleaved Gradient Noise (IGN)
+float ign(vec2 p) {
+    return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y));
+}
+
+float linearize_depth(float d) {
+    float n = (u_near > 0.1) ? u_near : 50.0;
+    float f = (u_far > 100.0) ? u_far : 20000.0;
+    return (2.0 * n) / (f + n - d * (f - n));
+}
+
+// Henyey-Greenstein forward phase function (anisotropic atmospheric scattering)
+float henyey_greenstein(float cos_theta, float g) {
+    float g2 = g * g;
+    float denom = 1.0 + g2 - 2.0 * g * cos_theta;
+    return (1.0 / (4.0 * 3.14159265)) * ((1.0 - g2) / max(pow(denom, 1.5), 0.0001));
 }
 
 void main() {
-    // Direction from this pixel toward the (off-screen) sun
-    vec2 delta = v_uv - u_sun_pos;
+    vec2 sun_uv = u_sun_pos;
+    vec2 delta = sun_uv - v_uv;
     float dist = length(delta);
     
-    // Anisotropic scattering: rays spread wide from the top
-    // Stronger near screen top-center, taper out at screen edges
-    float vertical_bias = clamp(1.0 - v_uv.y * 0.8, 0.0, 1.0);  // stronger near top
-    float scattering = vertical_bias / (1.0 + dist * 0.75);
+    // Surface depth at current pixel
+    float raw_pixel_depth = texture(u_depth, v_uv).r;
+    float lin_pixel_depth = linearize_depth(raw_pixel_depth);
     
-    // No visible sun corona (sun is off-screen) — only rays are visible
-    // We still compute a small "horizon glow" at the top edge
-    float horizon_glow = smoothstep(0.55, 1.0, v_uv.y) * 0.15;
+    // Virtual sun depth (sky/background = 0.98 in linearized units)
+    float sun_depth_lin = 0.98;
     
-    // Step direction: from current pixel toward the sun (which is above screen)
-    delta = delta / max(dist, 0.001) * (1.0 / 80.0) * u_density;
+    // View and sun directions in view-space
+    vec3 V = normalize(vec3(v_uv - 0.5, 1.0));
+    vec3 L = normalize(vec3(delta, 0.4));
+    float cos_theta = clamp(dot(V, L), -1.0, 1.0);
+    float hg_phase = henyey_greenstein(cos_theta, 0.65) * 4.0 * 3.14159265;
     
-    // Dither starting offset to eliminate banding artifacts
-    float dither = rand(v_uv);
-    vec2 uv = v_uv + delta * dither;
+    // Screen-space raymarching setup (48 steps for smooth gradients)
+    const int NUM_STEPS = 48;
+    vec2 step_dir = (delta / max(dist, 0.0001)) * min(dist, 0.85) / float(NUM_STEPS) * u_density;
     
-    float illumination_decay = 1.0;
-    vec3 god_ray = vec3(0.0);
+    // Interleaved gradient noise dither to eliminate banding
+    float dither = ign(gl_FragCoord.xy + fract(u_time * 0.05) * 16.0);
     
-    // March 80 steps toward the sun, accumulating light
-    // More steps = smoother rays from off-screen sun
-    for (int i = 0; i < 80; i++) {
-        uv -= delta;
-        // Clamp to valid UV range (we march UP, so clamp top)
-        uv = clamp(uv, vec2(0.0), vec2(1.0));
+    float transmittance = 1.0;
+    vec3 ray_accum = vec3(0.0);
+    float step_decay = clamp(u_decay, 0.85, 0.995);
+    
+    // March from current pixel toward the sun
+    for (int i = 0; i < NUM_STEPS; i++) {
+        float t = (float(i) + dither) / float(NUM_STEPS);
+        vec2 march_uv = v_uv + step_dir * (float(i) + dither);
         
-        vec3 sample_col = texture(u_tex, uv).rgb;
-        float depth = texture(u_depth, uv).r;
+        if (march_uv.x < 0.0 || march_uv.x > 1.0 || march_uv.y < 0.0 || march_uv.y > 1.0) {
+            break;
+        }
         
-        // Depth masking — only sky/background (far pixels) can emit light
-        // Depth near 1.0 = far/sky (background), near 0.0 = close (foreground)
-        float depth_mask = smoothstep(0.92, 1.0, depth);
+        float raw_sample_depth = texture(u_depth, march_uv).r;
+        float geom_depth = linearize_depth(raw_sample_depth);
         
-        // Brightness — sky and bright highlights scatter light
-        float bright = dot(sample_col, vec3(0.2126, 0.7152, 0.0722));
-        float brightness_mask = smoothstep(0.15, 0.6, bright);
+        // Interpolate ray depth from pixel surface to distant sun
+        float ray_depth = mix(lin_pixel_depth, sun_depth_lin, t);
         
-        // Combined emission
-        float emission = depth_mask * brightness_mask;
+        // Depth-tested occlusion: if geometry is in front of the ray, light is blocked
+        float is_occluded = step(geom_depth, ray_depth - 0.003);
+        float visibility = 1.0 - is_occluded;
         
-        god_ray += sample_col * emission * illumination_decay;
-        illumination_decay *= u_decay;
+        // Light emission from background/bright surfaces
+        vec3 sample_col = texture(u_tex, march_uv).rgb;
+        float sky_mask = smoothstep(0.85, 1.0, raw_sample_depth);
+        float luma = dot(sample_col, vec3(0.2126, 0.7152, 0.0722));
+        float bright_mask = smoothstep(0.25, 0.85, luma);
+        float emitter = mix(bright_mask * 0.35, 1.0, sky_mask);
+        
+        float dist_to_sun = length(march_uv - sun_uv);
+        float radial_att = 1.0 / (1.0 + dist_to_sun * 1.5);
+        
+        ray_accum += sample_col * emitter * visibility * transmittance * radial_att;
+        transmittance *= step_decay;
     }
     
-    god_ray *= u_exposure / 80.0;
+    ray_accum = (ray_accum / float(NUM_STEPS)) * u_exposure * hg_phase * u_intensity;
     
-    // Horizon glow fill — subtle warm bloom near top screen edge
-    vec3 final_ray = god_ray * u_intensity * (1.0 + scattering * 0.6)
-                   + vec3(horizon_glow * u_intensity * 0.6, horizon_glow * u_intensity * 0.5, horizon_glow * u_intensity * 0.3);
-    FragColor = vec4(clamp(final_ray, 0.0, 1.0), 1.0);
+    // Subtle horizon ambient haze
+    float top_haze = smoothstep(0.65, 1.0, v_uv.y) * 0.08 * u_intensity;
+    ray_accum += vec3(top_haze * 1.0, top_haze * 0.9, top_haze * 0.7);
+    
+    FragColor = vec4(clamp(ray_accum, 0.0, 1.0), 1.0);
 }
 )GLSL";
 
 
-// ----- SSAO (Screen Space Ambient Occlusion) -----
-// Upgraded: uses cross-pattern depth reconstruction to reconstruct
-// approximate normals on-the-fly, giving better orientation-aware occlusion
-// and preventing halos on flat surfaces.
+// ----- Godot 4 / Intel ASSAO (Adaptive Screen Space Ambient Occlusion) -----
+// Multi-tap spiral sampling with bilateral normal reconstruction,
+// horizon angle occlusion, and distance falloff.
 static const char* FRAG_SSAO = R"GLSL(
-#version 330
+#version 430 core
 uniform sampler2D u_depth;    // depth texture
 uniform vec2 u_tex_size;      // resolution
-uniform float u_radius;       // sample radius in UV
+uniform float u_radius;       // sample radius
 uniform float u_intensity;    // AO strength
 uniform float u_time;         // for noise
-uniform float u_near_plane;   // camera near plane (game uses 50.0)
-uniform float u_far_plane;    // camera far plane  (game uses 20000.0)
+uniform float u_near_plane;   // camera near plane (50.0)
+uniform float u_far_plane;    // camera far plane  (20000.0)
+
 in vec2 v_uv;
 out vec4 FragColor;
 
-float rand(vec2 co) {
-    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+float ign(vec2 p) {
+    return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y));
 }
 
 float linearize_depth(float d) {
-    return (2.0 * u_near_plane) / (u_far_plane + u_near_plane - d * (u_far_plane - u_near_plane));
+    float n = (u_near_plane > 0.1) ? u_near_plane : 50.0;
+    float f = (u_far_plane > 100.0) ? u_far_plane : 20000.0;
+    return (2.0 * n) / (f + n - d * (f - n));
 }
 
-// Reconstruct a view-space position from a UV coordinate
 vec3 get_view_pos(vec2 uv) {
     float d = linearize_depth(texture(u_depth, uv).r);
     float aspect = u_tex_size.x / u_tex_size.y;
-    // Map UV to [-1,1] NDC, scale by depth for a rough view-space position
-    float x = (uv.x * 2.0 - 1.0) * d * aspect;
-    float y = (uv.y * 2.0 - 1.0) * d;
-    return vec3(x, y, d);
+    vec2 ndc = uv * 2.0 - 1.0;
+    return vec3(ndc.x * d * 0.17632698 * aspect, ndc.y * d * 0.17632698, d);
 }
+
+// Intel ASSAO 16-sample spiral disk pattern
+const vec2 SAMPLE_DISK[16] = vec2[](
+    vec2( 0.78488,  0.56661), vec2( 0.26022, -0.29575),
+    vec2( 0.10459,  0.08372), vec2(-0.68286,  0.04963),
+    vec2(-0.13570, -0.64190), vec2(-0.26193, -0.08205),
+    vec2(-0.61177,  0.66664), vec2( 0.43675,  0.25119),
+    vec2( 0.07884,  0.86618), vec2(-0.12790, -0.29869),
+    vec2(-0.04031,  0.02413), vec2( 0.16201, -0.52851),
+    vec2(-0.70991,  0.47301), vec2( 0.03277, -0.22349),
+    vec2( 0.68921,  0.36800), vec2( 0.29251,  0.37775)
+);
 
 void main() {
     float depth = texture(u_depth, v_uv).r;
-    float center_z = linearize_depth(depth);
-    
-    // Skip sky/far pixels
     if (depth > 0.999) {
-        FragColor = vec4(1.0, 1.0, 1.0, 1.0);
+        FragColor = vec4(1.0);
         return;
     }
     
-    // Reconstruct view-space normal from screen-space depth derivatives
     vec2 px = 1.0 / u_tex_size;
     vec3 pos_c = get_view_pos(v_uv);
+    
+    // Cross-depth reconstruction for bilateral normal estimation (Intel ASSAO)
     vec3 pos_r = get_view_pos(v_uv + vec2(px.x, 0.0));
+    vec3 pos_l = get_view_pos(v_uv - vec2(px.x, 0.0));
     vec3 pos_u = get_view_pos(v_uv + vec2(0.0, px.y));
-    // Flip normal direction to face the camera (Z increases with distance, so camera points to smaller Z)
-    vec3 normal = normalize(cross(pos_u - pos_c, pos_r - pos_c));
+    vec3 pos_d = get_view_pos(v_uv - vec2(0.0, px.y));
     
-    float occlusion = 0.0;
-    int samples = 16;
-    float angle_step = 6.2831853 / float(samples);
+    vec3 dx = (abs(pos_r.z - pos_c.z) < abs(pos_l.z - pos_c.z)) ? (pos_r - pos_c) : (pos_c - pos_l);
+    vec3 dy = (abs(pos_u.z - pos_c.z) < abs(pos_d.z - pos_c.z)) ? (pos_u - pos_c) : (pos_c - pos_d);
+    vec3 normal = normalize(cross(dx, dy));
+    if (normal.z > 0.0) normal = -normal;
     
-    // Rotate sample pattern per pixel for noise
-    float noise_angle = rand(v_uv + fract(u_time * 0.1)) * 6.2831853;
+    float noise = ign(gl_FragCoord.xy) * 6.2831853;
+    mat2 rot = mat2(cos(noise), -sin(noise), sin(noise), cos(noise));
+    
+    float world_radius = max(u_radius, 0.001);
+    float falloff_sq = -1.0 / (world_radius * world_radius);
+    float horizon_threshold = 0.05;
+    
+    float obscurance_sum = 0.0;
+    float weight_sum = 0.0;
     
     for (int i = 0; i < 16; i++) {
-        float angle = float(i) * angle_step + noise_angle;
-        // Vary radius per sample
-        float r = u_radius * (0.3 + 0.7 * rand(vec2(float(i) * 0.1, v_uv.x)));
-        vec2 offset = vec2(cos(angle), sin(angle)) * r;
+        vec2 sample_offset = (rot * SAMPLE_DISK[i]) * world_radius;
+        sample_offset.x *= u_tex_size.y / u_tex_size.x;
         
-        // Aspect ratio correction
-        offset.x *= u_tex_size.y / u_tex_size.x;
+        vec2 sample_uv = v_uv + sample_offset;
+        if (sample_uv.x < 0.0 || sample_uv.x > 1.0 || sample_uv.y < 0.0 || sample_uv.y > 1.0)
+            continue;
         
-        vec2 sample_uv = v_uv + offset;
-        if (sample_uv.x < 0.0 || sample_uv.x > 1.0 ||
-            sample_uv.y < 0.0 || sample_uv.y > 1.0) continue;
+        vec3 hit_pos = get_view_pos(sample_uv);
+        vec3 hit_delta = hit_pos - pos_c;
+        float len_sq = dot(hit_delta, hit_delta);
+        float dist = sqrt(max(len_sq, 0.00001));
         
-        float sample_depth = texture(u_depth, sample_uv).r;
-        float sample_z = linearize_depth(sample_depth);
+        float NdotD = dot(-normal, hit_delta) / dist;
+        float falloff_mult = max(0.0, len_sq * falloff_sq + 1.0);
+        float obscurance = max(0.0, NdotD - horizon_threshold) * falloff_mult;
         
-        // If sample is closer to the camera than center (sample_z < center_z), it blocks light
-        float occluded = step(sample_z, center_z - 0.001);
+        float reduce = max(0.0, hit_delta.z);
+        float halo_weight = clamp(reduce * (-1.0 / world_radius) + 2.0, 0.0, 1.0);
+        float weight = 0.6 * halo_weight + 0.4;
         
-        // Range check: prevent halos across large depth discontinuities
-        // (e.g., don't let background occlude foreground character)
-        float range_check = smoothstep(u_radius * 3.0, 0.0, abs(center_z - sample_z));
-        
-        // Normal-aware weight: prefer samples in the hemisphere facing the normal
-        // This prevents flat surfaces from self-occluding
-        vec3 sample_pos = get_view_pos(sample_uv);
-        vec3 to_sample = normalize(sample_pos - pos_c);
-        float normal_weight = clamp(dot(normal, to_sample) + 0.5, 0.0, 1.0);
-        
-        occlusion += occluded * range_check * normal_weight;
+        obscurance_sum += obscurance * weight;
+        weight_sum += weight;
     }
     
-    float ao = 1.0 - (occlusion / float(samples)) * u_intensity;
-    ao = clamp(ao, 0.0, 1.0);
-    
-    // Gamma correction pass to keep AO looking natural
-    ao = pow(ao, 0.8);
-    
+    float ao = 1.0;
+    if (weight_sum > 0.001) {
+        float avg_obscurance = obscurance_sum / weight_sum;
+        ao = clamp(1.0 - avg_obscurance * u_intensity * 2.2, 0.0, 1.0);
+    }
+    ao = pow(ao, 0.9);
     FragColor = vec4(ao, ao, ao, 1.0);
 }
 )GLSL";
 
 
-// ----- Gaussian Blur (separable, for SSAO smoothing) -----
+// ----- Godot 4 Cross-Bilateral Depth-Aware Blur Filter -----
+// Preserves depth edges when blurring SSAO, and provides 9-tap Gaussian/Tent for Bloom.
 static const char* FRAG_BLUR = R"GLSL(
-#version 330
+#version 430 core
 uniform sampler2D u_tex;
-uniform vec2 u_direction;   // (1/w, 0) for horizontal, (0, 1/h) for vertical
+uniform sampler2D u_depth;
+uniform vec2  u_direction;     // step direction in UV space
+uniform float u_use_depth;     // 1.0 = depth-aware cross bilateral, 0.0 = gaussian/tent
+uniform float u_near_plane;
+uniform float u_far_plane;
+
 in vec2 v_uv;
 out vec4 FragColor;
+
+float linearize_depth(float d) {
+    float n = (u_near_plane > 0.1) ? u_near_plane : 50.0;
+    float f = (u_far_plane > 100.0) ? u_far_plane : 20000.0;
+    return (2.0 * n) / (f + n - d * (f - n));
+}
+
+const float WEIGHTS[5] = float[](0.2270, 0.1945, 0.1216, 0.0540, 0.0162);
+
 void main() {
-    vec4 col = vec4(0.0);
-    // 9-tap Gaussian kernel
-    col += texture(u_tex, v_uv - 4.0 * u_direction) * 0.0162;
-    col += texture(u_tex, v_uv - 3.0 * u_direction) * 0.0540;
-    col += texture(u_tex, v_uv - 2.0 * u_direction) * 0.1216;
-    col += texture(u_tex, v_uv - 1.0 * u_direction) * 0.1945;
-    col += texture(u_tex, v_uv)                      * 0.2270;
-    col += texture(u_tex, v_uv + 1.0 * u_direction) * 0.1945;
-    col += texture(u_tex, v_uv + 2.0 * u_direction) * 0.1216;
-    col += texture(u_tex, v_uv + 3.0 * u_direction) * 0.0540;
-    col += texture(u_tex, v_uv + 4.0 * u_direction) * 0.0162;
-    FragColor = col;
+    if (u_use_depth > 0.5) {
+        float center_d = linearize_depth(texture(u_depth, v_uv).r);
+        vec4 accum_col = texture(u_tex, v_uv) * WEIGHTS[0];
+        float total_weight = WEIGHTS[0];
+        
+        for (int i = 1; i <= 4; i++) {
+            float spatial_w = WEIGHTS[i];
+            vec2 off = u_direction * float(i);
+            
+            // Positive tap
+            vec2 uv_pos = v_uv + off;
+            float d_pos = linearize_depth(texture(u_depth, uv_pos).r);
+            float range_w_pos = exp(-abs(d_pos - center_d) * 120.0);
+            float w_pos = spatial_w * range_w_pos;
+            accum_col += texture(u_tex, uv_pos) * w_pos;
+            total_weight += w_pos;
+            
+            // Negative tap
+            vec2 uv_neg = v_uv - off;
+            float d_neg = linearize_depth(texture(u_depth, uv_neg).r);
+            float range_w_neg = exp(-abs(d_neg - center_d) * 120.0);
+            float w_neg = spatial_w * range_w_neg;
+            accum_col += texture(u_tex, uv_neg) * w_neg;
+            total_weight += w_neg;
+        }
+        FragColor = accum_col / max(total_weight, 0.0001);
+    } else {
+        vec4 col = texture(u_tex, v_uv) * WEIGHTS[0];
+        for (int i = 1; i <= 4; i++) {
+            vec2 off = u_direction * float(i);
+            col += texture(u_tex, v_uv + off) * WEIGHTS[i];
+            col += texture(u_tex, v_uv - off) * WEIGHTS[i];
+        }
+        FragColor = col;
+    }
 }
 )GLSL";
 
-// ----- Bloom: extract bright areas -----
+
+// ----- Godot 4 13-Tap Dual-Kawase Downsampling with Karis Average -----
+// Eliminates subpixel aliasing and fireflies using Brian Karis (UE4) weighting.
+//
+// The bloom key is the game's OWN authored emitter palette rather than a
+// luminance cutoff: see src/shaders/graphics/bloom_extract.glsl for the full
+// rationale and the measured numbers behind every constant below. THIS COPY MUST
+// STAY IN STEP WITH THAT FILE - it is the fallback used when the shader file is
+// missing from the install, and a divergent copy is a silent behaviour change.
 static const char* FRAG_BLOOM_EXTRACT = R"GLSL(
-#version 330
+#version 430 core
 uniform sampler2D u_tex;
-uniform float u_threshold;
+uniform float u_threshold;        // luminance cutoff; legacy path only
+uniform vec2  u_tex_size;
+
+// --- authored-emitter key, uploaded from BiomeTable::kEmitterPalette ---------
+uniform float u_emitter_keyed;    // 0 = luminance only, 1 = authored-emitter key
+uniform int   u_emitter_count;
+uniform vec3  u_emitter[4];
+uniform float u_emitter_luma;     // level floor                 (default 0.16)
+uniform float u_emitter_sat;      // saturation floor, fraction  (default 0.75)
+uniform float u_emitter_contrast; // local-contrast ratio floor  (default 1.12)
+uniform float u_emitter_gain;     // weight scale                (default 1.60)
+
 in vec2 v_uv;
 out vec4 FragColor;
+
+// Hue window: full weight inside HI (11.5 deg of an authored emitter), nothing
+// beyond LO (18 deg). 8-bit ceiling: at or above CLIP a channel has clipped and
+// its hue is gone.
+const float EMITTER_HUE_LO = 0.95;
+const float EMITTER_HUE_HI = 0.98;
+const float EMITTER_CLIP_LO = 0.98;
+const float EMITTER_LEVEL_KNEE = 0.10;
+const float EMITTER_CONTRAST_KNEE = 0.35;
+const float EMITTER_SAT_KNEE = 0.08;
+
+float luma709(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 chroma_dir(vec3 c, out float strength) {
+    float m = max(max(c.r, c.g), c.b);
+    if (m < 1e-5) { strength = 0.0; return vec3(0.0); }
+    vec3 n = max(c, vec3(0.0)) / m;
+    vec3 v = n - vec3(dot(n, vec3(0.299, 0.587, 0.114)));
+    strength = length(v);
+    if (strength < 1e-5) { return vec3(0.0); }
+    return v / strength;
+}
+
+vec2 emitter_match(vec3 col) {
+    float cand_strength;
+    vec3 cand = chroma_dir(col, cand_strength);
+    if (cand_strength < 1e-4) return vec2(0.0);
+
+    float best_hue = 0.0;
+    float best_sat = 0.0;
+    for (int i = 0; i < 4; i++) {
+        if (i >= u_emitter_count) break;
+        float ref_strength;
+        vec3 ref = chroma_dir(u_emitter[i], ref_strength);
+        if (ref_strength < 1e-4) continue;
+        float hue = dot(cand, ref);
+        if (hue > best_hue) {
+            best_hue = hue;
+            best_sat = cand_strength / ref_strength;
+        }
+    }
+    return vec2(best_hue, best_sat);
+}
+
+float emitter_weight(vec3 col, float local_luma) {
+    float l = luma709(col);
+
+    float ratio = l / max(local_luma, 1e-3);
+    float contrast = smoothstep(u_emitter_contrast,
+                                u_emitter_contrast + EMITTER_CONTRAST_KNEE, ratio);
+    if (contrast <= 0.0) return 0.0;
+
+    float level = smoothstep(u_emitter_luma, u_emitter_luma + EMITTER_LEVEL_KNEE, l);
+    float hue_path = 0.0;
+    if (level > 0.0) {
+        vec2 m = emitter_match(col);
+        float hue = smoothstep(EMITTER_HUE_LO, EMITTER_HUE_HI, m.x);
+        float sat = smoothstep(u_emitter_sat - EMITTER_SAT_KNEE,
+                               u_emitter_sat + 0.02, m.y);
+        hue_path = level * hue * sat;
+    }
+
+    float mx = max(max(col.r, col.g), col.b);
+    float clip = smoothstep(EMITTER_CLIP_LO, 1.0, mx);
+
+    return clamp(max(hue_path, clip) * contrast * u_emitter_gain, 0.0, 1.0);
+}
+
+float karis_weight(vec3 c) {
+    float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    return 1.0 / (1.0 + luma);
+}
+
+vec3 threshold_sample(vec3 col, float thresh) {
+    float luma = luma709(col);
+    float knee = max(thresh * 0.5, 0.001);
+    float soft = clamp((luma - thresh + knee) / (2.0 * knee), 0.0, 1.0);
+    soft = soft * soft;
+    float factor = max(soft, step(thresh, luma));
+    return col * factor;
+}
+
+vec3 emitter_sample(vec3 col, float local_luma) {
+    return col * emitter_weight(col, local_luma);
+}
+
 void main() {
-    vec3 col = texture(u_tex, v_uv).rgb;
-    float brightness = dot(col, vec3(0.2126, 0.7152, 0.0722));
-    // Soft knee extraction — smoother than hard cutoff
-    float knee = max(0.0, brightness - u_threshold) / max(brightness, 0.001);
-    FragColor = vec4(col * knee, 1.0);
+    vec2 px = 1.0 / max(u_tex_size, vec2(1.0));
+    
+    // 13-tap Dual-Kawase / Jimenez layout (Jimenez 2014, Godot 4 blur_raster.glsl)
+    // 4 inner diagonal samples
+    vec3 d = texture(u_tex, v_uv + vec2(-0.5, -0.5) * px).rgb;
+    vec3 e = texture(u_tex, v_uv + vec2( 0.5, -0.5) * px).rgb;
+    vec3 i = texture(u_tex, v_uv + vec2(-0.5,  0.5) * px).rgb;
+    vec3 j = texture(u_tex, v_uv + vec2( 0.5,  0.5) * px).rgb;
+    
+    // 4 outer corner samples
+    vec3 a = texture(u_tex, v_uv + vec2(-1.0, -1.0) * px).rgb;
+    vec3 c = texture(u_tex, v_uv + vec2( 1.0, -1.0) * px).rgb;
+    vec3 k = texture(u_tex, v_uv + vec2(-1.0,  1.0) * px).rgb;
+    vec3 m = texture(u_tex, v_uv + vec2( 1.0,  1.0) * px).rgb;
+    
+    // 4 cross axis samples
+    vec3 b = texture(u_tex, v_uv + vec2( 0.0, -1.0) * px).rgb;
+    vec3 f = texture(u_tex, v_uv + vec2(-1.0,  0.0) * px).rgb;
+    vec3 g = texture(u_tex, v_uv).rgb;
+    vec3 h = texture(u_tex, v_uv + vec2( 1.0,  0.0) * px).rgb;
+    vec3 l = texture(u_tex, v_uv + vec2( 0.0,  1.0) * px).rgb;
+    
+    // Local mean over the whole 13-tap footprint.
+    float local_luma = luma709(a + b + c + d + e + f + g + h + i + j + k + l + m) / 13.0;
+
+    // Threshold each individual box
+    vec3 box0 = (d + e + i + j) * 0.25;
+    vec3 box1 = (a + b + g + f) * 0.25;
+    vec3 box2 = (b + c + h + g) * 0.25;
+    vec3 box3 = (f + g + l + k) * 0.25;
+    vec3 box4 = (g + h + m + l) * 0.25;
+
+    if (u_emitter_keyed > 0.5) {
+        box0 = emitter_sample(box0, local_luma);
+        box1 = emitter_sample(box1, local_luma);
+        box2 = emitter_sample(box2, local_luma);
+        box3 = emitter_sample(box3, local_luma);
+        box4 = emitter_sample(box4, local_luma);
+    } else {
+        box0 = threshold_sample(box0, u_threshold);
+        box1 = threshold_sample(box1, u_threshold);
+        box2 = threshold_sample(box2, u_threshold);
+        box3 = threshold_sample(box3, u_threshold);
+        box4 = threshold_sample(box4, u_threshold);
+    }
+    
+    // Karis weighted combination
+    float w0 = 0.5   * karis_weight(box0);
+    float w1 = 0.125 * karis_weight(box1);
+    float w2 = 0.125 * karis_weight(box2);
+    float w3 = 0.125 * karis_weight(box3);
+    float w4 = 0.125 * karis_weight(box4);
+    
+    vec3 bloom = (box0 * w0 + box1 * w1 + box2 * w2 + box3 * w3 + box4 * w4) / (w0 + w1 + w2 + w3 + w4 + 0.0001);
+    FragColor = vec4(bloom, 1.0);
 }
 )GLSL";
 
 // ----- Composite: scene + AO + god rays + bloom + shadows -----
 static const char* FRAG_COMPOSITE = R"GLSL(
-#version 330
+#version 430 core
 uniform sampler2D u_scene;      // original scene
 uniform sampler2D u_ao;         // SSAO result (grayscale)
 uniform sampler2D u_godrays;    // god rays (additive light)
@@ -745,6 +1005,11 @@ uniform mat4  u_projection;      // current projection matrix
 uniform float u_pbr_enabled;          // 0 or 1
 uniform float u_reflections_enabled;  // 0 or 1
 uniform float u_reflection_intensity; // 0-1
+// Authoritative water colour for the CURRENT biome, straight from
+// scene_v3_biomes.json (BiomeEntry::waterSurface). u_water_valid is 0 when the
+// biome has no water or could not be resolved.
+uniform vec3  u_water_surface;
+uniform float u_water_valid;
 uniform float u_time;                 // animated ripples
 uniform float u_ui_pass;              // 0 or 1 (bypasses postfx for UI)
 
@@ -812,6 +1077,32 @@ struct Material {
     vec3 F0;
 };
 
+// --- Water identification ----------------------------------------------------
+// The game's water is NOT blue, and the old test assumed it was.
+//
+// scene_v3_biomes.json records the water colour per biome. Grasslands and Cave
+// are RGB(0.000, 0.376, 0.256) - GREENER than they are blue - and Fire's water is
+// lava at RGB(0.800, 0.200, 0.000). The previous test was
+//     color.b > 0.45 && color.g > 0.25 && color.r < 0.35
+// i.e. "clearly blue", which the real palette fails outright on b
+// (0.376 < 0.45), so reflections never engaged on real water at all. It is also
+// worse than a no-op: the foliage rule below requires g > b * 1.15, and
+// (0.000, 0.376, 0.256) satisfies that (0.376 > 0.294), so actual water was being
+// classified as GRASS and received subsurface scattering instead of a reflection.
+//
+// Match the biome's recorded chroma when we have one, and only fall back to the
+// blue heuristic when no biome is known. Chroma rather than absolute level,
+// because a liquid's brightness swings with depth, lighting and what is behind
+// it, while its hue is what identifies it.
+bool is_water_chroma(vec3 c) {
+    if (u_water_valid > 0.5) {
+        vec3 a = normalize(max(c, vec3(0.0)) + vec3(1e-4));
+        vec3 b = normalize(max(u_water_surface, vec3(0.0)) + vec3(1e-4));
+        return dot(a, b) > 0.93;
+    }
+    return (c.b > 0.45 && c.g > 0.25 && c.r < 0.35);
+}
+
 Material get_material(vec3 color, float depth) {
     Material mat;
     mat.id = 0;
@@ -824,8 +1115,14 @@ Material get_material(vec3 color, float depth) {
         return mat; // Sky/Background
     }
     
-    // 1. Water (Cyan-blue signature)
-    if (color.b > 0.45 && color.g > 0.25 && color.r < 0.35) {
+    // 1. Water / lava, from the biome's recorded colour when available.
+    if (is_water_chroma(color)) {
+        if (u_water_valid > 0.5 && u_water_surface.r > u_water_surface.b) {
+            mat.id = 2;              // Fire biome: its water IS lava.
+            mat.emissive = 1.0;
+            mat.roughness = 1.0;
+            return mat;
+        }
         mat.id = 1;
         mat.roughness = 0.08;
         mat.metalness = 0.1;
@@ -833,24 +1130,45 @@ Material get_material(vec3 color, float depth) {
         return mat;
     }
     
-    // 2. Lava / Fire (Highly emissive red-orange)
-    if (color.r > 0.80 && color.g > 0.22 && color.b < 0.20) {
+    // 2-4. Warm emitters and lava, matched against MEASURED anchors.
+    //
+    // KEEP IN STEP with the same block in src/shaders/graphics/composite.glsl.
+    // This is the embedded fallback used when the shader file cannot be read;
+    // editing only the .glsl leaves the two disagreeing, and the fallback is
+    // exactly the path taken on a broken install where nobody is looking.
+    //
+    // The previous thresholds here were invented and both were measurably wrong
+    // against the palette in scene_v3_biomes.json:
+    //   * `r > 0.80` is STRICT and Fire's real lava is exactly 0.800, so the
+    //     lava rule never fired; `g > 0.22` excluded its 0.200 as well.
+    //   * the "gold" rule matched NOTHING in the vanilla palette - the torch
+    //     emitter (1.000, 0.480, 0.000) missed `g > 0.50` by 0.02.
+    // Re-derive the anchor values with tools/scene_material_report.cpp.
+    vec3 lava_chroma    = normalize(vec3(0.800, 0.200, 0.000) + vec3(1e-4));
+    vec3 torch_chroma   = normalize(vec3(1.000, 0.480, 0.000) + vec3(1e-4));
+    vec3 lantern_chroma = normalize(vec3(1.000, 0.850, 0.500) + vec3(1e-4));
+    vec3 c_chroma       = normalize(max(color, vec3(0.0)) + vec3(1e-4));
+
+    if (dot(c_chroma, lava_chroma) > 0.995) {   // 0.995 ~ 5.7 deg
         mat.id = 2;
         mat.emissive = 1.0;
         mat.roughness = 1.0;
         return mat;
     }
-    
-    // 3. Gold / Coins / Key objects (Yellowish reflection)
-    if (color.r > 0.70 && color.g > 0.50 && color.b < 0.30) {
+
+    if (dot(c_chroma, torch_chroma) > 0.99 || dot(c_chroma, lantern_chroma) > 0.99) {
+        // The warm point emitters the game actually uses. Named for what the
+        // data supports rather than "gold" - the palette contains no gold.
         mat.id = 3;
-        mat.roughness = 0.18;
-        mat.metalness = 0.95;
+        mat.roughness = 0.32;
+        mat.metalness = 0.55;
         mat.F0 = color; // reflect base color
         return mat;
     }
-    
+
     // 4. Foliage / Grass (Green tone classification)
+    // Real water RGB(0.000, 0.376, 0.256) also satisfies this; it is only
+    // correct because is_water_chroma() returns earlier. Do not reorder.
     if (color.g > color.r * 1.15 && color.g > color.b * 1.15 && color.g > 0.20) {
         mat.id = 4;
         mat.roughness = 0.85;
@@ -1010,7 +1328,7 @@ vec3 compute_water_reflection(vec3 current_scene, float depth, vec3 color) {
     for (float offset = 0.002; offset < 0.12; offset += 0.004) {
         vec2 sample_uv = v_uv + vec2(0.0, offset);
         vec3 c = texture(u_scene, sample_uv).rgb;
-        bool is_still_water = (c.b > 0.45 && c.g > 0.25 && c.r < 0.35);
+        bool is_still_water = is_water_chroma(c);
         if (!is_still_water) {
             water_level = sample_uv.y;
             break;
@@ -1032,6 +1350,16 @@ vec3 compute_water_reflection(vec3 current_scene, float depth, vec3 color) {
     float reflection_blend = u_reflection_intensity * shoreline_dist;
     
     return mix(current_scene, reflected_color, reflection_blend);
+}
+
+// ACES Filmic Tonemapping (Narkowicz 2015)
+vec3 ACESFilm(vec3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
 void main() {
@@ -1125,15 +1453,12 @@ void main() {
         scene += bloom * u_bloom_intensity * boost;
     }
     
-    // --- Highlight compression (SDR friendly) ---
-    // Preserves white point at 1.0, boosts midtones, and rolls off values > 1.0 safely
-    scene = scene * 1.12 / (1.0 + scene * 0.12);
+    // --- ACES Filmic Tonemapping & Highlight Rolloff ---
+    scene = ACESFilm(scene * 1.06);
     
-    // --- Saturation boost ---
+    // --- Saturation & Vibrance Tuning ---
     float luma2 = dot(scene, vec3(0.2126, 0.7152, 0.0722));
-    scene = mix(vec3(luma2), scene, 1.12);
-    
-    // No more harsh smoothstep crushing blacks
+    scene = mix(vec3(luma2), scene, 1.08);
     
     FragColor = vec4(clamp(scene, 0.0, 1.0), 1.0);
 }
@@ -1144,7 +1469,7 @@ void main() {
 // Based on AMD FidelityFX Super Resolution 1.0
 // 12-tap filter with edge detection for sharp, artifact-free upscaling
 static const char* FRAG_FSR = R"GLSL(
-#version 330
+#version 430 core
 uniform sampler2D u_tex;
 uniform vec2 u_tex_size;   // input texture resolution
 uniform vec2 u_out_size;   // output resolution
@@ -1229,6 +1554,37 @@ void main() {
 
 // ======================= SHADER HELPERS =======================
 
+static std::string load_shader_source(const std::string& filename, const char* default_src) {
+    // Check multiple candidate locations:
+    // 1. src/shaders/ subdirectories (graphics, postfx, core, common)
+    // 2. src/shaders/ root
+    // 3. User data path
+    std::string candidate_paths[] = {
+        "src/shaders/graphics/" + filename,
+        "src/shaders/postfx/" + filename,
+        "src/shaders/core/" + filename,
+        "src/shaders/common/" + filename,
+        "src/shaders/" + filename,
+        get_data_path("shaders/" + filename),
+        get_data_path("src/shaders/" + filename)
+    };
+    for (const auto& path : candidate_paths) {
+        if (!path.empty() && std::filesystem::exists(path)) {
+            std::ifstream f(path);
+            if (f.is_open()) {
+                std::stringstream ss;
+                ss << f.rdbuf();
+                std::string content = ss.str();
+                if (!content.empty()) {
+                    std::cout << "[FBO] Loaded external shader: " << path << std::endl;
+                    return content;
+                }
+            }
+        }
+    }
+    return std::string(default_src);
+}
+
 static GLuint compile_shader(GLenum type, const char* src) {
     GLuint sh = glCreateShader(type);
     glShaderSource(sh, 1, &src, nullptr);
@@ -1245,10 +1601,22 @@ static GLuint compile_shader(GLenum type, const char* src) {
     return sh;
 }
 
-static GLuint link_program(const char* vert, const char* frag) {
+static GLuint link_program(const char* vert, const char* frag, const char* fallback_vert = nullptr, const char* fallback_frag = nullptr) {
     GLuint vs = compile_shader(GL_VERTEX_SHADER, vert);
+    if (!vs && fallback_vert && fallback_vert != vert) {
+        std::cerr << "[FBO] External vertex shader failed, falling back to embedded default..." << std::endl;
+        vs = compile_shader(GL_VERTEX_SHADER, fallback_vert);
+    }
     GLuint fs = compile_shader(GL_FRAGMENT_SHADER, frag);
-    if (!vs || !fs) return 0;
+    if (!fs && fallback_frag && fallback_frag != frag) {
+        std::cerr << "[FBO] External fragment shader failed, falling back to embedded default..." << std::endl;
+        fs = compile_shader(GL_FRAGMENT_SHADER, fallback_frag);
+    }
+    if (!vs || !fs) {
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+        return 0;
+    }
     GLuint prog = glCreateProgram();
     glAttachShader(prog, vs);
     glAttachShader(prog, fs);
@@ -1270,18 +1638,19 @@ static GLuint link_program(const char* vert, const char* frag) {
 }
 
 static GLuint get_program(FBOScale mode) {
+    std::string vert_src = load_shader_source("quad.vert", VERT_SRC);
     switch (mode) {
         case FBOScale::NEAREST:
-            if (!g_prog_nearest) g_prog_nearest = link_program(VERT_SRC, FRAG_NEAREST);
+            if (!g_prog_nearest) g_prog_nearest = link_program(vert_src.c_str(), load_shader_source("nearest.glsl", FRAG_NEAREST).c_str(), VERT_SRC, FRAG_NEAREST);
             return g_prog_nearest;
         case FBOScale::CRT_SCANLINE:
-            if (!g_prog_crt) g_prog_crt = link_program(VERT_SRC, FRAG_CRT);
+            if (!g_prog_crt) g_prog_crt = link_program(vert_src.c_str(), load_shader_source("crt.glsl", FRAG_CRT).c_str(), VERT_SRC, FRAG_CRT);
             return g_prog_crt;
         case FBOScale::FSR:
-            if (!g_prog_fsr) g_prog_fsr = link_program(VERT_SRC, FRAG_FSR);
+            if (!g_prog_fsr) g_prog_fsr = link_program(vert_src.c_str(), load_shader_source("fsr.glsl", FRAG_FSR).c_str(), VERT_SRC, FRAG_FSR);
             return g_prog_fsr;
         default:
-            if (!g_prog_sharp) g_prog_sharp = link_program(VERT_SRC, FRAG_SHARP_BILINEAR);
+            if (!g_prog_sharp) g_prog_sharp = link_program(vert_src.c_str(), load_shader_source("sharp.glsl", FRAG_SHARP_BILINEAR).c_str(), VERT_SRC, FRAG_SHARP_BILINEAR);
             return g_prog_sharp;
     }
 }
@@ -1394,15 +1763,16 @@ bool fbo_init(int game_w, int game_h) {
         std::cerr << "[FBO] Bloom FBO B incomplete" << std::endl;
     }
 
-    // --- Pre-compile shaders ---
-    g_prog_sharp     = link_program(VERT_SRC, FRAG_SHARP_BILINEAR);
-    g_prog_postfx    = link_program(VERT_SRC, FRAG_POSTFX);
-    g_prog_godrays   = link_program(VERT_SRC, FRAG_GODRAYS);
-    g_prog_ssao      = link_program(VERT_SRC, FRAG_SSAO);
-    g_prog_blur      = link_program(VERT_SRC, FRAG_BLUR);
-    g_prog_composite = link_program(VERT_SRC, FRAG_COMPOSITE);
-    g_prog_bloom_extract = link_program(VERT_SRC, FRAG_BLOOM_EXTRACT);
-    g_prog_portal    = link_program(VERT_PORTAL, FRAG_PORTAL);
+    // --- Pre-compile shaders (with external file overrides) ---
+    std::string vert_src = load_shader_source("quad.vert", VERT_SRC);
+    g_prog_sharp     = link_program(vert_src.c_str(), load_shader_source("sharp.glsl", FRAG_SHARP_BILINEAR).c_str(), VERT_SRC, FRAG_SHARP_BILINEAR);
+    g_prog_postfx    = link_program(vert_src.c_str(), load_shader_source("postfx.glsl", FRAG_POSTFX).c_str(), VERT_SRC, FRAG_POSTFX);
+    g_prog_godrays   = link_program(vert_src.c_str(), load_shader_source("godrays.glsl", FRAG_GODRAYS).c_str(), VERT_SRC, FRAG_GODRAYS);
+    g_prog_ssao      = link_program(vert_src.c_str(), load_shader_source("ssao.glsl", FRAG_SSAO).c_str(), VERT_SRC, FRAG_SSAO);
+    g_prog_blur      = link_program(vert_src.c_str(), load_shader_source("blur.glsl", FRAG_BLUR).c_str(), VERT_SRC, FRAG_BLUR);
+    g_prog_composite = link_program(vert_src.c_str(), load_shader_source("composite.glsl", FRAG_COMPOSITE).c_str(), VERT_SRC, FRAG_COMPOSITE);
+    g_prog_bloom_extract = link_program(vert_src.c_str(), load_shader_source("bloom_extract.glsl", FRAG_BLOOM_EXTRACT).c_str(), VERT_SRC, FRAG_BLOOM_EXTRACT);
+    g_prog_portal    = link_program(load_shader_source("portal.vert", VERT_PORTAL).c_str(), load_shader_source("portal.glsl", FRAG_PORTAL).c_str(), VERT_PORTAL, FRAG_PORTAL);
     if (g_prog_portal) {
         std::cout << "[FBO] Portal shader compiled OK (program=" << g_prog_portal << ")" << std::endl;
     } else {
@@ -1420,8 +1790,12 @@ bool fbo_init(int game_w, int game_h) {
         loc_ssao_far_plane  = glGetUniformLocation(g_prog_ssao, "u_far_plane");
     }
     if (g_prog_blur) {
-        loc_blur_tex       = glGetUniformLocation(g_prog_blur, "u_tex");
-        loc_blur_direction = glGetUniformLocation(g_prog_blur, "u_direction");
+        loc_blur_tex        = glGetUniformLocation(g_prog_blur, "u_tex");
+        loc_blur_depth      = glGetUniformLocation(g_prog_blur, "u_depth");
+        loc_blur_direction  = glGetUniformLocation(g_prog_blur, "u_direction");
+        loc_blur_use_depth  = glGetUniformLocation(g_prog_blur, "u_use_depth");
+        loc_blur_near_plane = glGetUniformLocation(g_prog_blur, "u_near_plane");
+        loc_blur_far_plane  = glGetUniformLocation(g_prog_blur, "u_far_plane");
     }
     if (g_prog_godrays) {
         loc_godrays_tex       = glGetUniformLocation(g_prog_godrays, "u_tex");
@@ -1431,10 +1805,22 @@ bool fbo_init(int game_w, int game_h) {
         loc_godrays_decay     = glGetUniformLocation(g_prog_godrays, "u_decay");
         loc_godrays_density   = glGetUniformLocation(g_prog_godrays, "u_density");
         loc_godrays_exposure  = glGetUniformLocation(g_prog_godrays, "u_exposure");
+        loc_godrays_tex_size  = glGetUniformLocation(g_prog_godrays, "u_tex_size");
+        loc_godrays_time      = glGetUniformLocation(g_prog_godrays, "u_time");
+        loc_godrays_near      = glGetUniformLocation(g_prog_godrays, "u_near");
+        loc_godrays_far       = glGetUniformLocation(g_prog_godrays, "u_far");
     }
     if (g_prog_bloom_extract) {
         loc_bloom_extract_tex       = glGetUniformLocation(g_prog_bloom_extract, "u_tex");
         loc_bloom_extract_threshold = glGetUniformLocation(g_prog_bloom_extract, "u_threshold");
+        loc_bloom_extract_tex_size  = glGetUniformLocation(g_prog_bloom_extract, "u_tex_size");
+        loc_bloom_extract_emitter_keyed    = glGetUniformLocation(g_prog_bloom_extract, "u_emitter_keyed");
+        loc_bloom_extract_emitter_count    = glGetUniformLocation(g_prog_bloom_extract, "u_emitter_count");
+        loc_bloom_extract_emitter          = glGetUniformLocation(g_prog_bloom_extract, "u_emitter[0]");
+        loc_bloom_extract_emitter_luma     = glGetUniformLocation(g_prog_bloom_extract, "u_emitter_luma");
+        loc_bloom_extract_emitter_sat      = glGetUniformLocation(g_prog_bloom_extract, "u_emitter_sat");
+        loc_bloom_extract_emitter_contrast = glGetUniformLocation(g_prog_bloom_extract, "u_emitter_contrast");
+        loc_bloom_extract_emitter_gain     = glGetUniformLocation(g_prog_bloom_extract, "u_emitter_gain");
     }
     if (g_prog_composite) {
         loc_comp_scene            = glGetUniformLocation(g_prog_composite, "u_scene");
@@ -1466,6 +1852,8 @@ bool fbo_init(int game_w, int game_h) {
         loc_comp_pbr_enabled      = glGetUniformLocation(g_prog_composite, "u_pbr_enabled");
         loc_comp_reflections_enabled = glGetUniformLocation(g_prog_composite, "u_reflections_enabled");
         loc_comp_reflection_intensity = glGetUniformLocation(g_prog_composite, "u_reflection_intensity");
+        loc_comp_water_surface = glGetUniformLocation(g_prog_composite, "u_water_surface");
+        loc_comp_water_valid   = glGetUniformLocation(g_prog_composite, "u_water_valid");
         loc_comp_time             = glGetUniformLocation(g_prog_composite, "u_time");
         loc_comp_ui_pass          = glGetUniformLocation(g_prog_composite, "u_ui_pass");
     }
@@ -1526,7 +1914,9 @@ bool fbo_init(int game_w, int game_h) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 
     g_fbo_ok = true;
-    std::cout << "[FBO] Pipeline ready: " << game_w << "x" << game_h
+    extern PostFXState g_postfx;
+    postfx_apply_boot_defaults(g_postfx);
+    std::cout << "[FBO] Pipeline ready (Boot Default: SW+ Medium, PostFX: None): " << game_w << "x" << game_h
               << " | half=" << g_half_w << "x" << g_half_h
               << " | quarter=" << g_quarter_w << "x" << g_quarter_h
               << " | depth=texture | SSAO+GodRays+Bloom+PostFX+Portal" << std::endl;
@@ -1566,6 +1956,9 @@ void fbo_begin_game() {
     glStencilMask(0xFF);
     glClearStencil(0);
     glClear(GL_STENCIL_BUFFER_BIT);
+
+    // Reset dynamic light buffer for this frame
+    LightManager::Instance().ClearFrameLights();
     
     static int begin_diag_count = 0;
     if (begin_diag_count < 5) {
@@ -1659,19 +2052,28 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         glBindTexture(GL_TEXTURE_2D, g_fbo_depth_tex);
         draw_fsq();
 
-        // Blur SSAO horizontally: half_a -> half_b (increased to 2.2f for soft feathered shadows)
+        // Blur SSAO horizontally: half_a -> half_b (depth-aware cross bilateral)
         glBindFramebuffer(GL_FRAMEBUFFER, g_half_fbo_b);
         glUseProgram(g_prog_blur);
         glUniform1i(loc_blur_tex, 0);
+        glUniform1i(loc_blur_depth, 1);
+        glUniform1f(loc_blur_use_depth, 1.0f);
+        glUniform1f(loc_blur_near_plane, 50.0f);
+        glUniform1f(loc_blur_far_plane, 20000.0f);
         glUniform2f(loc_blur_direction, 2.2f / g_half_w, 0.0f);
+        glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_half_tex_a);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_fbo_depth_tex);
         draw_fsq();
 
         // Blur SSAO vertically: half_b -> half_a
         glBindFramebuffer(GL_FRAMEBUFFER, g_half_fbo_a);
         glUniform2f(loc_blur_direction, 0.0f, 2.2f / g_half_h);
+        glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_half_tex_b);
         draw_fsq();
+        glActiveTexture(GL_TEXTURE0);
 
         ao_tex = g_half_tex_a;
     }
@@ -1690,6 +2092,10 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         glUniform1f(loc_godrays_decay, postfx->god_rays_decay);
         glUniform1f(loc_godrays_density, 1.0f);
         glUniform1f(loc_godrays_exposure, 1.0f);
+        if (loc_godrays_tex_size != -1) glUniform2f(loc_godrays_tex_size, (float)g_half_w, (float)g_half_h);
+        if (loc_godrays_time != -1)     glUniform1f(loc_godrays_time, g_postfx_time);
+        if (loc_godrays_near != -1)     glUniform1f(loc_godrays_near, 50.0f);
+        if (loc_godrays_far != -1)      glUniform1f(loc_godrays_far, 20000.0f);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
         glActiveTexture(GL_TEXTURE1);
@@ -1702,12 +2108,51 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
 
     // ======== PASS 2b: Bloom (quarter-res) ========
     if (do_bloom) {
-        // Extract bright pixels: scene -> bloom_fbo_a
+        // Extract light sources: scene -> bloom_fbo_a
         glBindFramebuffer(GL_FRAMEBUFFER, g_bloom_fbo_a);
         glViewport(0, 0, g_quarter_w, g_quarter_h);
         glUseProgram(g_prog_bloom_extract);
         glUniform1i(loc_bloom_extract_tex, 0);
         glUniform1f(loc_bloom_extract_threshold, postfx->bloom_threshold);
+        if (loc_bloom_extract_tex_size != -1) {
+            glUniform2f(loc_bloom_extract_tex_size, (float)g_quarter_w, (float)g_quarter_h);
+        }
+        // ── Authored-emitter key ────────────────────────────────────────────────
+        // The bloom key is the CURRENT biome's own point-light colours, from the
+        // same authoritative record the water pass uses. Every vanilla glow is a
+        // Point light whose colour is authored in the level, so this needs no
+        // inference: an unresolved biome contributes ZERO emitters and the key
+        // then finds nothing, rather than falling back to a different biome's
+        // palette (a wrong palette is invisible and therefore never corrected).
+        if (loc_bloom_extract_emitter_keyed != -1) {
+            const auto& eb = TextureAwareMapper::Instance().GetCurrentBiome();
+            int emitter_count = 0;
+            float emitter_buf[4 * 3] = {0.0f};
+            if (eb.valid && eb.entry != nullptr) {
+                const int bid = eb.entry->id;
+                emitter_count = swordigo::biome::EmitterCountForBiome(bid);
+                if (emitter_count > 4) emitter_count = 4;
+                for (int i = 0; i < emitter_count; ++i) {
+                    emitter_buf[i * 3 + 0] = swordigo::biome::kEmitterPalette[bid][i][0];
+                    emitter_buf[i * 3 + 1] = swordigo::biome::kEmitterPalette[bid][i][1];
+                    emitter_buf[i * 3 + 2] = swordigo::biome::kEmitterPalette[bid][i][2];
+                }
+            }
+            glUniform1f(loc_bloom_extract_emitter_keyed, postfx->bloom_emitter_key ? 1.0f : 0.0f);
+            if (loc_bloom_extract_emitter_count != -1) {
+                glUniform1i(loc_bloom_extract_emitter_count, emitter_count);
+            }
+            if (loc_bloom_extract_emitter != -1) {
+                // count 0 is not a legal uniform upload; one padded slot is, and
+                // the shader guards on u_emitter_count anyway.
+                glUniform3fv(loc_bloom_extract_emitter,
+                             emitter_count > 0 ? emitter_count : 1, emitter_buf);
+            }
+            if (loc_bloom_extract_emitter_luma != -1)     glUniform1f(loc_bloom_extract_emitter_luma, postfx->bloom_emitter_luma);
+            if (loc_bloom_extract_emitter_sat != -1)      glUniform1f(loc_bloom_extract_emitter_sat, postfx->bloom_emitter_sat);
+            if (loc_bloom_extract_emitter_contrast != -1) glUniform1f(loc_bloom_extract_emitter_contrast, postfx->bloom_emitter_contrast);
+            if (loc_bloom_extract_emitter_gain != -1)     glUniform1f(loc_bloom_extract_emitter_gain, postfx->bloom_emitter_gain);
+        }
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_fbo_tex);
         draw_fsq();
@@ -1716,7 +2161,9 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         glBindFramebuffer(GL_FRAMEBUFFER, g_bloom_fbo_b);
         glUseProgram(g_prog_blur);
         glUniform1i(loc_blur_tex, 0);
+        glUniform1f(loc_blur_use_depth, 0.0f); // Fast Gaussian/tent for bloom
         glUniform2f(loc_blur_direction, 1.2f / g_quarter_w, 0.0f);
+        glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_bloom_tex_a);
         draw_fsq();
 
@@ -1822,6 +2269,11 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
 
     // ======== PASS 3: Composite (scene * AO + god rays + bloom) at full-res ========
     if (do_composite) {
+        // Pre-blit game color buffer (including pristine UI text) to g_postfx_fbo
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_postfx_fbo);
+        glBlitFramebuffer(0, 0, g_game_w, g_game_h, 0, 0, g_game_w, g_game_h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
         glBindFramebuffer(GL_FRAMEBUFFER, g_postfx_fbo);
         glViewport(0, 0, g_game_w, g_game_h);
         glUseProgram(g_prog_composite);
@@ -1882,6 +2334,25 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         }
         if (loc_comp_reflection_intensity != -1) {
             glUniform1f(loc_comp_reflection_intensity, postfx ? postfx->reflection_intensity : 0.35f);
+        }
+        // ── Water identity, from the authoritative biome record ─────────────
+        // Without this the composite falls back to "strongly blue", which the
+        // game's actual water palette (0.0, 0.376, 0.256 - greener than blue)
+        // fails, so the reflection never engaged and real water was shaded as
+        // foliage instead. See is_water_chroma() in composite.glsl.
+        if (loc_comp_water_valid != -1 || loc_comp_water_surface != -1) {
+            const auto& wb = TextureAwareMapper::Instance().GetCurrentBiome();
+            const bool has_water = wb.valid && wb.water && wb.entry != nullptr;
+            if (loc_comp_water_surface != -1) {
+                if (has_water) glUniform3f(loc_comp_water_surface,
+                                          wb.entry->waterSurface[0],
+                                          wb.entry->waterSurface[1],
+                                          wb.entry->waterSurface[2]);
+                else           glUniform3f(loc_comp_water_surface, 0.0f, 0.0f, 0.0f);
+            }
+            if (loc_comp_water_valid != -1) {
+                glUniform1f(loc_comp_water_valid, has_water ? 1.0f : 0.0f);
+            }
         }
         if (loc_comp_time != -1) {
             glUniform1f(loc_comp_time, g_postfx_time);
@@ -1975,8 +2446,15 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
                 glUniformMatrix4fv(loc_comp_projection, 1, GL_FALSE, safe_projection);
         }
         
-        // Single composite draw — no stencil tricks (g_postfx_fbo has no stencil attachment)
+        // Hardware Stencil Isolation:
+        // Only shade 3D world pixels where stencil == 0.
+        // 2D UI / HUD / text (stencil == 1) remains untouched and razor-sharp!
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(GL_EQUAL, 0, 0xFF);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+        glStencilMask(0x00);
         draw_fsq();
+        glDisable(GL_STENCIL_TEST);
 
         final_tex = g_postfx_tex;
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -2132,6 +2610,300 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
     glBindVertexArray(saved_vao);
     glActiveTexture(saved_active_tex);
     glViewport(0, 0, win_w, win_h);
+}
+
+// ======================= DECOUPLED GRAPHICS & POSTFX =======================
+
+const char* graphics_tier_name(GraphicsTier tier) {
+    switch (tier) {
+        case GraphicsTier::LOW:          return "Low";
+        case GraphicsTier::MEDIUM:       return "Medium";
+        case GraphicsTier::HIGH:         return "High";
+        case GraphicsTier::SW_PLUS:      return "SW+";
+        case GraphicsTier::SW_PLUS_HIGH: return "SW+ High";
+        default:                         return "Custom";
+    }
+}
+
+const char* postfx_filter_name(PostEffectFilter filter) {
+    switch (filter) {
+        case PostEffectFilter::NONE:           return "None";
+        case PostEffectFilter::RETRO_TV:       return "Retro TV (CRT)";
+        case PostEffectFilter::OUTLINE_MILD:   return "Mild Outline";
+        case PostEffectFilter::OUTLINE_HEAVY:  return "Heavy Outline";
+        case PostEffectFilter::VHS_GLITCH:     return "VHS Glitch";
+        case PostEffectFilter::VIGNETTE_GRAIN: return "Vignette & Grain";
+        default:                               return "Custom";
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Boot defaults - the single source of truth for "what runs on a cold start"
+// ---------------------------------------------------------------------------
+void postfx_apply_boot_defaults(PostFXState& s) {
+    // Tier first, cosmetic filter second - the same order the F6 menu uses.
+    // graphics_apply_tier() now also neutralises the cosmetic overlays (see the
+    // header note on that function), so this pair leaves no residue from the
+    // struct's default member initialisers, and it leaves .graphics_tier and
+    // .preset_name describing the SAME state the renderer is running.
+    graphics_apply_tier(s, GraphicsTier::SW_PLUS);
+    postfx_apply_filter(s, PostEffectFilter::NONE);
+
+    s.enabled = true;
+    // The F6 modal prints these two strings, and the F3 debug panel prints
+    // preset_name. They must name the boot state, not a legacy preset enum.
+    s.preset_name = "SW+ Medium";
+    s.filter_name = "None";
+}
+
+void graphics_apply_tier(PostFXState& s, GraphicsTier tier) {
+    s.graphics_tier = tier;
+    s.preset_name = graphics_tier_name(tier);
+    s.enabled = true;
+
+    // ── Neutralise the cosmetic overlays ────────────────────────────────────
+    // These four belong to the PostEffectFilter axis, NOT to the tier axis. A
+    // tier switch must not inherit them, because postfx_apply_preset() and the
+    // filter buttons both set them, and switching tier afterwards used to leave
+    // e.g. vignette_intensity = 0.6 from the Noir preset in place while the menu
+    // displayed a clean "SW+". That is a large part of why the tier looked
+    // unexpectedly dark: a vignette of 0.3-0.6 darkens the corners and reads as
+    // "the whole setting is too dark".
+    //
+    // Callers that DO want a filter re-apply it immediately afterwards
+    // (draw_graphics_options_modal does exactly this), which is the intended
+    // composition: pick a tier, then layer a cosmetic filter on top.
+    s.vignette             = false;
+    s.vignette_intensity   = 0.30f;
+    s.film_grain           = false;
+    s.grain_intensity      = 0.06f;
+    s.chromatic_aberration = false;
+    s.ca_offset            = 0.002f;
+    s.outlines             = false;
+    s.outline_thickness    = 1.0f;
+    s.outline_intensity    = 0.70f;
+    s.outline_depth_threshold = 0.002f;
+
+    // Reset physical engine passes according to tier
+    switch (tier) {
+        case GraphicsTier::LOW:
+            s.pbr_enabled = false;
+            s.procedural_detail = false;
+            s.procedural_strength = 0.0f;
+            s.reflections_enabled = false;
+            s.ssao = false;
+            s.volumetric_light = false;
+            s.god_rays = false;
+            s.bloom = false;
+            s.shadows = false;
+            s.sharpen = false;
+            s.color_adjust = true;
+            s.warmth = 0.0f;
+            s.contrast = 1.0f;
+            s.saturation = 1.0f;
+            s.brightness = 0.0f;
+            break;
+
+        case GraphicsTier::MEDIUM:
+            s.pbr_enabled = false;
+            s.procedural_detail = true;
+            s.procedural_strength = 0.5f;
+            s.reflections_enabled = false;
+            s.ssao = true;
+            s.ssao_radius = 0.030f;
+            s.ssao_intensity = 0.70f;
+            s.volumetric_light = false;
+            s.god_rays = false;
+            s.bloom = true;
+            s.bloom_threshold = 0.85f;
+            s.bloom_intensity = 0.40f;
+            s.shadows = true;
+            s.shadow_intensity = 0.20f;
+            s.shadow_softness = 0.005f;
+            s.sharpen = true;
+            s.sharpen_strength = 0.15f;
+            s.color_adjust = true;
+            s.warmth = 0.04f;
+            s.contrast = 1.01f;
+            s.saturation = 1.05f;
+            s.brightness = 0.01f;
+            break;
+
+        case GraphicsTier::HIGH:
+            s.pbr_enabled = true;
+            s.procedural_detail = true;
+            s.procedural_strength = 0.85f;
+            s.reflections_enabled = false;
+            s.ssao = true;
+            s.ssao_radius = 0.036f;
+            s.ssao_intensity = 0.90f;
+            s.volumetric_light = true;
+            s.volumetric_intensity = 0.25f;
+            s.god_rays = true;
+            s.god_rays_intensity = 0.30f;
+            s.god_rays_decay = 0.965f;
+            s.sun_x = 0.58f;
+            s.sun_y = 1.12f;
+            s.bloom = true;
+            s.bloom_threshold = 0.82f;
+            s.bloom_intensity = 0.55f;
+            s.shadows = true;
+            s.shadow_intensity = 0.30f;
+            s.shadow_softness = 0.006f;
+            s.shadow_light_x = -0.10f;
+            s.shadow_light_y = 0.85f;
+            s.shadow_sun_z = 0.16f;
+            s.sharpen = true;
+            s.sharpen_strength = 0.20f;
+            s.color_adjust = true;
+            s.warmth = 0.06f;
+            s.contrast = 1.02f;
+            s.saturation = 1.08f;
+            s.brightness = 0.01f;
+            break;
+
+        case GraphicsTier::SW_PLUS:
+            // ── Balance note (the "SW+ is too dark" fix) ────────────────────
+            // Three multiplicative darkeners were stacking here:
+            //   * scene ambient was being REPLACED by a ~0.05 biome value
+            //     (fixed in ffp_forward.cpp - now additive)
+            //   * SSAO 1.05 and contact shadows 0.32 both subtract light, and
+            //     they overlap on the same ground/contact regions
+            //   * contrast 1.03 pushes midtones down while brightness 0.02 does
+            //     not compensate
+            // The two AO/shadow strengths are now in a range where they add
+            // depth instead of eating the image, and brightness/contrast give a
+            // small net lift. Saturation stays high: the remaster's intent is
+            // "vivid", and boosting saturation without the exposure to match is
+            // what made it read as murky rather than rich.
+            s.pbr_enabled = true;
+            s.procedural_detail = true;
+            s.procedural_strength = 1.0f;
+            s.reflections_enabled = true;
+            s.reflection_intensity = 0.35f;
+            s.ssao = true;
+            s.ssao_radius = 0.036f;
+            s.ssao_intensity = 0.75f;
+            s.volumetric_light = true;
+            s.volumetric_intensity = 0.32f;
+            s.god_rays = true;
+            s.god_rays_intensity = 0.40f;
+            s.god_rays_decay = 0.965f;
+            s.sun_x = 0.58f;
+            s.sun_y = 1.12f;
+            s.bloom = true;
+            s.bloom_threshold = 0.80f;
+            s.bloom_intensity = 0.65f;
+            s.shadows = true;
+            s.shadow_intensity = 0.22f;
+            s.shadow_softness = 0.007f;
+            s.shadow_light_x = -0.10f;
+            s.shadow_light_y = 0.85f;
+            s.shadow_sun_z = 0.16f;
+            s.sharpen = true;
+            s.sharpen_strength = 0.22f;
+            s.color_adjust = true;
+            s.warmth = 0.08f;
+            s.contrast = 1.015f;
+            s.saturation = 1.10f;
+            s.brightness = 0.045f;
+            break;
+
+        case GraphicsTier::SW_PLUS_HIGH:
+            // Same balance rationale as SW_PLUS, one notch stronger.
+            s.pbr_enabled = true;
+            s.procedural_detail = true;
+            s.procedural_strength = 1.25f;
+            s.reflections_enabled = true;
+            s.reflection_intensity = 0.50f;
+            s.ssao = true;
+            s.ssao_radius = 0.040f;
+            s.ssao_intensity = 0.90f;
+            s.volumetric_light = true;
+            s.volumetric_intensity = 0.38f;
+            s.god_rays = true;
+            s.god_rays_intensity = 0.48f;
+            s.god_rays_decay = 0.968f;
+            s.sun_x = 0.58f;
+            s.sun_y = 1.12f;
+            s.bloom = true;
+            s.bloom_threshold = 0.78f;
+            s.bloom_intensity = 0.75f;
+            s.shadows = true;
+            s.shadow_intensity = 0.25f;
+            s.shadow_softness = 0.008f;
+            s.shadow_light_x = -0.10f;
+            s.shadow_light_y = 0.85f;
+            s.shadow_sun_z = 0.18f;
+            s.sharpen = true;
+            s.sharpen_strength = 0.25f;
+            s.color_adjust = true;
+            s.warmth = 0.10f;
+            s.contrast = 1.02f;
+            s.saturation = 1.13f;
+            s.brightness = 0.05f;
+            break;
+
+        default:
+            break;
+    }
+}
+
+void postfx_apply_filter(PostFXState& s, PostEffectFilter filter, float intensity) {
+    s.postfx_filter = filter;
+    s.postfx_filter_intensity = intensity;
+    s.filter_name = postfx_filter_name(filter);
+
+    // Reset purely cosmetic overlays
+    s.vignette = false;
+    s.film_grain = false;
+    s.chromatic_aberration = false;
+    s.outlines = false;
+
+    switch (filter) {
+        case PostEffectFilter::NONE:
+            break;
+
+        case PostEffectFilter::RETRO_TV:
+            s.vignette = true;
+            s.vignette_intensity = 0.35f * intensity;
+            s.film_grain = true;
+            s.grain_intensity = 0.08f * intensity;
+            s.chromatic_aberration = true;
+            s.ca_offset = 0.0035f * intensity;
+            break;
+
+        case PostEffectFilter::OUTLINE_MILD:
+            s.outlines = true;
+            s.outline_thickness = 1.0f;
+            s.outline_intensity = 0.55f * intensity;
+            s.outline_depth_threshold = 0.0025f;
+            break;
+
+        case PostEffectFilter::OUTLINE_HEAVY:
+            s.outlines = true;
+            s.outline_thickness = 2.0f;
+            s.outline_intensity = 0.90f * intensity;
+            s.outline_depth_threshold = 0.0018f;
+            break;
+
+        case PostEffectFilter::VHS_GLITCH:
+            s.film_grain = true;
+            s.grain_intensity = 0.12f * intensity;
+            s.chromatic_aberration = true;
+            s.ca_offset = 0.005f * intensity;
+            break;
+
+        case PostEffectFilter::VIGNETTE_GRAIN:
+            s.vignette = true;
+            s.vignette_intensity = 0.30f * intensity;
+            s.film_grain = true;
+            s.grain_intensity = 0.04f * intensity;
+            break;
+
+        default:
+            break;
+    }
 }
 
 // ======================= PRESETS =======================
@@ -2425,6 +3197,12 @@ bool postfx_load_custom_json(PostFXState& state) {
         else if (key == "bloom") state.bloom = parse_bool(val_str);
         else if (key == "bloom_threshold") state.bloom_threshold = parse_float(val_str);
         else if (key == "bloom_intensity") state.bloom_intensity = parse_float(val_str);
+        // Authored-emitter bloom key (see bloom_extract.glsl).
+        else if (key == "bloom_emitter_key") state.bloom_emitter_key = parse_bool(val_str);
+        else if (key == "bloom_emitter_luma") state.bloom_emitter_luma = parse_float(val_str);
+        else if (key == "bloom_emitter_sat") state.bloom_emitter_sat = parse_float(val_str);
+        else if (key == "bloom_emitter_contrast") state.bloom_emitter_contrast = parse_float(val_str);
+        else if (key == "bloom_emitter_gain") state.bloom_emitter_gain = parse_float(val_str);
         else if (key == "shadows") state.shadows = parse_bool(val_str);
         else if (key == "shadow_intensity") state.shadow_intensity = parse_float(val_str);
         else if (key == "shadow_softness") state.shadow_softness = parse_float(val_str);
@@ -2484,8 +3262,18 @@ void postfx_save_default_json() {
         << "  // Volumetric Lighting\n"
         << "  \"volumetric_light\": false,\n"
         << "  \"volumetric_intensity\": 0.3,\n\n"
-        << "  // Bloom (glow on bright objects)\n"
+        << "  // Bloom (glow on light sources)\n"
         << "  \"bloom\": false,\n"
+        << "  // true  = bloom only genuine light sources: pixels matching one of the\n"
+        << "  //         current biome's authored emitter colours (torch, lantern pods,\n"
+        << "  //         lava) that are brighter than their own neighbourhood.\n"
+        << "  // false = the legacy single luminance threshold below, which also lets\n"
+        << "  //         flat bright surfaces (sky, ice) bloom.\n"
+        << "  \"bloom_emitter_key\": true,\n"
+        << "  \"bloom_emitter_luma\": 0.10,\n"
+        << "  \"bloom_emitter_sat\": 0.80,\n"
+        << "  \"bloom_emitter_contrast\": 1.12,\n"
+        << "  \"bloom_emitter_gain\": 1.6,\n"
         << "  \"bloom_threshold\": 0.7,\n"
         << "  \"bloom_intensity\": 0.35,\n\n"
         << "  // Screen-space Shadows\n"
@@ -2612,4 +3400,41 @@ void fbo_draw_portal_vanilla(int viewport_w, int viewport_h) {
 
 unsigned int fbo_get_fbo() {
     return g_fbo;
+}
+
+// ---------------------------------------------------------------------------
+//  F3 diagnostic for the authored-emitter bloom key  (REMOVABLE test surface)
+// ---------------------------------------------------------------------------
+//  Reports what the extract pass was actually given: the resolved biome, how
+//  many authored emitters it contributed, and their colours. This exists because
+//  the key cannot be validated by looking at a picture - a frame with no keyed
+//  pixels looks the same whether the palette was empty (biome unresolved) or the
+//  thresholds are wrong, and those need opposite fixes. Returns the emitter
+//  count; writes a one-line description into `out`.
+//
+//  Delete this function and its call site in swordfare_gui.cpp's draw_debug to
+//  remove the diagnostic; nothing else uses it.
+extern "C" int swordigo_bloom_emitter_report(char* out, int cap) {
+    if (!out || cap <= 0) return 0;
+    out[0] = '\0';
+
+    const auto& eb = TextureAwareMapper::Instance().GetCurrentBiome();
+    if (!eb.valid || eb.entry == nullptr) {
+        std::snprintf(out, size_t(cap), "no biome resolved (key finds nothing)");
+        return 0;
+    }
+    const int bid = eb.entry->id;
+    int n = swordigo::biome::EmitterCountForBiome(bid);
+    if (n > 4) n = 4;
+
+    int written = std::snprintf(out, size_t(cap), "%s x%d:",
+                                eb.entry->name ? eb.entry->name : "?", n);
+    for (int i = 0; i < n && written > 0 && written < cap; ++i) {
+        written += std::snprintf(out + written, size_t(cap - written),
+                                 " %.2f,%.2f,%.2f",
+                                 swordigo::biome::kEmitterPalette[bid][i][0],
+                                 swordigo::biome::kEmitterPalette[bid][i][1],
+                                 swordigo::biome::kEmitterPalette[bid][i][2]);
+    }
+    return n;
 }

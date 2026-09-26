@@ -82,6 +82,19 @@ bool g_sre_overlay_blocking = false;
 extern "C" uint32_t get_guest_heap_size_64();
 extern "C" uint32_t get_guest_heap_size_32();
 
+// -----------------------------------------------------------------------------
+//  F3: SRE13 texture-identity telemetry  (additive, removable)
+// -----------------------------------------------------------------------------
+//  Declared here, not through jni_bridge.h, matching the two externs above.
+//  Layout: [0] bind_calls [1] identified [2] unique_names
+//          [3] trusted    [4] rejected   [5] level_generation
+//  Delete this extern and the matching F3 block together.
+extern "C" void sre13_tex_telemetry_snapshot(uint32_t out[6]);
+// F3 diagnostic for the authored-emitter bloom key; defined in fbo_scaler.cpp.
+// REMOVABLE together with the bloom block below and the function itself.
+extern "C" int swordigo_bloom_emitter_report(char* out, int cap);
+
+
 // Weak fallback definitions for SRE Scene Shifter symbols (resolved from guest space at runtime)
 extern "C" {
     SWORDIGO_WEAK int    g_sre_scene_list_count = 0;
@@ -1128,7 +1141,14 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
         ImGuiWindowFlags_NoNav                 |
         ImGuiWindowFlags_NoSavedSettings       |
         ImGuiWindowFlags_NoFocusOnAppearing    |
-        ImGuiWindowFlags_NoBringToFrontOnFocus;
+        ImGuiWindowFlags_NoBringToFrontOnFocus |
+        // THIS OVERLAY IS FULL-SCREEN AND READ-ONLY, SO IT MUST NOT WANT INPUT.
+        // Without NoInputs ImGui sets io.WantCaptureMouse for the whole screen
+        // while F3 is up, and main.cpp's click router feeds the mouse to the HUD
+        // instead of the game - which reads as "the game is unclickable with F3
+        // open". NoInputs also removes it from keyboard capture, which is what a
+        // read-only debug readout wants.
+        ImGuiWindowFlags_NoInputs;
 
     if (!ImGui::Begin("##MinecraftF3DebugOverlay", nullptr, wflags)) {
         ImGui::End();
@@ -1392,6 +1412,54 @@ void SwordfareGUI::draw_debug(const SwordfareDebugStats& st) {
              (unsigned long)rgc.get_resource_count(),
              rgc.get_texture_count(), rgc.get_pod_count());
     draw_right(buf, IM_COL32(180, 220, 240, 255));
+
+    // ── SRE13 texture identity (REMOVABLE TEST SURFACE) ─────────────────────
+    //   Answers "does the host know which texture is bound" from measurement.
+    //   The diagnostic value is in the RELATIONSHIP between the two lines:
+    //     * identified == 0 while binds climbs  -> the Caver::Texture offsets in
+    //       sre13/hooks/texture_layout.h do not match this build. A broken
+    //       layout otherwise looks identical to a working one that found
+    //       nothing, which is why this is on F3 rather than in a log.
+    //     * unique > 0 but trusted == 0        -> the channel works but the
+    //       mapper's trust gate is refusing every name.
+    //   Delete this block, the extern above, and sre13_tex_telemetry_snapshot
+    //   once texture identity no longer needs proving.
+    {
+        uint32_t tt[6] = {0, 0, 0, 0, 0, 0};
+        sre13_tex_telemetry_snapshot(tt);
+        const uint32_t t_binds = tt[0], t_ident = tt[1], t_uniq = tt[2];
+        const uint32_t t_trust = tt[3], t_rej = tt[4], t_level = tt[5];
+
+        // Red when the channel is receiving binds but identifying none: that is
+        // the broken-offset case and it must not look like success.
+        const bool broken = (t_binds > 0u && t_ident == 0u);
+        const ImU32 col = broken ? IM_COL32(255, 90, 90, 255)
+                                 : (t_ident > 0u ? IM_COL32(150, 255, 170, 255)
+                                                 : IM_COL32(150, 150, 150, 255));
+        snprintf(buf, sizeof(buf), "TexID: %u of %u binds named", t_ident, t_binds);
+        draw_right(buf, col);
+
+        snprintf(buf, sizeof(buf), "TexID: %u distinct  L%u  gate +%u/-%u",
+                 t_uniq, t_level, t_trust, t_rej);
+        draw_right(buf, IM_COL32(180, 220, 240, 255));
+    }
+
+    // ── Authored-emitter bloom key (REMOVABLE TEST SURFACE) ─────────────
+    //   Which emitters the bloom extract is being keyed on, in the resolved
+    //   biome. "no biome resolved" is the failure that looks like success in the
+    //   picture: an empty palette and a wrong threshold both produce no bloom.
+    //   Delete this block, the extern above, and swordigo_bloom_emitter_report
+    //   in fbo_scaler.cpp when the key no longer needs proving.
+    {
+        extern PostFXState g_postfx;   // defined in the main translation unit
+        char ebuf[128];
+        swordigo_bloom_emitter_report(ebuf, sizeof(ebuf));
+        const bool keyed = g_postfx.bloom_emitter_key;
+        snprintf(buf, sizeof(buf), "Bloom key: %s", keyed ? "authored emitters" : "luma ONLY");
+        draw_right(buf, keyed ? IM_COL32(255, 200, 120, 255) : IM_COL32(255, 120, 120, 255));
+        snprintf(buf, sizeof(buf), "  %s", ebuf);
+        draw_right(buf, IM_COL32(200, 180, 140, 255));
+    }
 
     draw_right(""); // spacer
 
@@ -2869,6 +2937,184 @@ void SwordfareGUI::draw_mod_overlay(const std::string& save_dir) {
     }
 }
 
+void SwordfareGUI::draw_graphics_options_modal(PostFXState& state) {
+    if (!m_graphics_options_visible) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(760, 520), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse;
+    if (ImGui::Begin("  GRAPHICAL OPTIONS (F6)###GraphicsOptionsModal", &m_graphics_options_visible, flags)) {
+        if (ImGui::BeginTabBar("GraphicsOptionsTabs", ImGuiTabBarFlags_None)) {
+            // ==================== TAB 1: GRAPHICS PIPELINE ====================
+            if (ImGui::BeginTabItem(ICON_FA_GEAR "  Graphics Pipeline")) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "Engine Rendering Pipeline (OpenGL 4.30+ Hardware)");
+                ImGui::TextDisabled("Physical GPU passes: PBR GGX, Procedural Detail Injection (PDI), ASSAO, Volumetric Rays & Bloom.");
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::Text("Active Tier: ");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.4f, 1.0f), "%s", graphics_tier_name(state.graphics_tier));
+                ImGui::Spacing();
+
+                const char* tier_labels[] = { "Low", "Medium", "High", "SW+", "SW+ High" };
+                for (int t = 0; t < (int)GraphicsTier::COUNT; t++) {
+                    bool sel = ((int)state.graphics_tier == t);
+                    if (t > 0) ImGui::SameLine(0, 8);
+                    if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.48f, 0.24f, 1.0f));
+                    ImGui::PushID(500 + t);
+                    if (ImGui::Button(tier_labels[t], ImVec2(130, 36))) {
+                        // graphics_apply_tier() deliberately neutralises the
+                        // cosmetic overlay flags (it must not inherit, say, a
+                        // leftover Noir vignette), so re-apply the user's chosen
+                        // filter right after to preserve the two-axis
+                        // composition this modal advertises: tier x filter.
+                        graphics_apply_tier(state, (GraphicsTier)t);
+                        postfx_apply_filter(state, state.postfx_filter, state.postfx_filter_intensity);
+                    }
+                    ImGui::PopID();
+                    if (sel) ImGui::PopStyleColor();
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.3f, 1.0f), "Hardware Features & Advanced Passes:");
+
+                ImGui::Columns(2, "GfxColumns", false);
+
+                // Column 1: Core Physical Shaders & PDI
+                ImGui::Checkbox("Cook-Torrance GGX PBR", &state.pbr_enabled);
+                ImGui::Checkbox("Procedural Detail Injection (PDI)", &state.procedural_detail);
+                if (state.procedural_detail) {
+                    ImGui::SetNextItemWidth(170);
+                    ImGui::SliderFloat("PDI Strength##pdi", &state.procedural_strength, 0.0f, 2.0f, "Scale %.2f");
+                }
+                ImGui::Checkbox("Water Wave Reflections", &state.reflections_enabled);
+                if (state.reflections_enabled) {
+                    ImGui::SetNextItemWidth(170);
+                    ImGui::SliderFloat("Reflect Strength##refl", &state.reflection_intensity, 0.0f, 1.0f, "Blend %.2f");
+                }
+                ImGui::Checkbox("Contact Shadows", &state.shadows);
+                if (state.shadows) {
+                    ImGui::SetNextItemWidth(170);
+                    ImGui::SliderFloat("Shadow Darkness##shd", &state.shadow_intensity, 0.0f, 1.0f, "Dark %.2f");
+                }
+
+                ImGui::NextColumn();
+
+                // Column 2: Ambient Occlusion, Rays, Bloom
+                ImGui::Checkbox("Godot ASSAO (Ambient Occlusion)", &state.ssao);
+                if (state.ssao) {
+                    ImGui::SetNextItemWidth(170);
+                    ImGui::SliderFloat("AO Intensity##ssao_i", &state.ssao_intensity, 0.0f, 2.5f, "Inten %.2f");
+                    ImGui::SetNextItemWidth(170);
+                    ImGui::SliderFloat("AO Radius##ssao_r", &state.ssao_radius, 0.005f, 0.08f, "Radius %.3f");
+                }
+                ImGui::Checkbox("3D Volumetric God Rays (SSVR)", &state.god_rays);
+                if (state.god_rays) {
+                    ImGui::SetNextItemWidth(170);
+                    ImGui::SliderFloat("Ray Intensity##gri", &state.god_rays_intensity, 0.0f, 1.5f, "Inten %.2f");
+                }
+                ImGui::Checkbox("Dual-Kawase Bloom Pyramid", &state.bloom);
+                if (state.bloom) {
+                    ImGui::SetNextItemWidth(170);
+                    ImGui::SliderFloat("Bloom Intensity##blmi", &state.bloom_intensity, 0.0f, 1.5f, "Glow %.2f");
+
+                    // ============ BEGIN bloom-emitter-key controls ============
+                    // Removable: delete this block, the four bloom_emitter_* fields in
+                    // PostFXState, the uniform upload in fbo_scaler.cpp and the gate in
+                    // src/shaders/graphics/bloom_extract.glsl to go back to a plain
+                    // luminance cutoff for bloom. Nothing else reads any of them.
+                    ImGui::Checkbox("Key bloom to authored emitters##blmk",
+                                    &state.bloom_emitter_key);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "Bloom only the game's own light sources: the torch (1.00,0.48,0.00),\n"
+                            "this biome's lantern pods and lava (Fire), matched on the authored\n"
+                            "colour the level data records, and required to be brighter than\n"
+                            "their own neighbourhood.\n\n"
+                            "Off = the legacy single luminance cutoff, which also blooms flat\n"
+                            "bright surfaces such as sky and ice.");
+                    }
+                    if (state.bloom_emitter_key) {
+                        ImGui::SetNextItemWidth(170);
+                        ImGui::SliderFloat("Emitter Level Floor##blml", &state.bloom_emitter_luma,
+                                           0.0f, 0.6f, "Floor %.2f");
+                        ImGui::SetNextItemWidth(170);
+                        ImGui::SliderFloat("Emitter Saturation##blms", &state.bloom_emitter_sat,
+                                           0.0f, 1.5f, "Sat %.2f");
+                        ImGui::SetNextItemWidth(170);
+                        ImGui::SliderFloat("Emitter Local Contrast##blmc", &state.bloom_emitter_contrast,
+                                           1.0f, 2.0f, "Contrast %.2f");
+                        ImGui::SetNextItemWidth(170);
+                        ImGui::SliderFloat("Emitter Gain##blmg", &state.bloom_emitter_gain,
+                                           0.0f, 3.0f, "Gain %.2f");
+                    } else {
+                        ImGui::SetNextItemWidth(170);
+                        ImGui::SliderFloat("Bloom Threshold##blmt", &state.bloom_threshold, 0.5f, 1.0f, "Cutoff %.2f");
+                    }
+                    // ============= END bloom-emitter-key controls =============
+                }
+
+                ImGui::Columns(1);
+                ImGui::EndTabItem();
+            }
+
+            // ==================== TAB 2: STYLISTIC POST-EFFECTS ====================
+            if (ImGui::BeginTabItem(ICON_FA_WAND_SPARKLES "  Post-Effects")) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "Cosmetic Screen Filters (Zero Game Impact)");
+                ImGui::TextDisabled("Artistic lens overlays applied on the backbuffer irrespective of your active graphics tier.");
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::Text("Active Filter: ");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.0f, 0.85f, 1.0f, 1.0f), "%s", postfx_filter_name(state.postfx_filter));
+                ImGui::Spacing();
+
+                const char* filter_labels[] = {
+                    "None (Off)", "Retro TV (CRT)", "Mild Comic Outline",
+                    "Heavy Anime Outline", "VHS Glitch", "Vignette & Film Grain"
+                };
+
+                for (int f = 0; f < (int)PostEffectFilter::COUNT; f++) {
+                    bool sel = ((int)state.postfx_filter == f);
+                    if (f % 3 != 0) ImGui::SameLine(0, 10);
+                    if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.38f, 0.58f, 1.0f));
+                    ImGui::PushID(600 + f);
+                    if (ImGui::Button(filter_labels[f], ImVec2(228, 36))) {
+                        postfx_apply_filter(state, (PostEffectFilter)f, state.postfx_filter_intensity);
+                    }
+                    ImGui::PopID();
+                    if (sel) ImGui::PopStyleColor();
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Filter Global Parameters:");
+                ImGui::SetNextItemWidth(300);
+                if (ImGui::SliderFloat("Filter Intensity##f_inten", &state.postfx_filter_intensity, 0.0f, 2.0f, "Strength %.2f")) {
+                    postfx_apply_filter(state, state.postfx_filter, state.postfx_filter_intensity);
+                }
+
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.5f, 0.8f, 0.5f, 1.0f), ICON_FA_CIRCLE_CHECK " Post-effects blend flawlessly with Low, Medium, High, SW+, and SW+ High.");
+                ImGui::EndTabItem();
+            }
+
+            ImGui::EndTabBar();
+        }
+    }
+    ImGui::End();
+}
+
 bool SwordfareGUI::is_input_blocked(float mx, float my) {
     if (!m_initialized) return false;
     
@@ -2876,9 +3122,8 @@ bool SwordfareGUI::is_input_blocked(float mx, float my) {
     float win_w = io.DisplaySize.x;
     float win_h = io.DisplaySize.y;
 
-    // 1. The control-center toolbox owns the whole display, so any click while
-    //    it is open must be consumed by ImGui rather than passed to the game.
-    if (m_mod_overlay_visible) return true;
+    // 1. The control-center toolbox or graphics options modal owns the display
+    if (m_mod_overlay_visible || m_graphics_options_visible) return true;
 
     // 1b. The standalone Memory Research console is inset by 18px.
     if (m_research_overlay_visible) {

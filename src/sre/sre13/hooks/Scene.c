@@ -25,6 +25,41 @@ HOOK_SYMBOL(
 	}
 }
 
+HOOK_SYMBOL(
+	Scene_LoadFromFile_Hook,
+	"_ZN5Caver5Scene12LoadFromFileERKNSt6__ndk112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEE",
+	int64_t, (Scene *scene, String *filePath)
+) {
+	if (filePath) {
+		const char *s = String_get(filePath);
+		if (s && s[0]) {
+			extern char g_sre_current_scene_name[];
+			int i = 0;
+			for (; i < 127 && s[i]; ++i) g_sre_current_scene_name[i] = s[i];
+			g_sre_current_scene_name[i] = '\0';
+
+			/* Start the per-level texture-identity set from empty.
+			 *
+			 * This reset MUST happen here, in guest code, and not in the host.
+			 * The host reads the counters and the name list straight out of
+			 * guest memory - that is just data, and it is safe - but it must
+			 * never CALL into this library: the guest is ARM64 running under the
+			 * emulator, so a host call through `g_guest_memory + vaddr` executes
+			 * ARM64 bytes as host x86-64 and takes the whole process down. That
+			 * was a real SIGSEGV, not a hypothetical one. A scene load is a
+			 * guest event, so the guest does it. */
+			{
+				extern void sre_texture_reset_unique_set(void);
+				sre_texture_reset_unique_set();
+			}
+		}
+	}
+	if (orig_Scene_LoadFromFile_Hook) {
+		return orig_Scene_LoadFromFile_Hook(scene, filePath);
+	}
+	return 0;
+}
+
 G_DL_SYMBOL(
 	Scene_SetPaused,
 	"_ZN5Caver5Scene9SetPausedEb",

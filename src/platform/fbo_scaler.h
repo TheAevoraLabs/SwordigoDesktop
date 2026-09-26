@@ -15,11 +15,41 @@ enum class FBOScale : int {
     FSR            = 3,   // AMD FidelityFX Super Resolution 1.0 (EASU)
 };
 
-// Post-processing effects state
+// Graphics Pipeline Tiers (Hardware OpenGL 4.30+ rendering features)
+enum class GraphicsTier : int {
+    LOW = 0,
+    MEDIUM,
+    HIGH,
+    SW_PLUS,
+    SW_PLUS_HIGH,
+    COUNT
+};
+
+// Stylistic Post-Effects Filters (Cosmetic backbuffer overlays, independent of graphics tier)
+enum class PostEffectFilter : int {
+    NONE = 0,
+    RETRO_TV,       // CRT scanlines, barrel curvature, phosphor mask
+    OUTLINE_MILD,   // Comic-book thin Sobel depth/normal edge contours
+    OUTLINE_HEAVY,  // Anime thick dilated ink silhouettes
+    VHS_GLITCH,     // Tape tracking jitter, chromatic drift, noise lines
+    VIGNETTE_GRAIN, // Subtle photographic vignette & organic film grain
+    COUNT
+};
+
+// Post-processing and engine rendering pipeline state
 struct PostFXState {
-    bool enabled = false;
+    bool enabled = true;
     
-    // --- Tier 1: Color effects ---
+    // Decoupled classifications
+    GraphicsTier     graphics_tier = GraphicsTier::SW_PLUS;
+    PostEffectFilter postfx_filter = PostEffectFilter::NONE;
+    float            postfx_filter_intensity = 1.0f;
+
+    // Procedural Detail Injection (PDI) settings
+    bool  procedural_detail   = true;
+    float procedural_strength = 1.0f;
+    
+    // --- Tier 1: Color / Stylistic effects ---
     bool vignette = false;
     float vignette_intensity = 0.3f;
     
@@ -55,6 +85,25 @@ struct PostFXState {
     bool bloom = false;
     float bloom_threshold = 0.7f;       // brightness threshold for bloom extraction
     float bloom_intensity = 0.35f;      // additive bloom strength
+
+    // --- Authored-emitter bloom key -----------------------------------------
+    // ON (default): the extract keeps only pixels that match one of the CURRENT
+    // biome's authored emitter hues (BiomeTable::kEmitterPalette - torches,
+    // lantern pods, lava) AND that are brighter than their own neighbourhood.
+    // bloom_threshold is unused in this mode; bright-but-flat surfaces (sky, ice
+    // fields) no longer bloom at all, and genuine lights bloom at their authored
+    // mid-level brightness. OFF: the legacy single luminance threshold, which is
+    // what bloom_threshold above drives. See bloom_extract.glsl for the data
+    // behind every constant.
+    bool  bloom_emitter_key      = true;
+    float bloom_emitter_luma     = 0.10f;  // level floor; the dimmest authored
+                                           // emitter is grove purple at luma
+                                           // 0.164, the torch at 0.556
+    float bloom_emitter_sat      = 0.80f;  // fraction of the emitter's own chroma
+                                           // strength a pixel must reach; a real
+                                           // unclipped emitter measures 1.00
+    float bloom_emitter_contrast = 1.12f;  // local-brightness ratio floor
+    float bloom_emitter_gain     = 1.60f;  // weight scale (buffer clamps at 1.0)
     
     bool shadows = false;
     float shadow_intensity = 0.5f;       // shadow darkness (0=none, 1=pitch black)
@@ -76,10 +125,12 @@ struct PostFXState {
     bool reflections_enabled = false;    // Enable dynamic wave reflections for water
     float reflection_intensity = 0.35f;  // Reflection blend strength (0-1)
 
-    // Preset name (for display)
-    const char* preset_name = "Low";
+    // Preset & Filter names (for display)
+    const char* preset_name = "SW+";
+    const char* filter_name = "None";
 };
 
+// Legacy preset enum for backward compatibility
 enum class PostFXPreset : int {
     OFF = 0,
     SW_PLUS_MEDIUM, // Swordigo Plus - Medium settings
@@ -93,6 +144,25 @@ enum class PostFXPreset : int {
     CUSTOM,
     COUNT
 };
+
+void graphics_apply_tier(PostFXState& state, GraphicsTier tier);
+void postfx_apply_filter(PostFXState& state, PostEffectFilter filter, float intensity = 1.0f);
+
+// The ONE authoritative boot path for the render pipeline.
+//
+// Why this exists as a function instead of two inline calls: the F6 menu splits
+// the pipeline into (a) a hardware GraphicsTier and (b) a cosmetic
+// PostEffectFilter, and it changes them through exactly two entry points
+// (graphics_apply_tier / postfx_apply_filter). Booting has to use those same
+// two entry points in the same order. The previous boot path called
+// postfx_apply_preset(OFF), which assigns `state = PostFXState{}` and thereby
+// WIPES every tier flag set by fbo_init() while leaving graphics_tier at its
+// struct default of SW_PLUS. The F6 menu then displayed "SW+" while the
+// renderer ran with the OFF preset's flags - which is why the tier only took
+// effect after the user re-clicked the already-selected SW+ button.
+void postfx_apply_boot_defaults(PostFXState& state);
+const char* graphics_tier_name(GraphicsTier tier);
+const char* postfx_filter_name(PostEffectFilter filter);
 
 void postfx_apply_preset(PostFXState& state, PostFXPreset preset);
 const char* postfx_preset_name(PostFXPreset p);

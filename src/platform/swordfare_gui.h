@@ -173,6 +173,13 @@ public:
     bool m_show_about = false;
     bool m_show_help  = false;
 
+    // ---- F6 Decoupled Graphical Options Modal ----
+    void draw_graphics_options_modal(struct PostFXState& state);
+    void toggle_graphics_options() { m_graphics_options_visible = !m_graphics_options_visible; }
+    bool is_graphics_options_visible() const { return m_graphics_options_visible; }
+    void set_graphics_options_visible(bool v) { m_graphics_options_visible = v; }
+    bool m_graphics_options_visible = false;
+
     // ---- Memory Research Tab ----
     //
     // Call init_research_tab() once after RecoveryCatalog::instance().init()

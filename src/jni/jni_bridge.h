@@ -19,6 +19,37 @@ struct BridgeFunction {
 };
 
 // --- Frame Statistics ---
+// -----------------------------------------------------------------------------
+//  SRE13 TEXTURE IDENTITY TELEMETRY  (additive, removable)
+// -----------------------------------------------------------------------------
+//  Kept OUT of FrameStats on purpose. FrameStats is the frame-rate/latency
+//  surface and is reset every frame; this is a per-LEVEL diagnostic that must
+//  survive the reset, and it exists to answer one question: does the host know
+//  which texture is bound, or not?
+//
+//  Delete this struct, its global and its F3 block together once texture
+//  identity is no longer in question. Nothing else reads it.
+//
+//  Reading it:
+//    * identified == 0 while bind_calls climbs  -> the Caver::Texture offsets in
+//      sre13/hooks/texture_layout.h do not match this build. This is the ONLY
+//      signal that distinguishes "wrong offset" from "no textures bound", and
+//      without it a broken layout looks exactly like a working one that found
+//      nothing.
+//    * unique_names is the per-level texture set, read out of guest memory.
+//    * trusted/rejected show what the mapper's gate did with those names.
+struct Sre13TextureTelemetry {
+    uint32_t bind_calls   = 0;   // guest RenderingContext::BindTexture calls
+    uint32_t identified   = 0;   // calls that yielded a usable name
+    uint32_t unique_names = 0;   // distinct names bound since the level loaded
+    uint32_t trusted      = 0;   // names accepted by the trust gate
+    uint32_t rejected     = 0;   // names the gate refused
+    uint32_t level_generation = 0; // bumps on each scene change
+    bool     resolved     = false; // guest symbols located
+    bool     has_level    = false; // a level has been observed
+};
+extern Sre13TextureTelemetry g_sre13_tex_telemetry;
+
 struct FrameStats {
     uint32_t draw_calls = 0;        // glDrawArrays + glDrawElements
     uint32_t texture_binds = 0;     // glBindTexture

@@ -839,7 +839,12 @@ InputConfig g_input_config;
 SDL_Gamepad* g_gamepad = nullptr;
 FBOScale g_fbo_mode = FBOScale::SHARP_BILINEAR;
 PostFXState g_postfx;
-PostFXPreset g_postfx_preset = PostFXPreset::OFF;
+// Legacy mirror of the render pipeline default. The authoritative boot path is
+// postfx_apply_boot_defaults() (called right after fbo_init); this enum is kept
+// in sync because the N-key time-of-day cycle and the settings panel both start
+// from it. It used to be OFF, which is what desynced the F6 menu from the
+// renderer - see the comment on postfx_apply_boot_defaults() in fbo_scaler.cpp.
+PostFXPreset g_postfx_preset = PostFXPreset::SW_PLUS_MEDIUM;
 SkyRenderer g_sky;
 SwordfareGUI g_swordfare_gui;  /* Swordfare: ImGui in-game overlay */
 
@@ -1351,8 +1356,17 @@ void init_all() {
     if (g_display_active) {
         fbo_init(GAME_W, GAME_H);
         draw_batcher_init();
-        postfx_apply_preset(g_postfx, g_postfx_preset);
-        postfx_user_preset = g_postfx_preset;
+        // Boot through the SAME two entry points the F6 menu uses (tier, then
+        // cosmetic filter). This site previously called
+        //     postfx_apply_preset(g_postfx, g_postfx_preset);
+        // with g_postfx_preset defaulting to OFF, whose first statement is
+        // `s = PostFXState{}`. That wiped every tier flag fbo_init() had just
+        // applied while leaving graphics_tier at its struct default of SW_PLUS,
+        // so the F6 menu displayed an active "SW+" tier over an OFF pipeline and
+        // the tier only took effect once the user re-clicked the already-
+        // selected SW+ button. See postfx_apply_boot_defaults().
+        postfx_apply_boot_defaults(g_postfx);
+        postfx_user_preset = PostFXPreset::SW_PLUS_MEDIUM;
         postfx_user_enabled = g_postfx.enabled;
     }
     
@@ -2363,7 +2377,7 @@ void load_and_boot() {
 
                 snprintf(dbg, sizeof(dbg), "Speed: %s  %s", mod_speed_label(), g_game_paused ? "|| PAUSED" : "");
                 g_gui.draw_string(dbg, 20, g_win_h - 185, 1.2f, 255, 180, 50, 255);
-                snprintf(dbg, sizeof(dbg), "F1:GUI F2:Ctrl F3:Dbg F4:Scale F5:Cam F6:PostFX F7:Video \\\\:Type F10:HUD");
+                snprintf(dbg, sizeof(dbg), "F1:GUI F2:Ctrl F3:Dbg F4:Scale F5:Cam F6:Graphics F7:Video \\\\:Type F10:HUD");
                 g_gui.draw_string(dbg, 20, g_win_h - 202, 1.1f, 100, 100, 120, 200);
                 if (g_typing_mode) {
                     g_gui.draw_string("TYPING MODE ACTIVE", 20, g_win_h - 218, 1.2f, 255, 100, 100, 255);
@@ -2528,6 +2542,7 @@ void load_and_boot() {
                 g_swordfare_gui.draw_mod_overlay(g_save_dir);
                 g_swordfare_gui.draw_research_overlay();
                 g_swordfare_gui.draw_research_hud();
+                g_swordfare_gui.draw_graphics_options_modal(g_postfx);
                 g_swordfare_gui.end_frame();
             }
 
@@ -2751,15 +2766,7 @@ void load_and_boot() {
                                 break;
                             }
                             if (event.key.key == SDLK_F6 && !event.key.repeat) {
-                                g_postfx_preset = static_cast<PostFXPreset>(
-                                    (static_cast<int>(g_postfx_preset) + 1) % static_cast<int>(PostFXPreset::COUNT)
-                                );
-                                postfx_apply_preset(g_postfx, g_postfx_preset);
-                                // Update saved user state for menu auto-restore
-                                postfx_user_preset = g_postfx_preset;
-                                postfx_user_enabled = g_postfx.enabled;
-                                postfx_suppressed_by_menu = false;
-                                std::cout << "[PostFX] Preset: " << g_postfx.preset_name << std::endl;
+                                g_swordfare_gui.toggle_graphics_options();
                                 break;
                             }
                             if (event.key.key == SDLK_R && !event.key.repeat) {
@@ -7874,7 +7881,7 @@ void load_and_boot_arm64() {
 
                 // ── Hotkey legend ──
                 y -= 2;
-                g_gui.draw_string("F1:GUI F2:Ctrl F3:Debug F4:Scale F5:Cam F6:PostFX", x, y, 1.0f, 80, 80, 100, 180); y -= 14;
+                g_gui.draw_string("F1:GUI F2:Ctrl F3:Debug F4:Scale F5:Cam F6:Graphics", x, y, 1.0f, 80, 80, 100, 180); y -= 14;
                 g_gui.draw_string("F7:Video \\\\:Type F8:Pause F10:HUD F12:Fullscreen", x, y, 1.0f, 80, 80, 100, 180);
 
                 if (g_typing_mode) {
@@ -8005,6 +8012,7 @@ void load_and_boot_arm64() {
                 g_swordfare_gui.draw_mod_overlay(g_save_dir);
                 g_swordfare_gui.draw_research_overlay();
                 g_swordfare_gui.draw_research_hud();
+                g_swordfare_gui.draw_graphics_options_modal(g_postfx);
                 g_swordfare_gui.end_frame();
             }
             
@@ -8243,15 +8251,7 @@ void load_and_boot_arm64() {
                                 break;
                             }
                             if (event.key.key == SDLK_F6 && !event.key.repeat) {
-                                g_postfx_preset = static_cast<PostFXPreset>(
-                                    (static_cast<int>(g_postfx_preset) + 1) % static_cast<int>(PostFXPreset::COUNT)
-                                );
-                                postfx_apply_preset(g_postfx, g_postfx_preset);
-                                // Update saved user state for menu auto-restore
-                                postfx_user_preset = g_postfx_preset;
-                                postfx_user_enabled = g_postfx.enabled;
-                                postfx_suppressed_by_menu = false;
-                                std::cout << "[PostFX] Preset: " << g_postfx.preset_name << std::endl;
+                                g_swordfare_gui.toggle_graphics_options();
                                 break;
                             }
                             if (event.key.key == SDLK_R && !event.key.repeat) {

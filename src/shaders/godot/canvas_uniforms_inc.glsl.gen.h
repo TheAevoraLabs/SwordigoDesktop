@@ -1,0 +1,251 @@
+/**************************************************************************/
+/*  canvas_uniforms_inc.glsl.gen.h                                        */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
+
+/* THIS FILE IS GENERATED. EDITS WILL BE LOST. */
+
+#pragma once
+
+static const char canvas_uniforms_inc_shader_glsl[] = {
+R"<!>(#define MAX_LIGHTS_PER_ITEM 16
+
+#define M_PI 3.14159265359
+
+#define SDF_MAX_LENGTH 16384.0
+
+#define INSTANCE_FLAGS_LIGHT_COUNT_SHIFT 0 // 4 bits.
+
+#define INSTANCE_FLAGS_CLIP_RECT_UV (1 << 4)
+#define INSTANCE_FLAGS_TRANSPOSE_RECT (1 << 5)
+
+#define INSTANCE_FLAGS_NINEPATCH_DRAW_CENTER_SHIFT 8
+#define INSTANCE_FLAGS_NINEPATCH_H_MODE_SHIFT 9
+#define INSTANCE_FLAGS_NINEPATCH_V_MODE_SHIFT 11
+
+#define INSTANCE_FLAGS_SHADOW_MASKED_SHIFT 13 // 16 bits.
+#define INSTANCE_FLAGS_SHADOW_MASKED (1 << INSTANCE_FLAGS_SHADOW_MASKED_SHIFT)
+
+struct InstanceData {
+	vec2 world_x;
+	vec2 world_y;
+	vec2 world_ofs;
+	vec2 ninepatch_pixel_size;
+#ifdef USE_PRIMITIVE
+	vec2 points[3];
+	vec2 uvs[3];
+	uint colors[6];
+#else
+	vec4 modulation;
+	vec4 ninepatch_margins;
+	vec4 dst_rect; //for built-in rect and UV
+	vec4 src_rect;
+	vec2 pad;
+
+#endif
+	uint flags;
+	uint instance_uniforms_ofs;
+	uvec4 lights;
+};
+
+//1 means enabled, 2+ means trails in use
+#define BATCH_FLAGS_INSTANCING_MASK 0x7F
+#define BATCH_FLAGS_INSTANCING_HAS_COLORS_SHIFT 7
+#define BATCH_FLAGS_INSTANCING_HAS_COLORS (1 << BATCH_FLAGS_INSTANCING_HAS_COLORS_SHIFT)
+#define BATCH_FLAGS_INSTANCING_HAS_CUSTOM_DATA_SHIFT 8
+#define BATCH_FLAGS_INSTANCING_HAS_CUSTOM_DATA (1 << BATCH_FLAGS_INSTANCING_HAS_CUSTOM_DATA_SHIFT)
+
+#define BATCH_FLAGS_DEFAULT_NORMAL_MAP_USED (1 << 9)
+#define BATCH_FLAGS_DEFAULT_SPECULAR_MAP_USED (1 << 10)
+
+layout(push_constant, std430) uniform Params {
+	uint sc_packed_0;
+	uint specular_shininess;
+	uint batch_flags;
+	uint pad0;
+
+	vec2 msdf;
+	vec2 color_texture_pixel_size;
+#ifdef USE_ATTRIBUTES
+	// Particles and meshes
+	vec2 world_x;
+	vec2 world_y;
+
+	vec2 world_ofs;
+	uint flags;
+	uint instance_uniforms_ofs;
+
+	vec4 modulation;
+	uvec4 lights;
+#endif
+}
+params;
+
+// Specialization constants.
+
+#ifdef UBERSHADER
+
+// Pull the constants from the draw call's push constants.
+uint sc_packed_0() {
+	return params.sc_packed_0;
+}
+
+#else
+
+// Pull the constants from the pipeline's specialization constants.
+layout(constant_id = 0) const uint pso_sc_packed_0 = 0;
+
+uint sc_packed_0() {
+	return pso_sc_packed_0;
+}
+
+#endif
+
+bool sc_use_lighting() {
+	return ((sc_packed_0() >> 0) & 1U) != 0;
+}
+
+bool sc_use_msdf() {
+	return ((sc_packed_0() >> 1) & 1U) != 0;
+}
+
+bool sc_use_lcd() {
+	return ((sc_packed_0() >> 2) & 1U) != 0;
+}
+
+// In vulkan, sets should always be ordered using the following logic:
+// Lower Sets: Sets that change format and layout less often
+// Higher sets: Sets that change format and layout very often
+// This is because changing a set for another with a different layout or format,
+// invalidates all the upper ones (as likely internal base offset changes)
+
+/* SET0: Globals */
+
+#define CANVAS_FLAGS_CONVERT_ATTRIBUTES_TO_LINEAR (1 << 0)
+
+// The values passed per draw primitives are cached within it
+
+layout(set = 0, binding = 1, std140) uniform CanvasData {
+	mat4 canvas_transform;
+	mat4 screen_transform;
+	mat4 canvas_normal_transform;
+	vec4 canvas_modulation;
+	vec2 screen_pixel_size;
+	float time;
+	bool use_pixel_snap;
+
+	vec4 sdf_to_tex;
+	vec2 screen_to_sdf;
+	vec2 sdf_to_screen;
+
+	uint directional_light_count;
+	float tex_to_sdf;
+	float shadow_pixel_size;
+	uint flags;
+}
+canvas_data;
+
+#define LIGHT_FLAGS_BLEND_MASK (3 << 16)
+#define LIGHT_FLAGS_BLEND_MODE_ADD (0 << 16)
+#define LIGHT_FLAGS_BLEND_MODE_SUB (1 << 16)
+#define LIGHT_FLAGS_BLEND_MODE_MIX (2 << 16)
+#define LIGHT_FLAGS_BLEND_MODE_MASK (3 << 16)
+#define LIGHT_FLAGS_HAS_SHADOW (1 << 20)
+#define LIGHT_FLAGS_FILTER_SHIFT 22
+#define LIGHT_FLAGS_FILTER_MASK (3 << 22)
+#define LIGHT_FLAGS_SHADOW_NEAREST (0 << 22)
+#define LIGHT_FLAGS_SHADOW_PCF5 (1 << 22)
+#define LIGHT_FLAGS_SHADOW_PCF13 (2 << 22)
+
+struct Light {
+	mat2x4 texture_matrix; //light to texture coordinate matrix (transposed)
+	mat2x4 shadow_matrix; //light to shadow coordinate matrix (transposed)
+	vec4 color;
+
+	uint shadow_color; // packed
+	uint flags; //index to light texture
+	float shadow_pixel_size;
+	float height;
+
+	vec2 position;
+	float shadow_zfar_inv;
+	float shadow_y_ofs;
+
+	vec4 atlas_rect;
+};
+
+layout(set = 0, binding = 2, std430) restrict readonly buffer LightData {
+	Light data[];
+}
+light_array;
+
+layout(set = 0, binding = 3) uniform texture2D atlas_texture;
+layout(set = 0, binding = 4) uniform texture2D shadow_atlas_texture;
+
+layout(set = 0, binding = 5) uniform sampler shadow_sampler;
+
+layout(set = 0, binding = 6) uniform texture2D color_buffer;
+layout(set = 0, binding = 7) uniform texture2D sdf_texture;
+
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 0) uniform sampler SAMPLER_NEAREST_CLAMP;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 1) uniform sampler SAMPLER_LINEAR_CLAMP;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 2) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_CLAMP;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 3) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_CLAMP;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 4) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_ANISOTROPIC_CLAMP;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 5) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_CLAMP;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 6) uniform sampler SAMPLER_NEAREST_REPEAT;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 7) uniform sampler SAMPLER_LINEAR_REPEAT;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 8) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_REPEAT;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 9) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_REPEAT;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 10) uniform sampler SAMPLER_NEAREST_WITH_MIPMAPS_ANISOTROPIC_REPEAT;
+layout(set = 0, binding = SAMPLERS_BINDING_FIRST_INDEX + 11) uniform sampler SAMPLER_LINEAR_WITH_MIPMAPS_ANISOTROPIC_REPEAT;
+
+layout(set = 0, binding = 9, std430) restrict readonly buffer GlobalShaderUniformData {
+	vec4 data[];
+}
+global_shader_uniforms;
+
+/* SET1: Is reserved for the material */
+
+//
+
+/* SET2: Instancing and Skeleton */
+
+layout(set = 2, binding = 0, std430) restrict readonly buffer Transforms {
+	vec4 data[];
+}
+transforms;
+
+/* SET3: Texture */
+
+layout(set = 3, binding = 0) uniform texture2D color_texture;
+layout(set = 3, binding = 1) uniform texture2D normal_texture;
+layout(set = 3, binding = 2) uniform texture2D specular_texture;
+layout(set = 3, binding = 3) uniform sampler texture_sampler;
+)<!>"
+};
