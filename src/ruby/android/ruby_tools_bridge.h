@@ -66,6 +66,12 @@ public:
                                                     double frontMax, double backMax,
                                                     int seed);
 
+    // #will be unlocked after — mirrors boulderx::kPerNodeReliefUnlocked so the
+    // QML studios can DISABLE and label the relief controls rather than let a
+    // tap come back flat with no explanation. True means per-node Z is staged
+    // off for this release and a sheet ships as a uniform slab.
+    Q_INVOKABLE bool perNodeReliefUnlocked() const;
+
     // Documentation & Modding Guides
     Q_INVOKABLE QString loadDocMarkdown(const QString& docId);
     Q_INVOKABLE QVariantList getModdingGuides();

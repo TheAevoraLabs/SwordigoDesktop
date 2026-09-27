@@ -1037,12 +1037,18 @@ static constexpr uint32_t kGroundMeshPayload = 111;
 // (material/texture mapping, metadata) is preserved verbatim from the
 // original serialized message.
 static std::string reencode_mesh_data(const std::string& original, const PODMesh& pm) {
+    int num_vertices = pm.num_vertices;
+    if (num_vertices < 0) num_vertices = 0;
+    if (static_cast<size_t>(num_vertices) * 3 > pm.positions.size()) {
+        num_vertices = static_cast<int>(pm.positions.size() / 3);
+    }
+
     // Interleaved stream: pos(3) + normal(3) + uv(2) = 32 bytes per vertex.
     std::string vertex_data;
-    vertex_data.reserve(static_cast<size_t>(pm.num_vertices) * 32);
+    vertex_data.reserve(static_cast<size_t>(num_vertices) * 32);
     static const float kUp[3]    = {0.0f, 1.0f, 0.0f};
     static const float kZero[2]  = {0.0f, 0.0f};
-    for (int i = 0; i < pm.num_vertices; ++i) {
+    for (int i = 0; i < num_vertices; ++i) {
         const float* p = &pm.positions[static_cast<size_t>(i) * 3];
         const bool has_n = static_cast<size_t>(i) * 3 + 2 < pm.normals.size();
         const bool has_t = static_cast<size_t>(i) * 2 + 1 < pm.uvs.size();
@@ -1056,9 +1062,14 @@ static std::string reencode_mesh_data(const std::string& original, const PODMesh
     std::string index_data;
     index_data.reserve(pm.indices.size() * 2);
     for (uint32_t idx : pm.indices) {
+        if (num_vertices > 0 && idx >= static_cast<uint32_t>(num_vertices)) {
+            idx = 0;
+        }
         uint16_t v = static_cast<uint16_t>(idx);
         index_data.append(reinterpret_cast<const char*>(&v), 2);
     }
+
+    const uint64_t num_faces = static_cast<uint64_t>(pm.indices.size() / 3);
 
     proto::Writer w;
     bool wrote_vertices = false;
@@ -1069,8 +1080,10 @@ static std::string reencode_mesh_data(const std::string& original, const PODMesh
         proto::Field f;
         while (reader.read_field(f)) {
             if (f.field_number == 1 && f.wire_type == proto::WIRE_VARINT) {
-                w.write_varint_field(1, static_cast<uint64_t>(pm.num_vertices));
+                w.write_varint_field(1, static_cast<uint64_t>(num_vertices));
                 wrote_count = true;
+            } else if (f.field_number == 2 && f.wire_type == proto::WIRE_VARINT) {
+                w.write_varint_field(2, num_faces);
             } else if (f.field_number == 50 && f.wire_type == proto::WIRE_LEN) {
                 w.write_bytes_field(50, vertex_data);
                 wrote_vertices = true;
@@ -1087,7 +1100,7 @@ static std::string reencode_mesh_data(const std::string& original, const PODMesh
         return original; // malformed original — refuse to touch it
     }
     // Append anything the original lacked (protobuf ordering is insignificant).
-    if (!wrote_count)    w.write_varint_field(1, static_cast<uint64_t>(pm.num_vertices));
+    if (!wrote_count)    w.write_varint_field(1, static_cast<uint64_t>(num_vertices));
     if (!wrote_vertices) w.write_bytes_field(50, vertex_data);
     if (!wrote_indices && !pm.indices.empty())  w.write_bytes_field(51, index_data);
     return w.to_string();
@@ -1155,10 +1168,14 @@ static std::string rebuild_ground_mesh_component(const SceneObject& obj,
                     size_t pos = field_cursor[fld]++;
                     if (pos < field_to_meshes[fld].size()) {
                         const size_t mi = field_to_meshes[fld][pos];
-                        const std::string orig = (mi < obj.ground_mesh_raw.size())
-                            ? obj.ground_mesh_raw[mi] : g.bytes_val;
-                        gw.write_bytes_field(g.field_number,
-                                             reencode_mesh_data(orig, obj.ground_meshes[mi]));
+                        if (mi < obj.ground_meshes.size()) {
+                            const std::string orig = (mi < obj.ground_mesh_raw.size())
+                                ? obj.ground_mesh_raw[mi] : g.bytes_val;
+                            gw.write_bytes_field(g.field_number,
+                                                 reencode_mesh_data(orig, obj.ground_meshes[mi]));
+                        } else {
+                            gw.write_field(g);
+                        }
                     } else {
                         gw.write_field(g);
                     }

@@ -1,5 +1,6 @@
 #include "runner_vfs.h"
 #include "runner_scene.h"
+#include "runner_music.h"
 #include "stdstring.h"
 #include "Gloss.h"
 
@@ -139,11 +140,16 @@ static void* hook_NewByteBufferFromAA(String *file, unsigned int *outSize) {
             if (sz >= 0) {
                 void *buf = malloc((size_t)sz);
                 if (buf) {
-                    size_t readBytes = fread(buf, 1, (size_t)sz, f);
+                    size_t totalRead = 0;
+                    while (totalRead < (size_t)sz) {
+                        size_t n = fread((char *)buf + totalRead, 1, (size_t)sz - totalRead, f);
+                        if (n == 0) break;
+                        totalRead += n;
+                    }
                     fclose(f);
-                    if (outSize) *outSize = (unsigned int)readBytes;
+                    if (outSize) *outSize = (unsigned int)totalRead;
                     LOGI("VFS -> LOADED DISK ASSET (NewByteBufferFromAA): %s (%u bytes) for '%s'",
-                         custom_path, (unsigned int)readBytes, name ? name : "");
+                         custom_path, (unsigned int)totalRead, name ? name : "");
                     return buf;
                 }
             }
@@ -174,11 +180,16 @@ static void* hook_NewByteBufferFromFile(String *file, unsigned int *outSize) {
             if (sz >= 0) {
                 void *buf = malloc((size_t)sz);
                 if (buf) {
-                    size_t readBytes = fread(buf, 1, (size_t)sz, f);
+                    size_t totalRead = 0;
+                    while (totalRead < (size_t)sz) {
+                        size_t n = fread((char *)buf + totalRead, 1, (size_t)sz - totalRead, f);
+                        if (n == 0) break;
+                        totalRead += n;
+                    }
                     fclose(f);
-                    if (outSize) *outSize = (unsigned int)readBytes;
+                    if (outSize) *outSize = (unsigned int)totalRead;
                     LOGI("VFS -> LOADED DISK ASSET (NewByteBufferFromFile): %s (%u bytes) for '%s'",
-                         custom_path, (unsigned int)readBytes, name ? name : "");
+                         custom_path, (unsigned int)totalRead, name ? name : "");
                     return buf;
                 }
             }
@@ -200,11 +211,11 @@ static unsigned int hook_BinaryFile_Open(void *this_ptr, String *filename, int m
     const char *name = String_get(filename);
     const char *custom_path = resolve_mod_resource(name);
 
-    if (custom_path) {
+    // Only redirect read requests to disk mod assets; never hijack write opens (mode == 1)
+    if (custom_path && mode != 1) {
         int fd = open(custom_path, O_RDONLY);
         if (fd >= 0) {
-            const char *m = (mode == 1) ? "wb" : "rb";
-            void *gz = gzdopen(fd, m);
+            void *gz = gzdopen(fd, "rb");
             if (gz) {
                 *(int *)this_ptr = 2;
 #if defined(__aarch64__)
@@ -256,6 +267,7 @@ static GetAudioFileData_fn orig_GetAudioFileData = NULL;
 
 static bool hook_GetAudioFileData(String *path, int *fmt, void **data, int *size, int *rate) {
     const char *name = String_get(path);
+    LOGD("hook_GetAudioFileData requested: '%s'", name ? name : "<null>");
     const char *custom_path = resolve_mod_resource(name);
 
     if (custom_path) {
@@ -285,7 +297,8 @@ static bool hook_GetAudioFileData(String *path, int *fmt, void **data, int *size
                         if (data) *data = buf;
                         if (size) *size = (int)datasz;
                         if (rate) *rate = sr;
-                        LOGI("VFS -> LOADED DISK ASSET (Audio): %s for '%s'", custom_path, name ? name : "");
+                        LOGI("VFS -> LOADED DISK ASSET (Audio): %s for '%s' (sz=%u, ch=%d, bits=%d, sr=%d)",
+                             custom_path, name ? name : "", datasz, (int)ch, (int)bits, sr);
                         return true;
                     }
                     if (buf) free(buf);
@@ -296,7 +309,9 @@ static bool hook_GetAudioFileData(String *path, int *fmt, void **data, int *size
     }
 
     if (orig_GetAudioFileData) {
-        return orig_GetAudioFileData(path, fmt, data, size, rate);
+        bool res = orig_GetAudioFileData(path, fmt, data, size, rate);
+        LOGD("orig_GetAudioFileData for '%s' returned %d", name ? name : "<null>", (int)res);
+        return res;
     }
     return false;
 }
@@ -334,6 +349,7 @@ void runner_install_hooks(void) {
         (void **)&orig_NewByteBufferFromAA,
         NULL
     );
+    LOGI("Hook NewByteBufferFromAA: %p", g_hook_newbyte_asset);
 
     g_hook_newbyte_file = GlossHookByName(
         HOOK_LIB_NAME,
@@ -342,6 +358,7 @@ void runner_install_hooks(void) {
         (void **)&orig_NewByteBufferFromFile,
         NULL
     );
+    LOGI("Hook NewByteBufferFromFile: %p", g_hook_newbyte_file);
 
     g_hook_binaryfile = GlossHookByName(
         HOOK_LIB_NAME,
@@ -350,6 +367,7 @@ void runner_install_hooks(void) {
         (void **)&orig_BinaryFile_Open,
         NULL
     );
+    LOGI("Hook BinaryFile_Open: %p", g_hook_binaryfile);
 
     g_hook_open_asset_fd = GlossHookByName(
         HOOK_LIB_NAME,
@@ -358,6 +376,7 @@ void runner_install_hooks(void) {
         (void **)&orig_OpenAAssetFD,
         NULL
     );
+    LOGI("Hook OpenAAssetFD: %p", g_hook_open_asset_fd);
 
     g_hook_audio = GlossHookByName(
         HOOK_LIB_NAME,
@@ -366,6 +385,7 @@ void runner_install_hooks(void) {
         (void **)&orig_GetAudioFileData,
         NULL
     );
+    LOGI("Hook GetAudioFileData: %p", g_hook_audio);
 
     g_hook_fileexists = GlossHookByName(
         HOOK_LIB_NAME,
@@ -374,20 +394,31 @@ void runner_install_hooks(void) {
         (void **)&orig_FileExistsAtPath,
         NULL
     );
+    LOGI("Hook FileExistsAtPath: %p", g_hook_fileexists);
 
     /* Seventh hook: CaverShell::InitView, which is what makes "start this .scene in
      * game" possible. Independent of the VFS hooks and harmless when no scene was
      * requested — it simply forwards. */
     runner_install_scene_hook();
 
+    /* Eighth: MusicPlayerJNI audio hooks + Google Game Services stub */
+    runner_install_music_hooks();
+
     g_hooks_installed = 1;
-    LOGI("Ruby Runner VFS hooks successfully installed!");
+    LOGI("Ruby Runner VFS and Audio hooks successfully installed!");
 }
 
 void runner_uninstall_hooks(void) {
     if (!g_hooks_installed) return;
     LOGI("Uninstalling Ruby Runner VFS hooks...");
     runner_uninstall_scene_hook();
+    runner_uninstall_music_hooks();
+    if (g_hook_newbyte_asset) { GlossHookDelete(g_hook_newbyte_asset); g_hook_newbyte_asset = NULL; }
+    if (g_hook_newbyte_file)  { GlossHookDelete(g_hook_newbyte_file);  g_hook_newbyte_file = NULL; }
+    if (g_hook_binaryfile)    { GlossHookDelete(g_hook_binaryfile);    g_hook_binaryfile = NULL; }
+    if (g_hook_open_asset_fd) { GlossHookDelete(g_hook_open_asset_fd); g_hook_open_asset_fd = NULL; }
+    if (g_hook_audio)         { GlossHookDelete(g_hook_audio);         g_hook_audio = NULL; }
+    if (g_hook_fileexists)    { GlossHookDelete(g_hook_fileexists);    g_hook_fileexists = NULL; }
     g_resource_dir[0] = '\0';
     g_hooks_installed = 0;
 }

@@ -3,6 +3,31 @@
 All notable changes to the Ruby Touch (Ruby Mobile) Android application and modding studio.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html) and follows the [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) format.
 
+> **Repository move (2026-09-26):** development moved from GitHub (`TheAevoraLabs`, terminated by automated moderation) to GitLab — [AevoralabsIN/RubyTouch](https://gitlab.com/AevoralabsIN/RubyTouch) — with a mirror at [quantumcreeper/RubyTouch](https://codeberg.org/quantumcreeper/RubyTouch). `github.com` links in older entries below are historical.
+
+---
+
+## [1.4.1] - 2026-09-26
+
+### Added
+- **FOSS build flavor** (`./build_android.sh --foss`): compiles out the proprietary GlossHook dependency entirely — zero proprietary libraries in the APK. The play-in-game and start-scene-in-game features are disabled (their buttons hidden via `playInGameAvailable`); all other features work identically.
+- **Persistent release signing**: `build_android.sh` now accepts `RUBY_KEYSTORE_PATH` / `RUBY_KEYSTORE_PASS` / `RUBY_KEY_ALIAS` / `RUBY_KEY_PASS` for a stable release key, falling back to the previous ephemeral debug key when unset.
+- **Native Crash Logger**: Ported `runner_crasher` signal handler with `_Unwind_Backtrace` and `dladdr` symbol resolution logging faulting PC and backtraces to logcat and `crash.log`.
+- **In-Viewport Scene Play**: Added direct "Play Scene in Game" action inside the Scene Editor's Viewport Menu.
+
+### Fixed
+- **Play-in-Game Crash After Ground Mesh Resize (P0)**:
+  - Fixed unsaved launch state: `launchGame()` and `startSceneInGame()` now synchronously commit active mesh edits (`applyMeshEdit()`) and flush dirty scene data to disk (`saveScene()`) before launching `GameActivity`.
+  - Fixed ground mesh metadata desync in `RubyQuickViewport::regenerateGroundMesh`: updated `target.ground_mesh_raw` and `target.ground_mesh_fields` from re-parsed geometry, preventing `scene_save()` from encoding using stale wire buffers.
+  - Added defensive mesh re-encoding validation in `scene_loader.cpp`: strict vertex count / stride checks (`num_vertices * 32 <= vertex_data.size()`), vertex index bounds clamping, and automatic `num_faces` (wire field 2) synchronization.
+  - Fixed short `fread` handling in runner VFS hooks and guarded `BinaryFile::Open` against write-mode hijacking of read-only mod assets.
+- **Scene Mode Sound & Music Playback**:
+  - Eliminated `AssetManager` race in `GameActivity` by setting up the native engine environment prior to GLSurfaceView renderer initialization.
+  - Ported `Port.java` MediaPlayer audio bridge and hooked all 6 `MusicPlayerJNI` symbols (`LoadFile`, `Play`, `Pause`, `Stop`, `SetLooping`, `SetVolume`), restoring background music from vanilla APK `res/raw/` or mod `music/` directories.
+  - Added `Caver::AndroidIsGoogleGameServicesAvailable` stub returning false to prevent GMS hangs in runner mode.
+  - Added comprehensive hook resolution and audio query diagnostics in logcat.
+- Build-environment fixes: define `qt_resourceFeatureZstd` (missing from aqt's Qt 6.6.3 Android binaries) and pass `-encoding UTF-8` to `javac`.
+
 ---
 
 ## [1.4] - 2026-09-25

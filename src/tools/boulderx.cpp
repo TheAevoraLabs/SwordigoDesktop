@@ -1632,6 +1632,36 @@ void engine_node_depths(const Params& params, size_t node_count,
     }
 }
 
+// ── The flat-Z ship path — #will be unlocked after ───────────────────────
+// One constant plane for every node: the vanilla-exact SurfaceWidth/2 (see the
+// declaration in boulderx.h). No PRNG draw, so the arrays depend on nothing but
+// the object's own SurfaceWidth — the same number in, the same number out,
+// every import, on every platform.
+void flat_node_depths(double plane, size_t node_count,
+                      std::vector<double>& front_out, std::vector<double>& back_out) {
+    front_out.assign(node_count, plane);
+    back_out.assign(node_count, -plane);
+}
+
+void flat_node_depths(const Params& params, size_t node_count,
+                      std::vector<double>& front_out, std::vector<double>& back_out) {
+    flat_node_depths(params.surface_width * 0.5, node_count, front_out, back_out);
+}
+
+// The declared-depth form of the same rule. MeshType 1 declares
+// plane + HatWidthOffset1, so the plane is that much SHALLOWER than |MaxDepth|;
+// subtracting it is what keeps the emit from drifting the declaration a second
+// W1 further out on every edit (the "it over-increases the Z" report).
+double flat_plane_declared(double abs_max_depth, int mesh_type,
+                           double hat_width_offset_1) {
+    double plane = std::fabs(abs_max_depth);
+    if (mesh_type == 1) plane -= std::fabs(hat_width_offset_1);
+    // A declaration that already carries no room for the rim must not produce a
+    // negative (inverted) slab.
+    if (!(plane > 0.0)) plane = 0.0;
+    return plane;
+}
+
 // ── .swdm text ──────────────────────────────────────────────────────────────
 // A boulderx sheet is format v2: per-node depths, which v1 (boulder) has no way
 // to store. The marker is emitted first so a reader can tell the dialects apart

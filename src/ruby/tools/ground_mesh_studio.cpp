@@ -828,6 +828,26 @@ GroundMeshStudio::GroundMeshStudio(QWidget* parent) : QWidget(parent) {
     m_relief_status = new QLabel("Flat slab — no per-node Z yet.", mesh_box);
     m_relief_status->setWordWrap(true);
 
+    // #will be unlocked after — per-node Z is staged off for this release
+    // (boulderx::kPerNodeReliefUnlocked). The controls stay visible and
+    // labelled so the feature is discoverable, but disabled so no press can
+    // reshape a sheet behind the flat-Z contract. "Flatten Z" stays live: it
+    // only ever moves a sheet TOWARDS the flat slab.
+    if (!boulderx::kPerNodeReliefUnlocked) {
+        const QString staged = QStringLiteral("#will be unlocked after");
+        relief_btn->setText(QStringLiteral("Randomise Z — %1").arg(staged));
+        relief_btn->setEnabled(false);
+        relief_btn->setToolTip(QStringLiteral(
+            "Per-node Z sculpting is staged off for this release — %1.")
+            .arg(staged));
+        m_relief_front->setEnabled(false);
+        m_relief_back->setEnabled(false);
+        m_relief_front->setToolTip(QStringLiteral(
+            "Range for Randomise Z, staged off for this release — %1.").arg(staged));
+        m_relief_back->setToolTip(QStringLiteral(
+            "Range for Randomise Z, staged off for this release — %1.").arg(staged));
+    }
+
     mesh_form->addRow("Generator", m_generator);
     mesh_form->addRow("Object name", m_name);
     mesh_form->addRow("Top texture", m_top_texture);
@@ -1072,11 +1092,23 @@ void GroundMeshStudio::sync_relief_to_polygon() {
             ? QString("Per-node Z active — seed %1. Exports as a Zenith sheet (v2); "
                       "Boulder cannot open it.").arg(m_relief_seed)
             : QString("Uniform slab at Min/Max depth — exports as a v1 sheet, which "
-                      "Boulder and Zenith both read."));
+                      "Boulder and Zenith both read.%1")
+                  .arg(boulderx::kPerNodeReliefUnlocked
+                           ? QString()
+                           : QStringLiteral(" Per-node Z: #will be unlocked after.")));
     }
 }
 
 void GroundMeshStudio::randomise_relief() {
+    // #will be unlocked after — guarded at the slot too, so a stale connection
+    // or a keyboard shortcut cannot reach the sculptor while it is staged.
+    if (!boulderx::kPerNodeReliefUnlocked) {
+        if (m_relief_status)
+            m_relief_status->setText(QStringLiteral(
+                "Per-node Z is staged off for this release — #will be unlocked "
+                "after. The sheet stays a uniform slab."));
+        return;
+    }
     if (m_canvas->vertex_count() < 3) {
         m_summary->setText("Need at least three vertices before shaping terrain relief.");
         return;

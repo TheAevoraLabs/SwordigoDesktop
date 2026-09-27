@@ -102,6 +102,12 @@ if (SWORDIGO_BUILD_RUBY_GG)
         ${SRC_DIR}/tools/scene_v3_db.cpp
         ${SRC_DIR}/tools/boulder.cpp
         ${SRC_DIR}/tools/boulderx.cpp
+        # Zypher (Gen 3). viewport_3d_widget.cpp / ruby_quick_viewport.cpp call
+        # zypher::generate_terrain_object(), so the generator must be in the link;
+        # it was omitted here, which left every target built from this list
+        # (ruby_gg, scene_save_preserves_edit_test, scene_undo_test) with an
+        # undefined reference to zypher:: and therefore unbuildable by ctest.
+        ${SRC_DIR}/tools/roller.cpp
         ${SRC_DIR}/tools/rubymesh.cpp
         ${SRC_DIR}/tools/obj_loader.cpp
         ${SRC_DIR}/tools/ani_loader.cpp
@@ -286,6 +292,12 @@ if (SWORDIGO_BUILD_RUBY_GG)
         ${SRC_DIR}/tools/filerift.cpp
         ${SRC_DIR}/tools/boulder.cpp
         ${SRC_DIR}/tools/boulderx.cpp
+        # Zypher (Gen 3). viewport_3d_widget.cpp / ruby_quick_viewport.cpp call
+        # zypher::generate_terrain_object(), so the generator must be in the link;
+        # it was omitted here, which left every target built from this list
+        # (ruby_gg, scene_save_preserves_edit_test, scene_undo_test) with an
+        # undefined reference to zypher:: and therefore unbuildable by ctest.
+        ${SRC_DIR}/tools/roller.cpp
         ${SRC_DIR}/tools/rubymesh.cpp
         ${SRC_DIR}/tools/scene_asset_resolver.cpp
         ${SRC_DIR}/tools/scene_entity.cpp

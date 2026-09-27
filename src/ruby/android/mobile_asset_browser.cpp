@@ -428,17 +428,27 @@ void MobileAssetBrowser::populate_files() {
     std::sort(entries.begin(), entries.end(), [this](const QFileInfo& a, const QFileInfo& b) {
         if (a.isDir() != b.isDir()) return a.isDir(); // Dirs always on top
 
-        bool result = false;
+        const QFileInfo& first = m_sort_ascending ? a : b;
+        const QFileInfo& second = m_sort_ascending ? b : a;
+
         if (m_sort_mode == SortMode::Name) {
-            result = a.fileName().localeAwareCompare(b.fileName()) < 0;
+            int cmp = first.fileName().localeAwareCompare(second.fileName());
+            if (cmp != 0) return cmp < 0;
         } else if (m_sort_mode == SortMode::Date) {
-            result = a.lastModified() < b.lastModified();
+            if (first.lastModified() != second.lastModified()) {
+                return first.lastModified() < second.lastModified();
+            }
         } else if (m_sort_mode == SortMode::Size) {
-            result = a.size() < b.size();
+            if (first.size() != second.size()) {
+                return first.size() < second.size();
+            }
         } else if (m_sort_mode == SortMode::Type) {
-            result = a.suffix().localeAwareCompare(b.suffix()) < 0;
+            int cmp = first.suffix().localeAwareCompare(second.suffix());
+            if (cmp != 0) return cmp < 0;
         }
-        return m_sort_ascending ? result : !result;
+
+        // Tie-breaker: always sort by absoluteFilePath ascending for deterministic strict weak ordering
+        return a.absoluteFilePath() < b.absoluteFilePath();
     });
 
     int dir_count = 0;

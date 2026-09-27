@@ -1736,15 +1736,26 @@ private:
 
 // ─── RubyQuickViewport Implementation ──────────────────────────────────────
 
+static RubyQuickViewport* s_activeViewport = nullptr;
+
+RubyQuickViewport* RubyQuickViewport::activeInstance() {
+    return s_activeViewport;
+}
+
 RubyQuickViewport::RubyQuickViewport(QQuickItem* parent)
     : QQuickFramebufferObject(parent), m_objectModel(this)
 {
+    s_activeViewport = this;
     setMirrorVertically(true); // Right side up OpenGL FBO in Qt Quick!
     setAcceptedMouseButtons(Qt::LeftButton | Qt::RightButton);
     setAcceptTouchEvents(true);
 }
 
-RubyQuickViewport::~RubyQuickViewport() = default;
+RubyQuickViewport::~RubyQuickViewport() {
+    if (s_activeViewport == this) {
+        s_activeViewport = nullptr;
+    }
+}
 
 QQuickFramebufferObject::Renderer* RubyQuickViewport::createRenderer() const {
     return new RubyViewportRenderer();
@@ -3435,33 +3446,40 @@ void RubyQuickViewport::meshImport(int idx) {
     // on the desktop side: a sheet whose own envelope is +-95 regenerated at
     // -105 — the "it over-increases the Z" report).
     //
-    // So the array is not recovered, it is recomputed. GenerateMesh derives one
-    // depth per node from the generator's own parameters and nothing else, and a
-    // ground object always carries them; there is no XY matching left to fail, so
-    // no node can collapse onto another's depth.
+    // So the array is neither recovered nor, for this release, jittered: it is
+    // computed FLAT. #will be unlocked after — Zenith's per-node relief is
+    // staged off for the stable ship, so an import gets ONE constant plane
+    // (vanilla-exact SurfaceWidth/2, the pair Boulder would use) instead of the
+    // HorizNoise law. Vanilla's plane IS that constant, so the object bakes
+    // back to the shape it arrived with, and with every node on one z the cap
+    // is a PLANAR polygon whose triangulation order cannot corrupt it.
+    // Re-enabling relief means calling boulderx::engine_node_depths() here
+    // again; the controls that would do it are tagged "#will be unlocked after".
     m_meshEditVanillaFrontZ.clear();
     m_meshEditVanillaBackZ.clear();
-    if (surface_width > 0.0f) {
+    {
         boulderx::Params law;
         law.mesh_type = mesh_type;
         law.surface_width = surface_width;
         law.horiz_noise = horiz_noise;
         law.random_seed = random_seed;
-        boulderx::engine_node_depths(law, m_meshEditPoints.size(),
-                                     m_meshEditVanillaFrontZ, m_meshEditVanillaBackZ);
-    } else {
-        std::vector<float> positions;
-        for (const auto& pm : obj.ground_meshes)
-            positions.insert(positions.end(), pm.positions.begin(), pm.positions.end());
-        // Half a world unit: engine-written floats, and the level's own scale.
-        boulderx::recover_node_depths(
-            [&] {
-                std::vector<boulderx::Node> nodes;
-                nodes.reserve(m_meshEditPoints.size());
-                for (const auto& pt : m_meshEditPoints) nodes.push_back({pt.x, pt.y, 0.0, 0.0});
-                return nodes;
-            }(),
-            positions, 0.5, m_meshEditVanillaFrontZ, m_meshEditVanillaBackZ);
+        if (surface_width > 0.0f) {
+            // #will be unlocked after: kPerNodeReliefUnlocked flips this one
+            // call back to the HorizNoise law and the whole feature returns.
+            if (boulderx::kPerNodeReliefUnlocked)
+                boulderx::engine_node_depths(law, m_meshEditPoints.size(),
+                                             m_meshEditVanillaFrontZ, m_meshEditVanillaBackZ);
+            else
+                boulderx::flat_node_depths(law, m_meshEditPoints.size(),
+                                           m_meshEditVanillaFrontZ, m_meshEditVanillaBackZ);
+        } else {
+            // No generator field to measure from: the same constant, taken off
+            // the declared depth minus the rim the emitter adds back.
+            const double plane = boulderx::flat_plane_declared(
+                std::fabs((double)max_depth), mesh_type, hat_offset_1);
+            boulderx::flat_node_depths(plane, m_meshEditPoints.size(),
+                                       m_meshEditVanillaFrontZ, m_meshEditVanillaBackZ);
+        }
     }
     m_meshEditFrontZ = m_meshEditVanillaFrontZ;
     m_meshEditBackZ = m_meshEditVanillaBackZ;
@@ -3542,6 +3560,18 @@ void RubyQuickViewport::setGroundGeneratorStatus(const QString& status) {
 bool RubyQuickViewport::randomiseGroundRelief(float frontMagnitude, float backMagnitude,
                                               int seed) {
     if (!m_meshEditActive || m_meshEditPoints.size() < 3) return false;
+
+    // #will be unlocked after — per-node Z sculpting is staged off for this
+    // release (boulderx::kPerNodeReliefUnlocked). Refusing here rather than
+    // quietly reshaping means the object keeps the flat planes meshImport()
+    // gave it; long-press "Flatten" still works, because flattening is the
+    // safe direction. The body below is kept intact so the feature returns by
+    // flipping that one constant, not by re-deriving it.
+    if (!boulderx::kPerNodeReliefUnlocked) {
+        setGroundGeneratorStatus(QStringLiteral(
+            "Randomise Z — #will be unlocked after (this build ships flat Z)"));
+        return false;
+    }
 
     // The range defaults to the object's own depth, so "randomise" reshapes the
     // terrain without changing how thick it is. A caller can override either
@@ -3632,9 +3662,17 @@ bool RubyQuickViewport::regenerateGroundMesh() {
                 n.front_depth = m_meshEditFrontZ[i];
                 n.back_depth = m_meshEditBackZ[i];
             } else {
-                double hw = gm.surface_width > 0 ? gm.surface_width * 0.5 : 50.0;
-                n.front_depth = hw;
-                n.back_depth = -hw;
+                // The flat plane, never a bare declaration: for MeshType 1 the
+                // declaration already includes HatWidthOffset1, which the rim
+                // would then add a second time.
+                const double plane =
+                    gm.surface_width > 0
+                        ? gm.surface_width * 0.5
+                        : boulderx::flat_plane_declared(std::fabs((double)gm.max_depth),
+                                                        m_meshEditMeshType,
+                                                        gm.hat_width_offset_1);
+                n.front_depth = plane;
+                n.back_depth = -plane;
             }
             n.height = std::fabs(n.front_depth - n.back_depth);
             nodes.push_back(n);
@@ -3670,10 +3708,19 @@ bool RubyQuickViewport::regenerateGroundMesh() {
             boulderx::Node n;
             n.x = m_meshEditPoints[i].x;
             n.y = m_meshEditPoints[i].y;
-            // A modder's relief if they asked for one, otherwise the object's own
-            // depth — so the mesh keeps the thickness it arrived with.
-            n.front_depth = have_relief ? m_meshEditFrontZ[i] : double(gm.max_depth);
-            n.back_depth = have_relief ? m_meshEditBackZ[i] : double(gm.min_depth);
+            // A modder's relief if they asked for one, otherwise the object's
+            // own FLAT plane — SurfaceWidth/2, or the declared depth minus the
+            // rim. Never gm.max_depth itself: that declaration already carries
+            // HatWidthOffset1 on a MeshType 1 object, and build_rim would add
+            // it a second time (the "it over-increases the Z" report).
+            const double flat =
+                gm.surface_width > 0
+                    ? gm.surface_width * 0.5
+                    : boulderx::flat_plane_declared(std::fabs((double)gm.max_depth),
+                                                    m_meshEditMeshType,
+                                                    gm.hat_width_offset_1);
+            n.front_depth = have_relief ? m_meshEditFrontZ[i] : flat;
+            n.back_depth = have_relief ? m_meshEditBackZ[i] : -flat;
             outline.push_back(n);
         }
         boulderx::ensure_ccw(outline);
@@ -3799,6 +3846,8 @@ bool RubyQuickViewport::regenerateGroundMesh() {
 
     // The re-parsed geometry wins over what scene_refresh re-derived
     target.ground_meshes = std::move(fresh.ground_meshes);
+    target.ground_mesh_raw = std::move(fresh.ground_mesh_raw);
+    target.ground_mesh_fields = std::move(fresh.ground_mesh_fields);
     if (!fresh.ground_mesh_textures.empty()) {
         target.ground_mesh_textures = std::move(fresh.ground_mesh_textures);
     }

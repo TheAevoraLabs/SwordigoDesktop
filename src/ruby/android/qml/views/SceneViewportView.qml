@@ -333,11 +333,16 @@ Item {
                         // "Vanilla Z" is the object's own per-node depth, recovered
                         // from its baked mesh and carried through the edit; the seed
                         // shows only once it has been replaced by a randomisation.
-                        text: viewportItem.hasGroundRelief()
-                              ? (viewportItem.groundReliefSeed() > 0
-                                 ? qsTr("Z %1").arg(viewportItem.groundReliefSeed())
-                                 : qsTr("Vanilla Z"))
-                              : qsTr("Relief")
+                        // #will be unlocked after: per-node Z is staged off for this
+                        // release, so the pill says so rather than offering a tap that
+                        // would silently do nothing. Long-press (Flatten) still works.
+                        text: viewportItem.groundReliefStaged()
+                              ? qsTr("Z — #will be unlocked after")
+                              : (viewportItem.hasGroundRelief()
+                                 ? (viewportItem.groundReliefSeed() > 0
+                                    ? qsTr("Z %1").arg(viewportItem.groundReliefSeed())
+                                    : qsTr("Vanilla Z"))
+                                 : qsTr("Relief"))
                         font.pixelSize: Theme.dp(11)
                         font.weight: Font.Medium
                         color: Theme.textPrimary
@@ -1738,6 +1743,25 @@ Item {
                     if (typeof androidContext !== "undefined" && androidContext)
                         androidContext.lockPortrait()
                     root.openScriptRequested(root.scenePath)
+                }
+            }
+
+            MenuRow {
+                width: parent.width
+                visible: !root.isModel && typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.playInGameAvailable
+                iconName: "play"
+                text: qsTr("Play Scene in Game")
+                onClicked: {
+                    viewportMenu.close()
+                    if (viewportItem.meshEditActive) {
+                        viewportItem.applyMeshEdit()
+                    }
+                    if (viewportItem.dirty) {
+                        viewportItem.saveScene()
+                    }
+                    if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
+                        rubyFileModel.startSceneInGame(root.scenePath)
+                    }
                 }
             }
 

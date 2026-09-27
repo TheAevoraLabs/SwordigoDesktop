@@ -5,22 +5,18 @@ import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.res.ColorStateList;
-import android.graphics.Canvas;
 import android.graphics.Color;
-import android.graphics.Paint;
 import android.graphics.Typeface;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.Editable;
-import android.text.InputType;
-import android.text.Layout;
-import android.text.Spannable;
+import android.text.TextUtils;
 import android.text.TextWatcher;
-import android.text.style.ForegroundColorSpan;
-import android.text.style.StyleSpan;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -28,42 +24,47 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
-import android.view.inputmethod.EditorInfo;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
+import android.widget.ImageButton;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.BufferedReader;
+import in.aevora.ruby.lang.FileRiftLanguage;
+import in.aevora.ruby.lang.GlslLanguage;
+import in.aevora.ruby.lang.JsonLanguage;
+import in.aevora.ruby.lang.LuaLanguage;
+import in.aevora.ruby.lang.SchemeRubyDark;
+
+import io.github.rosemoe.sora.event.ContentChangeEvent;
+import io.github.rosemoe.sora.event.PublishSearchResultEvent;
+import io.github.rosemoe.sora.lang.EmptyLanguage;
+import io.github.rosemoe.sora.lang.Language;
+import io.github.rosemoe.sora.widget.CodeEditor;
+import io.github.rosemoe.sora.widget.EditorSearcher;
+
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStreamWriter;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
- * CodeEditorActivity - Blazingly fast, standalone native code editor for Ruby GG Mobile.
- * Optimizations:
- *   - Asynchronous background file loading & FileRift binary protobuf decoding
- *   - Custom low-overhead LineNumberView rendering only visible lines via onDraw
- *   - Viewport-bounded syntax highlighting with pre-compiled regex patterns (< 2ms per pass)
- *   - Debounced undo/redo history to prevent heap memory churn on 10,000+ line files
- *   - Fixed-gutter horizontal scrolling (gutter remains anchored while code scrolls)
- *   - Soft-keyboard accessory bar with Tab, Untab, Bracket pair auto-wrapping, Operators
- *   - In-editor search with match counter and navigation
- *   - Guarded exit confirmation on unsaved changes
+ * CodeEditorActivity - High-performance native code editor for RubyTouch
+ * powered by Sora Editor (io.github.rosemoe:editor).
+ *
+ * Features:
+ *   - Clean, professional dark IDE UI with zero emojis
+ *   - Strictly fixed-height top toolbar (48dp) and accessory bar (40dp)
+ *   - 120 FPS virtualized line rendering on hardware-accelerated Canvas
+ *   - Asynchronous FileRift protobuf decode/recode JNI bridging
+ *   - Dedicated mobile symbol bar with touch-ergonomic undo/redo/pairs
+ *   - "3D" app bar button for .scene and .scl files to return to viewport
+ *   - Fast background syntax highlighting for FileRift, Lua, GLSL, and JSON
+ *   - Compact inline search and replace with match count navigation
  */
 public class CodeEditorActivity extends Activity {
     private static final String TAG = "CodeEditorActivity";
@@ -95,15 +96,14 @@ public class CodeEditorActivity extends Activity {
         }
     }
 
-    // Native JNI methods
+    // Native JNI FileRift methods from scene_orientation.cpp
     public static native String nativeLoadFile(String path, boolean[] outIsFilerift, String[] outFileType);
     public static native String nativeSaveFile(String path, String content, boolean transcodeFilerift);
 
-    // Color Palette matching Ruby Design System
+    // Ruby Dark Design Palette
     private static final int BG_COLOR = 0xFF121316;
     private static final int SURFACE_COLOR = 0xFF181A20;
     private static final int SURFACE_ALT_COLOR = 0xFF15171C;
-    private static final int GUTTER_BG = 0xFF14161A;
     private static final int BORDER_COLOR = 0xFF262932;
     private static final int TEXT_PRIMARY = 0xFFE5E9F0;
     private static final int TEXT_MUTED = 0xFF5C6370;
@@ -111,224 +111,134 @@ public class CodeEditorActivity extends Activity {
     private static final int ACCENT_CYAN = 0xFF56B6C2;
     private static final int ACCENT_GREEN = 0xFF98C379;
     private static final int ACCENT_ORANGE = 0xFFD19A66;
-    private static final int ACCENT_PURPLE = 0xFFC678DD;
-
-    // Pre-compiled regex patterns (compiled once at class load for instant matcher execution)
-    private static final Pattern PATTERN_STRINGS = Pattern.compile(
-        "\"[^\"\\n\\\\]*(\\\\.[^\"\\n\\\\]*)*\"|'[^'\\n\\\\]*(\\\\.[^'\\n\\\\]*)*'"
-    );
-    private static final Pattern PATTERN_NUMBERS = Pattern.compile(
-        "\\b\\d+(\\.\\d+)?\\b|\\b0x[0-9a-fA-F]+\\b"
-    );
-    private static final Pattern PATTERN_LUA_COMMENTS = Pattern.compile(
-        "--.*$"
-    );
-    private static final Pattern PATTERN_GENERIC_COMMENTS = Pattern.compile(
-        "//.*$|#.*$"
-    );
-    private static final Pattern PATTERN_LUA_KEYWORDS = Pattern.compile(
-        "\\b(and|break|do|else|elseif|end|false|for|function|if|in|local|nil|not|or|repeat|return|then|true|until|while)\\b"
-    );
-    private static final Pattern PATTERN_SCL_KEYWORDS = Pattern.compile(
-        "\\b(Object|Component|Template|Package|import|export|struct|table|null|true|false|LocalAabb|Position|Depth|Rotation|Scaling|Hidden|OnLoad|ClassName|Identifier|TemplateName)\\b"
-    );
-    private static final Pattern PATTERN_SCL_COMPONENTS = Pattern.compile(
-        "\\b(BackgroundComponent|MeshComponent|GroundPolygonComponent|PhysicsComponent|SpawnPointComponent|WaterMesh|MovingPlatformComponent|TriggerComponent|ItemComponent|EnemyComponent|DoorComponent|LightComponent|AudioSourceComponent|CameraComponent|ParticleComponent)\\b"
-    );
-    private static final Pattern PATTERN_SCL_LUA_TAGS = Pattern.compile(
-        "\\$lua|\\$end"
-    );
-    private static final Pattern PATTERN_GLSL_KEYWORDS = Pattern.compile(
-        "\\b(void|float|int|vec2|vec3|vec4|mat4|uniform|attribute|varying|precision|mediump|highp|lowp|sampler2D|texture2D|discard|return|struct|if|else)\\b"
-    );
 
     private String mFilePath = "";
-    private String mInitialContent = "";
     private boolean mIsModified = false;
-    private boolean mIsFormatting = false;
     private boolean mIsFileriftTranscoded = false;
     private String mFileType = "";
+    private boolean mInitialLoadDone = false;
+    private boolean mIsWordWrap = false;
 
+    // UI Widgets
+    private CodeEditor mEditor;
     private TextView mTitleText;
-    private TextView mSubtitleText;
-    private TextView mDirtyIndicator;
-    private Button mUndoBtn;
-    private Button mRedoBtn;
+    private View mStatusDot;
+    private TextView mFormatBadge;
     private Button mSaveBtn;
     private Button mVisualBtn;
+    private Button mUndoBtn;
+    private Button mRedoBtn;
+    private Button mWrapBtn;
 
+    // Search Bar
     private LinearLayout mSearchBar;
     private EditText mSearchInput;
     private TextView mSearchCountLabel;
-    private final List<Integer> mSearchMatches = new ArrayList<>();
-    private int mCurrentSearchIndex = -1;
+    private LinearLayout mReplaceRow;
+    private EditText mReplaceInput;
+    private boolean mSearchBarVisible = false;
+    private boolean mReplaceRowVisible = false;
 
-    private LineNumberView mLineNumberView;
-    private EditText mCodeEditor;
-    private ScrollView mVerticalScroll;
+    // Loading overlay
     private FrameLayout mLoadingOverlay;
     private TextView mLoadingLabel;
 
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService mIoExecutor = Executors.newSingleThreadExecutor();
-    private final Runnable mHighlightRunnable = this::applySyntaxHighlighting;
-    private final Runnable mHistoryRunnable = this::recordHistoryImmediately;
-
-    // Undo / Redo history
-    private static class EditHistory {
-        final String text;
-        final int selectionStart;
-        final int selectionEnd;
-        EditHistory(String t, int s, int e) {
-            text = t;
-            selectionStart = s;
-            selectionEnd = e;
-        }
-    }
-    private final List<EditHistory> mUndoStack = new ArrayList<>();
-    private final List<EditHistory> mRedoStack = new ArrayList<>();
-    private boolean mIsUndoRedoAction = false;
-
-    /**
-     * Custom lightweight LineNumberView that draws only visible lines on demand.
-     * Replaces heavy multi-thousand line TextView measuring with direct canvas text draws.
-     */
-    public static class LineNumberView extends View {
-        private final Paint mPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private int mLineCount = 1;
-        private int mScrollY = 0;
-        private int mMaxDigits = 2;
-        private float mCharWidth = 0;
-        private EditText mEditor;
-
-        public LineNumberView(Context context) {
-            super(context);
-            mPaint.setColor(TEXT_MUTED);
-            mPaint.setTypeface(Typeface.MONOSPACE);
-            mPaint.setTextAlign(Paint.Align.RIGHT);
-        }
-
-        public void setEditor(EditText editor) {
-            mEditor = editor;
-            mPaint.setTextSize(editor.getTextSize());
-            mCharWidth = mPaint.measureText("8");
-            requestLayout();
-            invalidate();
-        }
-
-        public void setLineCount(int count) {
-            if (count < 1) count = 1;
-            if (mLineCount != count) {
-                mLineCount = count;
-                int digits = Math.max(2, String.valueOf(mLineCount).length());
-                if (digits != mMaxDigits) {
-                    mMaxDigits = digits;
-                    requestLayout();
-                }
-                invalidate();
-            }
-        }
-
-        public void updateScroll(int scrollY) {
-            if (mScrollY != scrollY) {
-                mScrollY = scrollY;
-                invalidate();
-            }
-        }
-
-        private int dpToPx(int dp) {
-            return (int) (dp * getResources().getDisplayMetrics().density);
-        }
-
-        @Override
-        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-            float charW = mCharWidth > 0 ? mCharWidth : dpToPx(8);
-            int width = (int) (charW * mMaxDigits + dpToPx(16));
-            setMeasuredDimension(width, MeasureSpec.getSize(heightMeasureSpec));
-        }
-
-        @Override
-        protected void onDraw(Canvas canvas) {
-            super.onDraw(canvas);
-            if (mEditor == null) return;
-
-            Layout layout = mEditor.getLayout();
-            if (layout == null) return;
-
-            int totalLines = layout.getLineCount();
-            if (totalLines <= 0) return;
-
-            int viewHeight = getHeight();
-            int firstLine = layout.getLineForVertical(mScrollY);
-            int lastLine = layout.getLineForVertical(mScrollY + viewHeight);
-
-            if (firstLine < 0) firstLine = 0;
-            if (lastLine >= totalLines) lastLine = totalLines - 1;
-
-            int editorPaddingTop = mEditor.getExtendedPaddingTop();
-            float rightX = getWidth() - dpToPx(6);
-
-            for (int i = firstLine; i <= lastLine; i++) {
-                int baseline = editorPaddingTop + layout.getLineBaseline(i) - mScrollY;
-                canvas.drawText(String.valueOf(i + 1), rightX, baseline, mPaint);
-            }
-        }
-    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        requestWindowFeature(Window.FEATURE_NO_TITLE);
         super.onCreate(savedInstanceState);
 
-        // Dark edge-to-edge window
+        // Window background and soft input behavior
         Window window = getWindow();
-        window.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(BG_COLOR));
+        window.setBackgroundDrawable(new ColorDrawable(BG_COLOR));
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.setDecorFitsSystemWindows(true);
-        }
+        window.setStatusBarColor(SURFACE_COLOR);
+        window.setNavigationBarColor(SURFACE_ALT_COLOR);
 
         mFilePath = getIntent().getStringExtra("file_path");
         if (mFilePath == null) mFilePath = "";
 
-        // Build root UI hierarchy
+        // Root layout
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(BG_COLOR);
 
-        // 1. Header Toolbar
-        View header = buildHeaderView();
-        root.addView(header);
+        // 1. Top Header Toolbar (Strictly fixed height 48dp)
+        root.addView(buildHeaderView());
 
-        // 2. Search / Find Bar (initially hidden)
+        // 1b. Header Divider Line (1dp)
+        View headerDivider = new View(this);
+        headerDivider.setBackgroundColor(BORDER_COLOR);
+        root.addView(headerDivider, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(1)));
+
+        // 2. Search / Replace Panel (Collapsible)
         mSearchBar = buildSearchBar();
+        mSearchBar.setVisibility(View.GONE);
         root.addView(mSearchBar);
 
-        // 3. High-performance Editor Container with synchronized Gutter
-        View editorContainer = buildEditorContainer();
+        // 3. Editor Container with Loading Overlay
+        FrameLayout editorContainer = new FrameLayout(this);
         LinearLayout.LayoutParams editorLp = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f
-        );
-        root.addView(editorContainer, editorLp);
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f);
+        editorContainer.setLayoutParams(editorLp);
 
-        // 4. Soft Keyboard Accessory Bar
-        View accessoryBar = buildAccessoryBar();
-        root.addView(accessoryBar);
+        mEditor = new CodeEditor(this);
+        mEditor.setColorScheme(new SchemeRubyDark());
+        mEditor.setTextSize(14f);
+        mEditor.setScalable(true);
+        mEditor.setLineNumberEnabled(true);
+        mEditor.setHighlightCurrentLine(true);
+        mEditor.setHighlightBracketPair(true);
+        mEditor.setTabWidth(4);
+        mEditor.setTypefaceText(Typeface.MONOSPACE);
+        mEditor.setTypefaceLineNumber(Typeface.MONOSPACE);
+        mEditor.setWordwrap(false);
+
+        // Track text changes for modified indicator and undo/redo state
+        mEditor.subscribeEvent(ContentChangeEvent.class, (event, unsubscribe) -> {
+            if (mInitialLoadDone) {
+                mHandler.post(() -> {
+                    if (!mIsModified) {
+                        mIsModified = true;
+                        updateStatusIndicators();
+                    }
+                    updateUndoRedoButtons();
+                });
+            }
+        });
+
+        // Search match updates
+        mEditor.subscribeEvent(PublishSearchResultEvent.class, (event, unsubscribe) -> {
+            mHandler.post(this::updateSearchMatchCount);
+        });
+
+        editorContainer.addView(mEditor, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // Loading overlay
+        mLoadingOverlay = buildLoadingOverlay();
+        editorContainer.addView(mLoadingOverlay, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        root.addView(editorContainer);
+
+        // 4. Accessory Bar Divider Line (1dp)
+        View accessoryDivider = new View(this);
+        accessoryDivider.setBackgroundColor(BORDER_COLOR);
+        root.addView(accessoryDivider, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(1)));
+
+        // 5. Soft Keyboard Symbol Accessory Bar (Strictly fixed height 40dp)
+        root.addView(buildAccessoryBar());
 
         setContentView(root);
 
-        // Setup event watchers and trigger background async load
-        setupTextWatchers();
-        loadFileContent();
-    }
-
-    @Override
-    protected void onDestroy() {
-        super.onDestroy();
-        mHandler.removeCallbacksAndMessages(null);
-        if (!mIoExecutor.isShutdown()) {
-            mIoExecutor.shutdownNow();
-        }
+        // Start loading the file asynchronously
+        loadFileAsync();
     }
 
     private View buildHeaderView() {
@@ -336,872 +246,644 @@ public class CodeEditorActivity extends Activity {
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setBackgroundColor(SURFACE_COLOR);
-        int padH = dp(12);
-        int padV = dp(8);
-        bar.setPadding(padH, padV, padH, padV);
+        bar.setPadding(dpToPx(10), 0, dpToPx(8), 0);
 
-        // Back Button
-        Button backBtn = createHeaderButton("<");
-        backBtn.setOnClickListener(v -> handleBackNavigation());
+        LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(48));
+        bar.setLayoutParams(barLp);
+
+        // Back button (vector icon, crisp 34dp x 34dp)
+        ImageButton backBtn = new ImageButton(this);
+        backBtn.setImageResource(R.drawable.ic_arrow_back_24);
+        backBtn.setColorFilter(TEXT_PRIMARY);
+        backBtn.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        backBtn.setPadding(dpToPx(6), dpToPx(6), dpToPx(6), dpToPx(6));
+        backBtn.setBackground(createButtonRippleDrawable(SURFACE_COLOR, BORDER_COLOR, dpToPx(6)));
+        LinearLayout.LayoutParams backLp = new LinearLayout.LayoutParams(dpToPx(34), dpToPx(34));
+        backLp.rightMargin = dpToPx(6);
+        backBtn.setLayoutParams(backLp);
+        backBtn.setOnClickListener(v -> handleBackAction());
         bar.addView(backBtn);
 
-        // Title and Subtitle Container
-        LinearLayout titleBox = new LinearLayout(this);
-        titleBox.setOrientation(LinearLayout.VERTICAL);
-        titleBox.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams titleBoxLp = new LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f
-        );
-        titleBoxLp.leftMargin = dp(10);
-        titleBoxLp.rightMargin = dp(6);
-
-        LinearLayout titleRow = new LinearLayout(this);
-        titleRow.setOrientation(LinearLayout.HORIZONTAL);
-        titleRow.setGravity(Gravity.CENTER_VERTICAL);
+        // Title Block (File name + clean status dot + format badge)
+        LinearLayout titleCol = new LinearLayout(this);
+        titleCol.setOrientation(LinearLayout.HORIZONTAL);
+        titleCol.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.0f);
+        titleLp.leftMargin = dpToPx(2);
+        titleLp.rightMargin = dpToPx(6);
+        titleCol.setLayoutParams(titleLp);
 
         mTitleText = new TextView(this);
-        File f = new File(mFilePath);
-        mTitleText.setText(mFilePath.isEmpty() ? "Untitled" : f.getName());
         mTitleText.setTextColor(TEXT_PRIMARY);
-        mTitleText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        mTitleText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         mTitleText.setTypeface(Typeface.DEFAULT_BOLD);
-        titleRow.addView(mTitleText);
+        mTitleText.setSingleLine(true);
+        mTitleText.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        File f = new File(mFilePath);
+        mTitleText.setText(f.getName().isEmpty() ? "Untitled" : f.getName());
+        LinearLayout.LayoutParams textLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        mTitleText.setLayoutParams(textLp);
+        titleCol.addView(mTitleText);
 
-        mDirtyIndicator = new TextView(this);
-        mDirtyIndicator.setText(" *");
-        mDirtyIndicator.setTextColor(ACCENT_CRIMSON);
-        mDirtyIndicator.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        mDirtyIndicator.setVisibility(View.GONE);
-        titleRow.addView(mDirtyIndicator);
+        // Clean status dot (circular dot, no emoji)
+        mStatusDot = new View(this);
+        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dpToPx(6), dpToPx(6));
+        dotLp.leftMargin = dpToPx(6);
+        mStatusDot.setLayoutParams(dotLp);
+        mStatusDot.setBackground(createDotDrawable(ACCENT_GREEN));
+        titleCol.addView(mStatusDot);
 
-        titleBox.addView(titleRow);
+        // Format badge (small pill badge for Protobuf / Scene / SCL)
+        mFormatBadge = new TextView(this);
+        mFormatBadge.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+        mFormatBadge.setTextColor(ACCENT_CYAN);
+        mFormatBadge.setTypeface(Typeface.DEFAULT_BOLD);
+        mFormatBadge.setPadding(dpToPx(5), dpToPx(1), dpToPx(5), dpToPx(1));
+        GradientDrawable badgeBg = new GradientDrawable();
+        badgeBg.setColor(0xFF1E293B);
+        badgeBg.setCornerRadius(dpToPx(3));
+        mFormatBadge.setBackground(badgeBg);
+        LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        badgeLp.leftMargin = dpToPx(6);
+        mFormatBadge.setLayoutParams(badgeLp);
+        mFormatBadge.setVisibility(View.GONE);
+        titleCol.addView(mFormatBadge);
 
-        mSubtitleText = new TextView(this);
-        mSubtitleText.setText(mFilePath.isEmpty() ? "New Buffer" : mFilePath);
-        mSubtitleText.setTextColor(TEXT_MUTED);
-        mSubtitleText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-        mSubtitleText.setSingleLine(true);
-        mSubtitleText.setEllipsize(android.text.TextUtils.TruncateAt.START);
-        titleBox.addView(mSubtitleText);
+        bar.addView(titleCol);
 
-        bar.addView(titleBox, titleBoxLp);
-
-        // Undo Button
-        mUndoBtn = createHeaderButton("Undo");
-        mUndoBtn.setOnClickListener(v -> performUndo());
-        bar.addView(mUndoBtn);
-
-        // Redo Button
-        mRedoBtn = createHeaderButton("Redo");
-        mRedoBtn.setOnClickListener(v -> performRedo());
-        bar.addView(mRedoBtn);
-
-        // Search Button
-        Button searchBtn = createHeaderButton("Find");
-        searchBtn.setOnClickListener(v -> toggleSearchBar());
-        bar.addView(searchBtn);
-
-        // 3D Visual View Button (for .scene files)
+        // 3D Viewport return button (for .scene and .scl files)
         String lower = mFilePath.toLowerCase();
-        if (lower.endsWith(".scene")) {
-            mVisualBtn = createHeaderButton("3D");
+        if (lower.endsWith(".scene") || lower.endsWith(".scl")) {
+            mVisualBtn = new Button(this);
+            mVisualBtn.setText("3D");
             mVisualBtn.setTextColor(ACCENT_CYAN);
-            mVisualBtn.setOnClickListener(v -> {
-                if (mIsModified) {
-                    new AlertDialog.Builder(this)
-                        .setTitle("Save before 3D View?")
-                        .setMessage("Save changes to " + new File(mFilePath).getName() + " before switching to 3D Viewport?")
-                        .setPositiveButton("Save & Open", (dialog, which) -> {
-                            saveFile();
-                            if (!mIsModified) {
-                                Intent data = new Intent();
-                                data.putExtra("file_path", mFilePath);
-                                data.putExtra("action", "open_visual");
-                                setResult(RESULT_OK, data);
-                                finish();
-                            }
-                        })
-                        .setNegativeButton("Cancel", null)
-                        .show();
-                } else {
-                    Intent data = new Intent();
-                    data.putExtra("file_path", mFilePath);
-                    data.putExtra("action", "open_visual");
-                    setResult(RESULT_OK, data);
-                    finish();
-                }
-            });
+            mVisualBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            mVisualBtn.setTypeface(Typeface.DEFAULT_BOLD);
+            mVisualBtn.setPadding(dpToPx(8), 0, dpToPx(8), 0);
+            mVisualBtn.setBackground(createPillDrawable(0xFF162630, ACCENT_CYAN, dpToPx(6)));
+            LinearLayout.LayoutParams visualLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dpToPx(30));
+            visualLp.rightMargin = dpToPx(6);
+            mVisualBtn.setLayoutParams(visualLp);
+            mVisualBtn.setOnClickListener(v -> handle3DViewAction());
             bar.addView(mVisualBtn);
         }
 
-        // Save Button
+        // Find Button (vector icon, crisp 34dp x 32dp)
+        ImageButton findBtn = new ImageButton(this);
+        findBtn.setImageResource(R.drawable.ic_search_24);
+        findBtn.setColorFilter(TEXT_PRIMARY);
+        findBtn.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        findBtn.setPadding(dpToPx(6), dpToPx(6), dpToPx(6), dpToPx(6));
+        findBtn.setBackground(createButtonRippleDrawable(SURFACE_COLOR, BORDER_COLOR, dpToPx(6)));
+        LinearLayout.LayoutParams findLp = new LinearLayout.LayoutParams(dpToPx(34), dpToPx(32));
+        findLp.rightMargin = dpToPx(6);
+        findBtn.setLayoutParams(findLp);
+        findBtn.setOnClickListener(v -> toggleSearchBar());
+        bar.addView(findBtn);
+
+        // Save Button (Clean typography, dynamic color state, no emoji)
         mSaveBtn = new Button(this);
         mSaveBtn.setText("SAVE");
-        mSaveBtn.setTextColor(Color.WHITE);
+        mSaveBtn.setTextColor(0xFF707888);
         mSaveBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
         mSaveBtn.setTypeface(Typeface.DEFAULT_BOLD);
-        GradientDrawable saveBg = new GradientDrawable();
-        saveBg.setColor(ACCENT_CRIMSON);
-        saveBg.setCornerRadius(dp(4));
-        mSaveBtn.setBackground(saveBg);
-        int btnPadH = dp(12);
-        int btnPadV = dp(6);
-        mSaveBtn.setPadding(btnPadH, btnPadV, btnPadH, btnPadV);
-        mSaveBtn.setOnClickListener(v -> saveFile());
+        mSaveBtn.setPadding(dpToPx(12), 0, dpToPx(12), 0);
+        mSaveBtn.setBackground(createButtonRippleDrawable(0xFF1E2128, BORDER_COLOR, dpToPx(6)));
         LinearLayout.LayoutParams saveLp = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)
-        );
-        saveLp.leftMargin = dp(6);
-        bar.addView(mSaveBtn, saveLp);
+            ViewGroup.LayoutParams.WRAP_CONTENT, dpToPx(30));
+        mSaveBtn.setLayoutParams(saveLp);
+        mSaveBtn.setOnClickListener(v -> saveFileAsync(null));
+        bar.addView(mSaveBtn);
 
         return bar;
-    }
-
-    private Button createHeaderButton(String label) {
-        Button btn = new Button(this);
-        btn.setText(label);
-        btn.setTextColor(TEXT_PRIMARY);
-        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        btn.setTypeface(Typeface.DEFAULT_BOLD);
-        btn.setBackgroundColor(Color.TRANSPARENT);
-        btn.setPadding(dp(8), dp(4), dp(8), dp(4));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-            dp(36), dp(36)
-        );
-        lp.leftMargin = dp(2);
-        btn.setLayoutParams(lp);
-        return btn;
     }
 
     private LinearLayout buildSearchBar() {
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setBackgroundColor(SURFACE_ALT_COLOR);
-        bar.setPadding(dp(12), dp(6), dp(12), dp(6));
-        bar.setVisibility(View.GONE);
+        LinearLayout searchLayout = new LinearLayout(this);
+        searchLayout.setOrientation(LinearLayout.VERTICAL);
+        searchLayout.setBackgroundColor(SURFACE_ALT_COLOR);
+        int padH = dpToPx(8);
+        int padV = dpToPx(6);
+        searchLayout.setPadding(padH, padV, padH, padV);
+
+        // Row 1: Find Row
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        row1.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams row1Lp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(34));
+        row1.setLayoutParams(row1Lp);
 
         mSearchInput = new EditText(this);
-        mSearchInput.setHint("Find in text...");
+        mSearchInput.setHint("Find in file...");
         mSearchInput.setHintTextColor(TEXT_MUTED);
         mSearchInput.setTextColor(TEXT_PRIMARY);
-        mSearchInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        mSearchInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        mSearchInput.setBackground(createInputBackground());
+        mSearchInput.setPadding(dpToPx(8), 0, dpToPx(8), 0);
         mSearchInput.setSingleLine(true);
-        mSearchInput.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
-        mSearchInput.setBackgroundColor(Color.TRANSPARENT);
-        LinearLayout.LayoutParams inputLp = new LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f
-        );
-        bar.addView(mSearchInput, inputLp);
+        LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(0, dpToPx(30), 1.0f);
+        mSearchInput.setLayoutParams(searchLp);
+        mSearchInput.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                performSearch(s.toString());
+            }
+            @Override public void afterTextChanged(Editable s) {}
+        });
+        row1.addView(mSearchInput);
 
         mSearchCountLabel = new TextView(this);
         mSearchCountLabel.setTextColor(TEXT_MUTED);
-        mSearchCountLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        mSearchCountLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        mSearchCountLabel.setTypeface(Typeface.MONOSPACE);
+        mSearchCountLabel.setPadding(dpToPx(6), 0, dpToPx(6), 0);
         mSearchCountLabel.setText("0/0");
-        mSearchCountLabel.setPadding(dp(6), 0, dp(6), 0);
-        bar.addView(mSearchCountLabel);
+        row1.addView(mSearchCountLabel);
 
-        Button prevBtn = createHeaderButton("Up");
-        prevBtn.setOnClickListener(v -> navigateSearch(-1));
-        bar.addView(prevBtn);
-
-        Button nextBtn = createHeaderButton("Dn");
-        nextBtn.setOnClickListener(v -> navigateSearch(1));
-        bar.addView(nextBtn);
-
-        Button closeBtn = createHeaderButton("X");
-        closeBtn.setOnClickListener(v -> toggleSearchBar());
-        bar.addView(closeBtn);
-
-        mSearchInput.addTextChangedListener(new TextWatcher() {
-            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {}
-            @Override
-            public void afterTextChanged(Editable s) {
-                runSearch(s.toString());
+        // Prev match button
+        ImageButton prevBtn = new ImageButton(this);
+        prevBtn.setImageResource(R.drawable.ic_arrow_up_24);
+        prevBtn.setColorFilter(TEXT_PRIMARY);
+        prevBtn.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        prevBtn.setPadding(dpToPx(4), dpToPx(4), dpToPx(4), dpToPx(4));
+        prevBtn.setBackground(createButtonRippleDrawable(SURFACE_COLOR, BORDER_COLOR, dpToPx(4)));
+        LinearLayout.LayoutParams prevLp = new LinearLayout.LayoutParams(dpToPx(28), dpToPx(28));
+        prevLp.leftMargin = dpToPx(2);
+        prevBtn.setLayoutParams(prevLp);
+        prevBtn.setOnClickListener(v -> {
+            if (mEditor != null && mEditor.getSearcher().hasQuery()) {
+                mEditor.getSearcher().gotoPrevious();
+                updateSearchMatchCount();
             }
         });
+        row1.addView(prevBtn);
 
-        return bar;
+        // Next match button
+        ImageButton nextBtn = new ImageButton(this);
+        nextBtn.setImageResource(R.drawable.ic_arrow_down_24);
+        nextBtn.setColorFilter(TEXT_PRIMARY);
+        nextBtn.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        nextBtn.setPadding(dpToPx(4), dpToPx(4), dpToPx(4), dpToPx(4));
+        nextBtn.setBackground(createButtonRippleDrawable(SURFACE_COLOR, BORDER_COLOR, dpToPx(4)));
+        LinearLayout.LayoutParams nextLp = new LinearLayout.LayoutParams(dpToPx(28), dpToPx(28));
+        nextLp.leftMargin = dpToPx(2);
+        nextBtn.setLayoutParams(nextLp);
+        nextBtn.setOnClickListener(v -> {
+            if (mEditor != null && mEditor.getSearcher().hasQuery()) {
+                mEditor.getSearcher().gotoNext();
+                updateSearchMatchCount();
+            }
+        });
+        row1.addView(nextBtn);
+
+        // Replace toggle button
+        Button repToggleBtn = new Button(this);
+        repToggleBtn.setText("Rep");
+        repToggleBtn.setTextColor(TEXT_PRIMARY);
+        repToggleBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        repToggleBtn.setBackground(createButtonRippleDrawable(SURFACE_COLOR, BORDER_COLOR, dpToPx(4)));
+        repToggleBtn.setPadding(dpToPx(6), 0, dpToPx(6), 0);
+        LinearLayout.LayoutParams repToggleLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dpToPx(28));
+        repToggleLp.leftMargin = dpToPx(3);
+        repToggleBtn.setLayoutParams(repToggleLp);
+        repToggleBtn.setOnClickListener(v -> {
+            mReplaceRowVisible = !mReplaceRowVisible;
+            mReplaceRow.setVisibility(mReplaceRowVisible ? View.VISIBLE : View.GONE);
+            repToggleBtn.setTextColor(mReplaceRowVisible ? ACCENT_CYAN : TEXT_PRIMARY);
+        });
+        row1.addView(repToggleBtn);
+
+        // Close search button
+        ImageButton closeBtn = new ImageButton(this);
+        closeBtn.setImageResource(R.drawable.ic_close_24);
+        closeBtn.setColorFilter(TEXT_MUTED);
+        closeBtn.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        closeBtn.setPadding(dpToPx(4), dpToPx(4), dpToPx(4), dpToPx(4));
+        closeBtn.setBackground(createButtonRippleDrawable(SURFACE_COLOR, BORDER_COLOR, dpToPx(4)));
+        LinearLayout.LayoutParams closeLp = new LinearLayout.LayoutParams(dpToPx(28), dpToPx(28));
+        closeLp.leftMargin = dpToPx(2);
+        closeBtn.setLayoutParams(closeLp);
+        closeBtn.setOnClickListener(v -> toggleSearchBar());
+        row1.addView(closeBtn);
+
+        searchLayout.addView(row1);
+
+        // Row 2: Replace Row (Collapsible)
+        mReplaceRow = new LinearLayout(this);
+        mReplaceRow.setOrientation(LinearLayout.HORIZONTAL);
+        mReplaceRow.setGravity(Gravity.CENTER_VERTICAL);
+        mReplaceRow.setVisibility(View.GONE);
+        LinearLayout.LayoutParams repRowLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(34));
+        repRowLp.topMargin = dpToPx(4);
+        mReplaceRow.setLayoutParams(repRowLp);
+
+        mReplaceInput = new EditText(this);
+        mReplaceInput.setHint("Replace with...");
+        mReplaceInput.setHintTextColor(TEXT_MUTED);
+        mReplaceInput.setTextColor(TEXT_PRIMARY);
+        mReplaceInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        mReplaceInput.setBackground(createInputBackground());
+        mReplaceInput.setPadding(dpToPx(8), 0, dpToPx(8), 0);
+        mReplaceInput.setSingleLine(true);
+        LinearLayout.LayoutParams repLp = new LinearLayout.LayoutParams(0, dpToPx(30), 1.0f);
+        mReplaceInput.setLayoutParams(repLp);
+        mReplaceRow.addView(mReplaceInput);
+
+        Button repBtn = new Button(this);
+        repBtn.setText("This");
+        repBtn.setTextColor(TEXT_PRIMARY);
+        repBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        repBtn.setBackground(createButtonRippleDrawable(SURFACE_COLOR, BORDER_COLOR, dpToPx(4)));
+        repBtn.setPadding(dpToPx(8), 0, dpToPx(8), 0);
+        LinearLayout.LayoutParams repBtnLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dpToPx(28));
+        repBtnLp.leftMargin = dpToPx(4);
+        repBtn.setLayoutParams(repBtnLp);
+        repBtn.setOnClickListener(v -> {
+            if (mEditor != null && mEditor.getSearcher().hasQuery()) {
+                mEditor.getSearcher().replaceCurrentMatch(mReplaceInput.getText().toString());
+                updateSearchMatchCount();
+            }
+        });
+        mReplaceRow.addView(repBtn);
+
+        Button repAllBtn = new Button(this);
+        repAllBtn.setText("All");
+        repAllBtn.setTextColor(ACCENT_ORANGE);
+        repAllBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        repAllBtn.setBackground(createButtonRippleDrawable(SURFACE_COLOR, BORDER_COLOR, dpToPx(4)));
+        repAllBtn.setPadding(dpToPx(8), 0, dpToPx(8), 0);
+        LinearLayout.LayoutParams repAllLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dpToPx(28));
+        repAllLp.leftMargin = dpToPx(3);
+        repAllBtn.setLayoutParams(repAllLp);
+        repAllBtn.setOnClickListener(v -> {
+            if (mEditor != null && mEditor.getSearcher().hasQuery()) {
+                mEditor.getSearcher().replaceAll(mReplaceInput.getText().toString());
+                updateSearchMatchCount();
+            }
+        });
+        mReplaceRow.addView(repAllBtn);
+
+        searchLayout.addView(mReplaceRow);
+
+        // Bottom separator under search layout
+        View searchDivider = new View(this);
+        searchDivider.setBackgroundColor(BORDER_COLOR);
+        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(1));
+        divLp.topMargin = dpToPx(6);
+        searchLayout.addView(searchDivider, divLp);
+
+        return searchLayout;
     }
 
-    private void toggleSearchBar() {
-        if (mSearchBar.getVisibility() == View.VISIBLE) {
-            mSearchBar.setVisibility(View.GONE);
-            mSearchMatches.clear();
-            mCurrentSearchIndex = -1;
-        } else {
-            mSearchBar.setVisibility(View.VISIBLE);
-            mSearchInput.requestFocus();
+    private View buildAccessoryBar() {
+        HorizontalScrollView scroll = new HorizontalScrollView(this);
+        scroll.setBackgroundColor(SURFACE_ALT_COLOR);
+        scroll.setHorizontalScrollBarEnabled(false);
+        scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
+
+        LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dpToPx(40));
+        scroll.setLayoutParams(scrollLp);
+
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        int padH = dpToPx(4);
+        int padV = dpToPx(3);
+        bar.setPadding(padH, padV, padH, padV);
+
+        // Core Touch Controls: Undo, Redo, Tab, Untab, Wrap
+        mUndoBtn = addSymbolButton(bar, "Undo", () -> {
+            if (mEditor != null && mEditor.canUndo()) {
+                mEditor.undo();
+                updateUndoRedoButtons();
+            }
+        });
+        mUndoBtn.setEnabled(false);
+        mUndoBtn.setAlpha(0.4f);
+
+        mRedoBtn = addSymbolButton(bar, "Redo", () -> {
+            if (mEditor != null && mEditor.canRedo()) {
+                mEditor.redo();
+                updateUndoRedoButtons();
+            }
+        });
+        mRedoBtn.setEnabled(false);
+        mRedoBtn.setAlpha(0.4f);
+
+        addSymbolButton(bar, "Tab", () -> {
+            if (mEditor != null) mEditor.indentOrCommitTab();
+        });
+        addSymbolButton(bar, "Untab", () -> {
+            if (mEditor != null) mEditor.unindentSelection();
+        });
+
+        mWrapBtn = addSymbolButton(bar, "Wrap", () -> {
+            mIsWordWrap = !mIsWordWrap;
+            if (mEditor != null) {
+                mEditor.setWordwrap(mIsWordWrap);
+            }
+            mWrapBtn.setTextColor(mIsWordWrap ? ACCENT_CYAN : TEXT_PRIMARY);
+        });
+
+        // Surrounding pairs (Auto-wraps selection or inserts pair)
+        addPairButton(bar, "{ }", "{", "}");
+        addPairButton(bar, "[ ]", "[", "]");
+        addPairButton(bar, "( )", "(", ")");
+        addPairButton(bar, "\" \"", "\"", "\"");
+        addPairButton(bar, "' '", "'", "'");
+        addPairButton(bar, "< >", "<", ">");
+
+        // Operators & Syntax Tokens
+        addInsertButton(bar, "=", "=");
+        addInsertButton(bar, ":", ":");
+        addInsertButton(bar, ";", ";");
+        addInsertButton(bar, ".", ".");
+        addInsertButton(bar, ",", ",");
+        addInsertButton(bar, "$", "$");
+        addInsertButton(bar, "_", "_");
+        addInsertButton(bar, "/", "/");
+        addInsertButton(bar, "\\", "\\");
+        addInsertButton(bar, "+", "+");
+        addInsertButton(bar, "-", "-");
+        addInsertButton(bar, "*", "*");
+        addInsertButton(bar, "!", "!");
+        addInsertButton(bar, "?", "?");
+        addInsertButton(bar, "&", "&");
+        addInsertButton(bar, "|", "|");
+        addInsertButton(bar, "#", "#");
+
+        // Language-specific tokens
+        String low = mFilePath.toLowerCase();
+        if (low.endsWith(".scene") || low.endsWith(".scl")) {
+            addInsertButton(bar, "$lua", "$lua\n");
+            addInsertButton(bar, "$end", "$end\n");
+            addInsertButton(bar, "Object", "Object {\n    \n}");
+            addInsertButton(bar, "Component", "Component {\n    \n}");
+            addInsertButton(bar, "Position", "Position {\n    X : 0\n    Y : 0\n}");
+            addInsertButton(bar, "LocalAabb", "LocalAabb {\n    X : 0\n    Y : 0\n    Width : 1\n    Height : 1\n}");
         }
+
+        if (low.endsWith(".lua") || low.endsWith(".scene") || low.endsWith(".scl")) {
+            addInsertButton(bar, "local", "local ");
+            addInsertButton(bar, "function", "function ");
+            addInsertButton(bar, "end", "end");
+            addInsertButton(bar, "return", "return ");
+            addInsertButton(bar, "if", "if ");
+            addInsertButton(bar, "then", "then ");
+            addInsertButton(bar, "else", "else\n    ");
+            addInsertButton(bar, "true", "true");
+            addInsertButton(bar, "false", "false");
+            addInsertButton(bar, "nil", "nil");
+        }
+
+        if (low.endsWith(".vert") || low.endsWith(".frag") || low.endsWith(".glsl")) {
+            addInsertButton(bar, "uniform", "uniform ");
+            addInsertButton(bar, "attribute", "attribute ");
+            addInsertButton(bar, "varying", "varying ");
+            addInsertButton(bar, "vec2", "vec2 ");
+            addInsertButton(bar, "vec3", "vec3 ");
+            addInsertButton(bar, "vec4", "vec4 ");
+            addInsertButton(bar, "mat4", "mat4 ");
+            addInsertButton(bar, "float", "float ");
+            addInsertButton(bar, "void", "void ");
+        }
+
+        scroll.addView(bar);
+        return scroll;
     }
 
-    private void runSearch(String query) {
-        mSearchMatches.clear();
-        mCurrentSearchIndex = -1;
-        if (query.isEmpty() || mCodeEditor == null || mCodeEditor.getText() == null) {
-            mSearchCountLabel.setText("0/0");
-            return;
-        }
+    private Button addSymbolButton(LinearLayout bar, String text, Runnable action) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setTextColor(TEXT_PRIMARY);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        b.setTypeface(Typeface.MONOSPACE);
+        b.setBackground(createButtonRippleDrawable(0xFF1E2128, 0xFF2C303B, dpToPx(5)));
+        int padH = dpToPx(8);
+        b.setPadding(padH, 0, padH, 0);
+        b.setMinWidth(dpToPx(32));
 
-        String content = mCodeEditor.getText().toString();
-        int idx = content.indexOf(query);
-        while (idx >= 0) {
-            mSearchMatches.add(idx);
-            idx = content.indexOf(query, idx + query.length());
-        }
-
-        if (!mSearchMatches.isEmpty()) {
-            mCurrentSearchIndex = 0;
-            navigateSearch(0);
-        } else {
-            mSearchCountLabel.setText("0/0");
-        }
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, dpToPx(30));
+        lp.setMargins(dpToPx(2), 0, dpToPx(2), 0);
+        b.setLayoutParams(lp);
+        b.setOnClickListener(v -> action.run());
+        bar.addView(b);
+        return b;
     }
 
-    private void navigateSearch(int direction) {
-        if (mSearchMatches.isEmpty() || mCodeEditor == null) return;
-        mCurrentSearchIndex = (mCurrentSearchIndex + direction + mSearchMatches.size()) % mSearchMatches.size();
-        int matchPos = mSearchMatches.get(mCurrentSearchIndex);
-        int qLen = mSearchInput.getText().length();
-
-        mSearchCountLabel.setText((mCurrentSearchIndex + 1) + "/" + mSearchMatches.size());
-        mCodeEditor.setSelection(matchPos, matchPos + qLen);
-        mCodeEditor.requestFocus();
+    private void addInsertButton(LinearLayout bar, String label, String textToInsert) {
+        addSymbolButton(bar, label, () -> {
+            if (mEditor != null) {
+                mEditor.insertText(textToInsert, textToInsert.length());
+            }
+        });
     }
 
-    private View buildEditorContainer() {
-        FrameLayout editorWrapper = new FrameLayout(this);
-
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setBackgroundColor(BG_COLOR);
-
-        // 1. High performance custom gutter view
-        mLineNumberView = new LineNumberView(this);
-        mLineNumberView.setBackgroundColor(GUTTER_BG);
-        LinearLayout.LayoutParams gutterLp = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT
-        );
-        row.addView(mLineNumberView, gutterLp);
-
-        // 2. Divider line between gutter and code
-        View divider = new View(this);
-        divider.setBackgroundColor(BORDER_COLOR);
-        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(dp(1), ViewGroup.LayoutParams.MATCH_PARENT);
-        row.addView(divider, divLp);
-
-        // 3. Vertical scroll containing Horizontal scroll and Code Editor
-        mVerticalScroll = new ScrollView(this);
-        mVerticalScroll.setFillViewport(true);
-        mVerticalScroll.setBackgroundColor(BG_COLOR);
-
-        HorizontalScrollView hScroll = new HorizontalScrollView(this);
-        hScroll.setFillViewport(true);
-        hScroll.setBackgroundColor(BG_COLOR);
-
-        mCodeEditor = new EditText(this);
-        mCodeEditor.setTypeface(Typeface.MONOSPACE);
-        mCodeEditor.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
-        mCodeEditor.setTextColor(TEXT_PRIMARY);
-        mCodeEditor.setBackgroundColor(Color.TRANSPARENT);
-        mCodeEditor.setGravity(Gravity.TOP | Gravity.START);
-        mCodeEditor.setPadding(dp(10), dp(10), dp(20), dp(10));
-        mCodeEditor.setInputType(InputType.TYPE_CLASS_TEXT |
-                                 InputType.TYPE_TEXT_FLAG_MULTI_LINE |
-                                 InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        mCodeEditor.setHorizontallyScrolling(true);
-        mCodeEditor.setHighlightColor(0x55E06C75);
-
-        hScroll.addView(mCodeEditor, new ViewGroup.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT
-        ));
-
-        mVerticalScroll.addView(hScroll, new ViewGroup.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-        ));
-
-        LinearLayout.LayoutParams vScrollLp = new LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.MATCH_PARENT, 1.0f
-        );
-        row.addView(mVerticalScroll, vScrollLp);
-
-        editorWrapper.addView(row, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-        ));
-
-        // Connect editor to LineNumberView
-        mLineNumberView.setEditor(mCodeEditor);
-
-        // Synchronize vertical scroll with gutter and viewport syntax highlighting
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            mVerticalScroll.setOnScrollChangeListener((v, scrollX, scrollY, oldX, oldY) -> {
-                mLineNumberView.updateScroll(scrollY);
-                scheduleHighlight();
-            });
-        } else {
-            mVerticalScroll.getViewTreeObserver().addOnScrollChangedListener(() -> {
-                mLineNumberView.updateScroll(mVerticalScroll.getScrollY());
-                scheduleHighlight();
-            });
-        }
-
-        // 4. Loading Overlay (shown during async protobuf decode)
-        mLoadingOverlay = buildLoadingOverlay();
-        editorWrapper.addView(mLoadingOverlay, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-        ));
-
-        return editorWrapper;
+    private void addPairButton(LinearLayout bar, String label, String open, String close) {
+        addSymbolButton(bar, label, () -> {
+            if (mEditor == null) return;
+            if (mEditor.getCursor().isSelected()) {
+                int left = mEditor.getCursor().getLeft();
+                int right = mEditor.getCursor().getRight();
+                CharSequence selected = mEditor.getText().subSequence(left, right);
+                mEditor.getText().replace(left, right, open + selected + close);
+                mEditor.setSelection(left + open.length(), right + open.length());
+            } else {
+                mEditor.insertText(open + close, open.length());
+            }
+        });
     }
 
     private FrameLayout buildLoadingOverlay() {
         FrameLayout overlay = new FrameLayout(this);
-        overlay.setBackgroundColor(BG_COLOR);
+        overlay.setBackgroundColor(0xEE121316);
         overlay.setClickable(true);
+        overlay.setFocusable(true);
 
-        LinearLayout centerBox = new LinearLayout(this);
-        centerBox.setOrientation(LinearLayout.VERTICAL);
-        centerBox.setGravity(Gravity.CENTER);
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        FrameLayout.LayoutParams boxLp = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
+        box.setLayoutParams(boxLp);
 
         ProgressBar spinner = new ProgressBar(this);
-        spinner.setIndeterminate(true);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            spinner.setIndeterminateTintList(ColorStateList.valueOf(ACCENT_CRIMSON));
-        }
-        centerBox.addView(spinner, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        spinner.setIndeterminateTintList(ColorStateList.valueOf(ACCENT_CRIMSON));
+        box.addView(spinner);
 
         mLoadingLabel = new TextView(this);
-        mLoadingLabel.setText("Decoding file...");
+        mLoadingLabel.setText("Loading file...");
         mLoadingLabel.setTextColor(TEXT_PRIMARY);
-        mLoadingLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
-        mLoadingLabel.setTypeface(Typeface.DEFAULT_BOLD);
-        mLoadingLabel.setGravity(Gravity.CENTER);
-        LinearLayout.LayoutParams textLp = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        );
-        textLp.topMargin = dp(12);
-        centerBox.addView(mLoadingLabel, textLp);
+        mLoadingLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        mLoadingLabel.setPadding(0, dpToPx(12), 0, 0);
+        box.addView(mLoadingLabel);
 
-        FrameLayout.LayoutParams centerLp = new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            Gravity.CENTER
-        );
-        overlay.addView(centerBox, centerLp);
-
+        overlay.addView(box);
         return overlay;
     }
 
-    private View buildAccessoryBar() {
-        HorizontalScrollView barScroll = new HorizontalScrollView(this);
-        barScroll.setBackgroundColor(SURFACE_COLOR);
-        barScroll.setHorizontalScrollBarEnabled(false);
-
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(dp(4), dp(4), dp(4), dp(4));
-
-        String[] keys = {
-            "TAB", "UNTAB",
-            "{", "}", "(", ")", "[", "]",
-            "\"", "'", "=", "_", ":", ";",
-            ",", ".", "<", ">", "+", "-",
-            "*", "/", "\\", "!", "?", "#",
-            "$", "%", "&", "|", "~", "^"
-        };
-
-        for (String k : keys) {
-            Button btn = new Button(this);
-            btn.setText(k);
-            btn.setTextColor(TEXT_PRIMARY);
-            btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-            btn.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-            GradientDrawable btnBg = new GradientDrawable();
-            btnBg.setColor(SURFACE_ALT_COLOR);
-            btnBg.setCornerRadius(dp(4));
-            btnBg.setStroke(dp(1), BORDER_COLOR);
-            btn.setBackground(btnBg);
-            btn.setPadding(dp(6), dp(2), dp(6), dp(2));
-
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(32)
-            );
-            lp.leftMargin = dp(2);
-            lp.rightMargin = dp(2);
-
-            btn.setOnClickListener(v -> handleAccessoryKeyPress(k));
-            bar.addView(btn, lp);
-        }
-
-        barScroll.addView(bar, new ViewGroup.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-        ));
-
-        return barScroll;
-    }
-
-    private void handleAccessoryKeyPress(String key) {
-        if (mCodeEditor == null) return;
-        int start = mCodeEditor.getSelectionStart();
-        int end = mCodeEditor.getSelectionEnd();
-        Editable text = mCodeEditor.getText();
-        if (text == null) return;
-
-        if ("TAB".equals(key)) {
-            text.replace(start, end, "    ");
-            mCodeEditor.setSelection(start + 4);
-        } else if ("UNTAB".equals(key)) {
-            int lineStart = start;
-            while (lineStart > 0 && text.charAt(lineStart - 1) != '\n') {
-                lineStart--;
-            }
-            int spaces = 0;
-            while (spaces < 4 && (lineStart + spaces) < text.length() && text.charAt(lineStart + spaces) == ' ') {
-                spaces++;
-            }
-            if (spaces > 0) {
-                text.delete(lineStart, lineStart + spaces);
-                int newCursor = Math.max(lineStart, start - spaces);
-                mCodeEditor.setSelection(newCursor);
-            }
-        } else if (isPairSymbol(key)) {
-            String close = getClosingSymbol(key);
-            if (start != end) {
-                text.insert(end, close);
-                text.insert(start, key);
-                mCodeEditor.setSelection(start + 1, end + 1);
-            } else {
-                text.insert(start, key + close);
-                mCodeEditor.setSelection(start + 1);
-            }
-        } else {
-            text.replace(start, end, key);
-            mCodeEditor.setSelection(start + key.length());
-        }
-
-        recordHistoryImmediately();
-    }
-
-    private boolean isPairSymbol(String s) {
-        return "{".equals(s) || "(".equals(s) || "[".equals(s) || "\"".equals(s) || "'".equals(s);
-    }
-
-    private String getClosingSymbol(String s) {
-        switch (s) {
-            case "{": return "}";
-            case "(": return ")";
-            case "[": return "]";
-            case "\"": return "\"";
-            case "'": return "'";
-            default: return "";
-        }
-    }
-
-    /**
-     * Loads file contents asynchronously in a background thread.
-     * Prevents blocking the Android Main/UI thread during large FileRift protobuf decode.
-     */
-    private void loadFileContent() {
-        if (mFilePath == null || mFilePath.isEmpty()) {
-            hideLoadingOverlay();
-            return;
-        }
-
-        File file = new File(mFilePath);
-        if (!file.exists()) {
-            hideLoadingOverlay();
-            Toast.makeText(this, "New file: " + file.getName(), Toast.LENGTH_SHORT).show();
-            mInitialContent = "";
-            mCodeEditor.setText("");
-            mIsFileriftTranscoded = false;
-            updateTitleAndSubtitle();
-            return;
-        }
-
+    private void loadFileAsync() {
         mLoadingOverlay.setVisibility(View.VISIBLE);
-        mLoadingLabel.setText("Opening " + file.getName() + "...");
-        mCodeEditor.setEnabled(false);
-        mSaveBtn.setEnabled(false);
-
         mIoExecutor.execute(() -> {
-            boolean isFilerift = false;
-            String fileType = "";
-            String loadedContent = null;
+            boolean[] isFilerift = new boolean[1];
+            String[] fileType = new String[1];
+            String content = null;
+            String loadError = null;
 
             try {
-                boolean[] outFilerift = new boolean[1];
-                String[] outType = new String[1];
-                try {
-                    loadedContent = nativeLoadFile(mFilePath, outFilerift, outType);
-                } catch (UnsatisfiedLinkError e) {
-                    Log.w(TAG, "nativeLoadFile JNI unavailable: " + e.getMessage());
-                }
-
-                if (loadedContent != null) {
-                    isFilerift = outFilerift[0];
-                    fileType = outType[0] != null ? outType[0] : "";
-                } else {
-                    // Direct stream fallback
-                    try (BufferedReader reader = new BufferedReader(
-                            new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
-                        StringBuilder sb = new StringBuilder((int) Math.min(file.length(), 2000000));
-                        String line;
-                        while ((line = reader.readLine()) != null) {
-                            sb.append(line).append("\n");
-                        }
-                        loadedContent = sb.toString();
-                    }
-                    isFilerift = false;
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Failed reading " + mFilePath, e);
+                content = nativeLoadFile(mFilePath, isFilerift, fileType);
+            } catch (Throwable t) {
+                loadError = t.getMessage();
             }
 
-            final String finalContent = loadedContent != null ? loadedContent : "";
-            final boolean finalIsFilerift = isFilerift;
-            final String finalFileType = fileType;
+            final String finalContent = content;
+            final boolean finalIsFilerift = isFilerift[0];
+            final String finalType = fileType[0] != null ? fileType[0] : "";
+            final String finalError = loadError;
 
-            runOnUiThread(() -> {
-                try {
+            mHandler.post(() -> {
+                if (finalContent != null) {
                     mIsFileriftTranscoded = finalIsFilerift;
-                    mFileType = finalFileType;
-                    mInitialContent = finalContent;
+                    mFileType = finalType;
 
-                    mIsFormatting = true;
-                    mCodeEditor.setText(mInitialContent);
-                    mIsFormatting = false;
+                    // Configure Language based on file type / extension
+                    Language lang = selectLanguage(mFilePath, mFileType);
+                    mEditor.setEditorLanguage(lang);
 
-                    updateTitleAndSubtitle();
-                    mCodeEditor.setEnabled(true);
-                    mSaveBtn.setEnabled(true);
-                    hideLoadingOverlay();
+                    // Set text into Sora Editor virtualized buffer
+                    mEditor.setText(finalContent);
+                    mIsModified = false;
+                    mInitialLoadDone = true;
 
-                    mCodeEditor.post(() -> {
-                        if (mLineNumberView != null && mCodeEditor != null) {
-                            mLineNumberView.setLineCount(mCodeEditor.getLineCount());
-                        }
-                        scheduleHighlight();
-                    });
+                    // Format badge
+                    if (mIsFileriftTranscoded) {
+                        mFormatBadge.setText("PROTO");
+                        mFormatBadge.setVisibility(View.VISIBLE);
+                    } else if (!mFileType.isEmpty()) {
+                        mFormatBadge.setText(mFileType.toUpperCase());
+                        mFormatBadge.setVisibility(View.VISIBLE);
+                    } else {
+                        mFormatBadge.setVisibility(View.GONE);
+                    }
 
-                    recordHistoryImmediately();
-                } catch (Exception e) {
-                    Log.e(TAG, "Error finalizing load", e);
+                    updateStatusIndicators();
+                    updateUndoRedoButtons();
+                    mLoadingOverlay.setVisibility(View.GONE);
+                } else {
+                    mLoadingOverlay.setVisibility(View.GONE);
+                    new AlertDialog.Builder(this)
+                        .setTitle("Load Error")
+                        .setMessage("Failed to load file:\n" + (finalError != null ? finalError : "Unknown error"))
+                        .setPositiveButton("Exit", (dialog, which) -> finish())
+                        .setCancelable(false)
+                        .show();
                 }
             });
         });
     }
 
-    private void hideLoadingOverlay() {
-        if (mLoadingOverlay != null) {
-            mLoadingOverlay.animate()
-                .alpha(0f)
-                .setDuration(150)
-                .withEndAction(() -> {
-                    mLoadingOverlay.setVisibility(View.GONE);
-                    mLoadingOverlay.setAlpha(1f);
-                });
+    private Language selectLanguage(String filePath, String detectedType) {
+        String low = filePath.toLowerCase();
+        if (mIsFileriftTranscoded || "scene".equalsIgnoreCase(detectedType) || "scl".equalsIgnoreCase(detectedType) ||
+            low.endsWith(".scene") || low.endsWith(".scl") || low.endsWith(".scmap") || low.endsWith(".gplayer")) {
+            return new FileRiftLanguage();
+        } else if (low.endsWith(".lua")) {
+            return new LuaLanguage();
+        } else if (low.endsWith(".vert") || low.endsWith(".frag") || low.endsWith(".glsl")) {
+            return new GlslLanguage();
+        } else if (low.endsWith(".json")) {
+            return new JsonLanguage();
         }
+        return new EmptyLanguage();
     }
 
-    private void updateTitleAndSubtitle() {
-        if (mTitleText != null) {
-            File f = new File(mFilePath);
-            mTitleText.setText(f.getName().isEmpty() ? "Code Editor" : f.getName());
-        }
-        if (mSubtitleText != null) {
-            String low = mFilePath.toLowerCase();
-            String sub;
-            if (mIsFileriftTranscoded) {
-                if (low.endsWith(".scene")) sub = "FileRift Scene";
-                else if (low.endsWith(".scl")) sub = "FileRift Template";
-                else sub = "FileRift (" + mFileType + ")";
-            } else if (low.endsWith(".lua")) {
-                sub = "Lua Script";
-            } else if (low.endsWith(".json")) {
-                sub = "JSON";
-            } else if (low.endsWith(".vsh") || low.endsWith(".fsh") || low.endsWith(".glsl")) {
-                sub = "GLSL Shader";
-            } else {
-                sub = "Plain Text";
-            }
-            mSubtitleText.setText(sub);
-        }
-    }
-
-    private void saveFile() {
-        if (mFilePath == null || mFilePath.isEmpty()) {
-            Toast.makeText(this, "Cannot save: file path is empty", Toast.LENGTH_SHORT).show();
+    private void saveFileAsync(Runnable onComplete) {
+        if (!mIsModified) {
+            Toast.makeText(this, "No changes to save", Toast.LENGTH_SHORT).show();
+            if (onComplete != null) onComplete.run();
             return;
         }
 
-        try {
-            File f = new File(mFilePath);
-            File parent = f.getParentFile();
-            if (parent != null && !parent.exists()) {
-                parent.mkdirs();
-            }
+        mSaveBtn.setEnabled(false);
+        mSaveBtn.setText("SAVING...");
 
-            String content = mCodeEditor.getText().toString();
-
-            String errorMsg = null;
-            boolean savedViaNative = false;
+        final String content = mEditor.getText().toString();
+        mIoExecutor.execute(() -> {
+            String error = null;
             try {
-                errorMsg = nativeSaveFile(mFilePath, content, mIsFileriftTranscoded);
-                savedViaNative = true;
-            } catch (UnsatisfiedLinkError e) {
-                Log.w(TAG, "nativeSaveFile JNI unavailable: " + e.getMessage());
+                error = nativeSaveFile(mFilePath, content, mIsFileriftTranscoded);
+            } catch (Throwable t) {
+                error = t.getMessage();
             }
 
-            if (savedViaNative) {
-                if (errorMsg != null && !errorMsg.isEmpty()) {
+            final String finalError = error;
+            mHandler.post(() -> {
+                mSaveBtn.setEnabled(true);
+                if (finalError == null) {
+                    mIsModified = false;
+                    updateStatusIndicators();
+                    Toast.makeText(this, "File saved successfully", Toast.LENGTH_SHORT).show();
+                    if (onComplete != null) onComplete.run();
+                } else {
+                    updateStatusIndicators();
                     new AlertDialog.Builder(this)
-                        .setTitle("FileRift Syntax Error")
-                        .setMessage("Cannot save " + f.getName() + " due to markup error:\n\n" + errorMsg)
-                        .setPositiveButton("Fix Code", null)
+                        .setTitle("Compilation Error")
+                        .setMessage("Failed to compile and save markup:\n\n" + finalError)
+                        .setPositiveButton("Keep Editing", null)
                         .show();
-                    return;
                 }
-            } else {
-                try (OutputStreamWriter writer = new OutputStreamWriter(
-                        new FileOutputStream(f), StandardCharsets.UTF_8)) {
-                    writer.write(content);
-                    writer.flush();
-                }
-            }
-
-            mInitialContent = content;
-            setModified(false);
-            String toastText = "Saved " + f.getName();
-            if (mIsFileriftTranscoded) {
-                toastText += " (FileRift compiled " + f.length() + " bytes)";
-            } else {
-                toastText += " (" + f.length() + " bytes)";
-            }
-            Toast.makeText(this, toastText, Toast.LENGTH_SHORT).show();
-        } catch (Exception e) {
-            Log.e(TAG, "Save failed: " + mFilePath, e);
-            Toast.makeText(this, "Save error: " + e.getMessage(), Toast.LENGTH_LONG).show();
-        }
-    }
-
-    private void setupTextWatchers() {
-        mCodeEditor.addTextChangedListener(new TextWatcher() {
-            @Override
-            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
-
-            @Override
-            public void onTextChanged(CharSequence s, int start, int before, int count) {}
-
-            @Override
-            public void afterTextChanged(Editable s) {
-                if (mIsFormatting) return;
-
-                if (!mIsModified) {
-                    setModified(true);
-                }
-
-                // Update line numbers on next frame after layout computes
-                mHandler.post(() -> {
-                    if (mCodeEditor != null && mLineNumberView != null) {
-                        mLineNumberView.setLineCount(mCodeEditor.getLineCount());
-                    }
-                });
-
-                scheduleHighlight();
-
-                if (!mIsUndoRedoAction) {
-                    scheduleHistoryRecord();
-                }
-            }
+            });
         });
     }
 
-    private void setModified(boolean modified) {
-        mIsModified = modified;
-        if (mDirtyIndicator != null) {
-            mDirtyIndicator.setVisibility(modified ? View.VISIBLE : View.GONE);
-        }
-    }
-
-    private void scheduleHistoryRecord() {
-        mHandler.removeCallbacks(mHistoryRunnable);
-        mHandler.postDelayed(mHistoryRunnable, 400);
-    }
-
-    private void recordHistoryImmediately() {
-        if (mCodeEditor == null) return;
-        Editable editable = mCodeEditor.getText();
-        if (editable == null) return;
-
-        String cur = editable.toString();
-        if (!mUndoStack.isEmpty() && mUndoStack.get(mUndoStack.size() - 1).text.equals(cur)) {
-            return;
-        }
-
-        mUndoStack.add(new EditHistory(cur, mCodeEditor.getSelectionStart(), mCodeEditor.getSelectionEnd()));
-        int maxHistory = cur.length() > 100000 ? 25 : 80;
-        if (mUndoStack.size() > maxHistory) {
-            mUndoStack.remove(0);
-        }
-        mRedoStack.clear();
-    }
-
-    private void performUndo() {
-        if (mUndoStack.size() <= 1) return;
-        EditHistory current = mUndoStack.remove(mUndoStack.size() - 1);
-        mRedoStack.add(current);
-
-        EditHistory prev = mUndoStack.get(mUndoStack.size() - 1);
-        mIsUndoRedoAction = true;
-        mCodeEditor.setText(prev.text);
-        mCodeEditor.setSelection(Math.min(prev.selectionStart, prev.text.length()));
-        mIsUndoRedoAction = false;
-
-        if (prev.text.equals(mInitialContent)) {
-            setModified(false);
-        }
-    }
-
-    private void performRedo() {
-        if (mRedoStack.isEmpty()) return;
-        EditHistory next = mRedoStack.remove(mRedoStack.size() - 1);
-        mUndoStack.add(next);
-
-        mIsUndoRedoAction = true;
-        mCodeEditor.setText(next.text);
-        mCodeEditor.setSelection(Math.min(next.selectionStart, next.text.length()));
-        mIsUndoRedoAction = false;
-
-        if (next.text.equals(mInitialContent)) {
-            setModified(false);
+    private void handle3DViewAction() {
+        if (mIsModified) {
+            new AlertDialog.Builder(this)
+                .setTitle("Save before 3D View?")
+                .setMessage("Save changes to " + new File(mFilePath).getName() + " before switching to 3D Viewport?")
+                .setPositiveButton("Save & Open", (dialog, which) -> {
+                    saveFileAsync(this::returnToVisualViewport);
+                })
+                .setNeutralButton("Discard & Open", (dialog, which) -> {
+                    returnToVisualViewport();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
         } else {
-            setModified(true);
+            returnToVisualViewport();
         }
     }
 
-    private void scheduleHighlight() {
-        mHandler.removeCallbacks(mHighlightRunnable);
-        mHandler.postDelayed(mHighlightRunnable, 120);
+    private void returnToVisualViewport() {
+        Intent data = new Intent();
+        data.putExtra("file_path", mFilePath);
+        data.putExtra("action", "open_visual");
+        setResult(RESULT_OK, data);
+        finish();
     }
 
-    /**
-     * Blazingly fast viewport-bounded syntax highlighting.
-     * For large files (> 300 lines), highlights only the visible lines with a 60-line buffer.
-     * Completes in 1 to 2 milliseconds without blocking UI or dropping frame rates.
-     */
-    private void applySyntaxHighlighting() {
-        if (mCodeEditor == null) return;
-        Editable editable = mCodeEditor.getText();
-        if (editable == null || editable.length() == 0) return;
-
-        Layout layout = mCodeEditor.getLayout();
-        if (layout == null) {
-            mHandler.postDelayed(mHighlightRunnable, 100);
-            return;
-        }
-
-        mIsFormatting = true;
-        try {
-            int textLength = editable.length();
-            int totalLines = layout.getLineCount();
-
-            int windowStartLine = 0;
-            int windowEndLine = totalLines - 1;
-
-            // Viewport windowing for large files
-            if (totalLines > 300) {
-                int scrollY = mVerticalScroll != null ? mVerticalScroll.getScrollY() : 0;
-                int viewHeight = mVerticalScroll != null && mVerticalScroll.getHeight() > 0
-                        ? mVerticalScroll.getHeight()
-                        : getResources().getDisplayMetrics().heightPixels;
-
-                int firstVisibleLine = layout.getLineForVertical(scrollY);
-                int lastVisibleLine = layout.getLineForVertical(scrollY + viewHeight);
-
-                // Buffer 60 lines before and 60 lines after visible viewport
-                windowStartLine = Math.max(0, firstVisibleLine - 60);
-                windowEndLine = Math.min(totalLines - 1, lastVisibleLine + 60);
-            }
-
-            int startChar = layout.getLineStart(windowStartLine);
-            int endChar = layout.getLineEnd(windowEndLine);
-            if (startChar < 0) startChar = 0;
-            if (endChar > textLength) endChar = textLength;
-            if (startChar >= endChar) return;
-
-            // Clear previous spans across document (total spans is small ~150 due to windowing)
-            ForegroundColorSpan[] oldSpans = editable.getSpans(0, textLength, ForegroundColorSpan.class);
-            for (ForegroundColorSpan s : oldSpans) {
-                editable.removeSpan(s);
-            }
-            StyleSpan[] oldStyle = editable.getSpans(0, textLength, StyleSpan.class);
-            for (StyleSpan s : oldStyle) {
-                editable.removeSpan(s);
-            }
-
-            CharSequence subText = editable.subSequence(startChar, endChar);
-            String low = mFilePath.toLowerCase();
-
-            // 1. Strings
-            applyPatternSpans(editable, startChar, PATTERN_STRINGS.matcher(subText), ACCENT_GREEN, false);
-
-            // 2. Numbers
-            applyPatternSpans(editable, startChar, PATTERN_NUMBERS.matcher(subText), ACCENT_ORANGE, false);
-
-            // 3. Comments
-            if (low.endsWith(".lua")) {
-                applyPatternSpans(editable, startChar, PATTERN_LUA_COMMENTS.matcher(subText), TEXT_MUTED, true);
-            } else {
-                applyPatternSpans(editable, startChar, PATTERN_GENERIC_COMMENTS.matcher(subText), TEXT_MUTED, true);
-            }
-
-            // 4. Language Keywords
-            if (low.endsWith(".lua")) {
-                applyPatternSpans(editable, startChar, PATTERN_LUA_KEYWORDS.matcher(subText), ACCENT_CRIMSON, true);
-            } else if (mIsFileriftTranscoded || low.endsWith(".scl") || low.endsWith(".scene") || low.endsWith(".gdata") || low.endsWith(".filerift")) {
-                applyPatternSpans(editable, startChar, PATTERN_SCL_KEYWORDS.matcher(subText), ACCENT_PURPLE, true);
-                applyPatternSpans(editable, startChar, PATTERN_SCL_COMPONENTS.matcher(subText), ACCENT_CYAN, true);
-                applyPatternSpans(editable, startChar, PATTERN_SCL_LUA_TAGS.matcher(subText), ACCENT_CRIMSON, true);
-                applyPatternSpans(editable, startChar, PATTERN_LUA_KEYWORDS.matcher(subText), ACCENT_CRIMSON, false);
-            } else if (low.endsWith(".vsh") || low.endsWith(".fsh") || low.endsWith(".glsl")) {
-                applyPatternSpans(editable, startChar, PATTERN_GLSL_KEYWORDS.matcher(subText), ACCENT_CYAN, true);
-            }
-        } finally {
-            mIsFormatting = false;
-        }
-    }
-
-    private void applyPatternSpans(Editable editable, int offset, Matcher matcher, int color, boolean bold) {
-        while (matcher.find()) {
-            int start = offset + matcher.start();
-            int end = offset + matcher.end();
-            editable.setSpan(
-                new ForegroundColorSpan(color),
-                start, end,
-                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
-            );
-            if (bold) {
-                editable.setSpan(
-                    new StyleSpan(Typeface.BOLD),
-                    start, end,
-                    Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
-                );
-            }
-        }
-    }
-
-    private void handleBackNavigation() {
+    private void handleBackAction() {
         if (mIsModified) {
             new AlertDialog.Builder(this)
                 .setTitle("Unsaved Changes")
-                .setMessage("Save changes to " + new File(mFilePath).getName() + " before exiting?")
-                .setPositiveButton("Save & Exit", (dialog, which) -> {
-                    saveFile();
-                    finish();
+                .setMessage("Save changes before closing?")
+                .setPositiveButton("Save & Close", (dialog, which) -> {
+                    saveFileAsync(this::finish);
                 })
-                .setNegativeButton("Discard", (dialog, which) -> finish())
-                .setNeutralButton("Cancel", null)
+                .setNeutralButton("Discard", (dialog, which) -> finish())
+                .setNegativeButton("Cancel", null)
                 .show();
         } else {
             finish();
@@ -1210,10 +892,113 @@ public class CodeEditorActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        handleBackNavigation();
+        handleBackAction();
     }
 
-    private int dp(int dp) {
+    private void toggleSearchBar() {
+        mSearchBarVisible = !mSearchBarVisible;
+        mSearchBar.setVisibility(mSearchBarVisible ? View.VISIBLE : View.GONE);
+        if (mSearchBarVisible) {
+            mSearchInput.requestFocus();
+        } else {
+            if (mEditor != null) {
+                mEditor.getSearcher().stopSearch();
+            }
+        }
+    }
+
+    private void performSearch(String query) {
+        if (mEditor == null) return;
+        if (query == null || query.isEmpty()) {
+            mEditor.getSearcher().stopSearch();
+            mSearchCountLabel.setText("0/0");
+            return;
+        }
+        try {
+            mEditor.getSearcher().search(query, new EditorSearcher.SearchOptions(EditorSearcher.SearchOptions.TYPE_NORMAL, false));
+        } catch (Exception e) {
+            Log.w(TAG, "Search error: " + e.getMessage());
+        }
+    }
+
+    private void updateSearchMatchCount() {
+        if (mEditor == null || !mEditor.getSearcher().hasQuery()) {
+            mSearchCountLabel.setText("0/0");
+            return;
+        }
+        int count = mEditor.getSearcher().getMatchedPositionCount();
+        int current = mEditor.getSearcher().getCurrentMatchedPositionIndex();
+        mSearchCountLabel.setText((current >= 0 ? (current + 1) : 0) + "/" + count);
+    }
+
+    private void updateStatusIndicators() {
+        mTitleText.setText(new File(mFilePath).getName());
+        if (mIsModified) {
+            mStatusDot.setBackground(createDotDrawable(ACCENT_CRIMSON));
+            mSaveBtn.setText("SAVE");
+            mSaveBtn.setTextColor(Color.WHITE);
+            mSaveBtn.setBackground(createPillDrawable(ACCENT_CRIMSON, ACCENT_CRIMSON, dpToPx(6)));
+        } else {
+            mStatusDot.setBackground(createDotDrawable(ACCENT_GREEN));
+            mSaveBtn.setText("SAVE");
+            mSaveBtn.setTextColor(0xFF707888);
+            mSaveBtn.setBackground(createButtonRippleDrawable(0xFF1E2128, BORDER_COLOR, dpToPx(6)));
+        }
+    }
+
+    private void updateUndoRedoButtons() {
+        if (mEditor != null) {
+            if (mUndoBtn != null) {
+                mUndoBtn.setEnabled(mEditor.canUndo());
+                mUndoBtn.setAlpha(mEditor.canUndo() ? 1.0f : 0.4f);
+            }
+            if (mRedoBtn != null) {
+                mRedoBtn.setEnabled(mEditor.canRedo());
+                mRedoBtn.setAlpha(mEditor.canRedo() ? 1.0f : 0.4f);
+            }
+        }
+    }
+
+    private GradientDrawable createDotDrawable(int color) {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setShape(GradientDrawable.OVAL);
+        gd.setColor(color);
+        return gd;
+    }
+
+    private GradientDrawable createPillDrawable(int bgColor, int strokeColor, int cornerRadiusPx) {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setColor(bgColor);
+        gd.setStroke(dpToPx(1), strokeColor);
+        gd.setCornerRadius(cornerRadiusPx);
+        return gd;
+    }
+
+    private RippleDrawable createButtonRippleDrawable(int bgColor, int strokeColor, int cornerRadiusPx) {
+        GradientDrawable content = createPillDrawable(bgColor, strokeColor, cornerRadiusPx);
+        GradientDrawable mask = new GradientDrawable();
+        mask.setColor(Color.WHITE);
+        mask.setCornerRadius(cornerRadiusPx);
+        return new RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), content, mask);
+    }
+
+    private GradientDrawable createInputBackground() {
+        GradientDrawable gd = new GradientDrawable();
+        gd.setColor(BG_COLOR);
+        gd.setStroke(dpToPx(1), BORDER_COLOR);
+        gd.setCornerRadius(dpToPx(6));
+        return gd;
+    }
+
+    private int dpToPx(int dp) {
         return (int) (dp * getResources().getDisplayMetrics().density);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (mEditor != null) {
+            mEditor.release();
+        }
     }
 }

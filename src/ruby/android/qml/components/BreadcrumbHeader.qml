@@ -122,7 +122,7 @@ Rectangle {
 
             IconButton {
                 id: playEngineBtn
-                visible: typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.isResourceRoot
+                visible: typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.isResourceRoot && rubyFileModel.playInGameAvailable
                 anchors.verticalCenter: parent.verticalCenter
                 iconName: "play"
                 variant: "soft"
@@ -181,6 +181,15 @@ Rectangle {
                             - (clearButton.visible ? Theme.dp(24) : 0)
                     height: parent.height
 
+                    Timer {
+                        id: searchDebounceTimer
+                        interval: 180
+                        repeat: false
+                        onTriggered: {
+                            root.searchFilterChanged(searchField.text)
+                        }
+                    }
+
                     TextInput {
                         id: searchField
                         anchors.verticalCenter: parent.verticalCenter
@@ -199,7 +208,12 @@ Rectangle {
 
                         onTextChanged: {
                             root.searchChanged(text)
-                            root.searchFilterChanged(text)
+                            if (text.trim().length === 0) {
+                                searchDebounceTimer.stop()
+                                root.searchFilterChanged("")
+                            } else {
+                                searchDebounceTimer.restart()
+                            }
                         }
                     }
                 }
@@ -211,7 +225,11 @@ Rectangle {
                     iconName: "close"
                     buttonSize: Theme.dp(26)
                     iconSize: Theme.dp(14)
-                    onClicked: searchField.text = ""
+                    onClicked: {
+                        searchDebounceTimer.stop()
+                        searchField.text = ""
+                        root.searchFilterChanged("")
+                    }
                 }
             }
         }

@@ -76,6 +76,16 @@ Item {
     /// no seed: see loadedRelief.
     property int reliefSeed: 0
 
+    /// #will be unlocked after — mirrors boulderx::kPerNodeReliefUnlocked
+    /// through the tools bridge. While true, per-node Z is staged off for this
+    /// release: the relief controls are disabled and labelled with that marker
+    /// and a sheet exports as a uniform slab. Defaults to TRUE when the bridge
+    /// is missing, so a missing bridge can never re-enable a staged feature.
+    readonly property bool reliefStaged: (typeof rubyToolsBridge === "undefined" ||
+                                          !rubyToolsBridge)
+                                         ? true
+                                         : !rubyToolsBridge.perNodeReliefUnlocked()
+
     /// True when the per-node Z currently in the model came out of a FILE rather
     /// than out of randomiseRelief(). Such relief has no seed, and pretending
     /// otherwise (the old `reliefSeed = Date.now()` on load) both made the relief
@@ -1336,7 +1346,9 @@ Item {
                 // and they are deliberately separate from Depth min/max: relief
                 // reshapes the terrain without changing how thick the slab is.
                 Text {
-                    text: qsTr("TERRAIN RELIEF (Z)")
+                    text: root.reliefStaged
+                          ? qsTr("TERRAIN RELIEF (Z) — #will be unlocked after")
+                          : qsTr("TERRAIN RELIEF (Z)")
                     font.pixelSize: Theme.dp(Theme.fontXs)
                     font.weight: Font.Bold
                     font.letterSpacing: 1.1
@@ -1355,6 +1367,7 @@ Item {
                     ThemedField {
                         width: Theme.dp(72)
                         text: "" + root.reliefFront
+                        enabled: !root.reliefStaged
                         onEditingFinished: root.reliefFront = Math.abs(parseFloat(text) || 0.0)
                     }
                 }
@@ -1371,6 +1384,7 @@ Item {
                     ThemedField {
                         width: Theme.dp(72)
                         text: "" + root.reliefBack
+                        enabled: !root.reliefStaged
                         onEditingFinished: root.reliefBack = Math.abs(parseFloat(text) || 0.0)
                     }
                 }
@@ -1384,11 +1398,14 @@ Item {
                         // A loaded sheet's relief is the file's, so there is no
                         // seed to show -- labelling it "Z <n>" claimed the loaded
                         // curving came from a randomiser it never ran through.
-                        text: root.loadedRelief ? qsTr("Z (loaded)")
-                                                : (root.reliefSeed > 0
-                                                   ? qsTr("Z %1").arg(root.reliefSeed)
-                                                   : qsTr("Randomise Z"))
+                        text: root.reliefStaged
+                              ? qsTr("Randomise Z — #will be unlocked after")
+                              : (root.loadedRelief ? qsTr("Z (loaded)")
+                                                   : (root.reliefSeed > 0
+                                                      ? qsTr("Z %1").arg(root.reliefSeed)
+                                                      : qsTr("Randomise Z")))
                         font.pixelSize: Theme.dp(Theme.fontXs)
+                        enabled: !root.reliefStaged
                         onClicked: root.randomiseRelief()
                     }
 
@@ -1403,7 +1420,9 @@ Item {
 
                 Text {
                     width: parent.width
-                    text: qsTr("Sculpted Z is exported as a Zenith sheet (format v2). Boulder cannot open a sheet with per-node Z.")
+                    text: root.reliefStaged
+                          ? qsTr("Per-node Z is staged off for this release — #will be unlocked after. The sheet stays a uniform slab, which Boulder and Zenith both read.")
+                          : qsTr("Sculpted Z is exported as a Zenith sheet (format v2). Boulder cannot open a sheet with per-node Z.")
                     wrapMode: Text.WordWrap
                     color: Theme.textMuted
                     font.pixelSize: Theme.dp(Theme.fontXs)
@@ -1587,6 +1606,14 @@ Item {
     readonly property bool hasRelief: reliefSeed > 0 || loadedRelief
 
     function randomiseRelief() {
+        // #will be unlocked after — per-node Z sculpting is staged off for this
+        // release, so the press is refused with a reason instead of coming back
+        // flat with no explanation. "Flatten" stays live: it only moves the
+        // sheet towards the flat slab this build ships as.
+        if (root.reliefStaged) {
+            toast.show(qsTr("Randomise Z — #will be unlocked after (this build ships flat Z)"))
+            return
+        }
         if (pointCount < 3) {
             toast.show(qsTr("A sheet needs at least 3 vertices"))
             return

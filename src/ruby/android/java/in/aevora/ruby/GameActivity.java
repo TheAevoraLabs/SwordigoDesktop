@@ -41,9 +41,16 @@ import java.util.zip.ZipFile;
 public class GameActivity extends Activity {
     private static final String TAG = "RubyGameActivity";
 
+    private static GameActivity currentActivity = null;
+
+    public static GameActivity getCurrentActivity() {
+        return currentActivity;
+    }
+
     public static native void setResourceDirectory(String dirPath);
     public static native void loadHooks();
     public static native void unloadHooks();
+    public static native void setCrashLogPath(String path);
 
     /**
      * Arm a direct boot into a specific scene. Pass the scene BASENAME without the
@@ -127,6 +134,8 @@ public class GameActivity extends Activity {
         Log.i(TAG, "Starting GameActivity with resource_dir: " + resourceDir
                 + (bootScene != null ? (", boot_scene: " + bootScene) : ""));
 
+        currentActivity = this;
+
         String abi = getAbi();
         File libDir = getExtractedPath();
         File openAlFile = new File(libDir, "libopenal-soft.so");
@@ -151,12 +160,21 @@ public class GameActivity extends Activity {
         }
 
         try {
+            Log.i(TAG, "libopenal-soft.so status: exists=" + openAlFile.exists() + ", len=" + openAlFile.length() + ", path=" + openAlFile.getAbsolutePath());
             System.loadLibrary("GlossHook");
             System.load(openAlFile.getAbsolutePath());
+            Log.i(TAG, "libopenal-soft.so loaded successfully");
             System.load(swordigoFile.getAbsolutePath());
+            Log.i(TAG, "libswordigo.so loaded successfully");
             System.loadLibrary("ruby_runner");
+            Log.i(TAG, "ruby_runner loaded successfully");
+
+            File crashLogFile = new File(getFilesDir(), "crash.log");
+            setCrashLogPath(crashLogFile.getAbsolutePath());
 
             setResourceDirectory(resourceDir);
+            Port.setResourceDir(resourceDir);
+
             loadHooks();
             hooksLoaded = true;
 
@@ -179,6 +197,10 @@ public class GameActivity extends Activity {
             return;
         }
 
+        // CRITICAL: Setup native environment (AssetManager, filesDir, handleApplicationLaunch)
+        // BEFORE starting GLSurfaceView renderer so onSurfaceCreated sees an initialized AssetManager.
+        setupNativeEnvironment(targetApkPath);
+
         FrameLayout gameRoot = new FrameLayout(this);
         gameRoot.setLayoutParams(new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         gameRoot.setBackgroundColor(Color.BLACK);
@@ -194,8 +216,6 @@ public class GameActivity extends Activity {
 
         setContentView(gameRoot);
         enableImmersiveMode();
-
-        setupNativeEnvironment(targetApkPath);
     }
 
     private void addOverlayReturnButton(FrameLayout parent) {
@@ -289,12 +309,14 @@ public class GameActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        Port.onGamePause();
         if (glSurfaceView != null) glSurfaceView.onPause();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        Port.onGameResume();
         if (glSurfaceView != null) {
             glSurfaceView.onResume();
             enableImmersiveMode();
@@ -310,6 +332,10 @@ public class GameActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        Port.onGameStop();
+        if (currentActivity == this) {
+            currentActivity = null;
+        }
         if (hooksLoaded) {
             try {
                 unloadHooks();

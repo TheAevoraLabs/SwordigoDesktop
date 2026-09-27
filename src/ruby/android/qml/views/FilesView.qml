@@ -142,15 +142,16 @@ Item {
 
             delegate: FileRowDelegate {
                 width: fileListView.width
-                fileName: model.fileName
-                filePath: model.filePath
-                fileType: model.fileType
-                isDir: model.isDir
-                fileSizeStr: model.fileSizeStr
-                fileDateStr: model.fileDateStr
-                isPinned: model.isPinned
+                fileName: model.fileName != null ? model.fileName : ""
+                filePath: model.filePath != null ? model.filePath : ""
+                fileType: model.fileType != null ? model.fileType : ""
+                isDir: model.isDir === true
+                fileSizeStr: model.fileSizeStr != null ? model.fileSizeStr : ""
+                fileDateStr: model.fileDateStr != null ? model.fileDateStr : ""
+                isPinned: model.isPinned === true
 
                 function popContext() {
+                    if (!model || !model.filePath) return
                     contextSheet.targetFilePath = model.filePath
                     contextSheet.targetFileName = model.fileName
                     contextSheet.targetIsDir = model.isDir
@@ -159,6 +160,7 @@ Item {
                 }
 
                 onRowClicked: {
+                    if (!model || !model.filePath) return
                     if (model.isDir) {
                         rubyFileModel.navigateTo(model.filePath)
                     } else {
@@ -175,12 +177,14 @@ Item {
                 }
 
                 onDeleteClicked: {
+                    if (!model || !model.filePath) return
                     deleteDialog.targetPath = model.filePath
                     deleteDialog.targetName = model.fileName
                     deleteDialog.open()
                 }
 
                 onRenameClicked: {
+                    if (!model || !model.filePath) return
                     renameDialog.targetPath = model.filePath
                     renameDialog.targetName = model.fileName
                     renameDialog.initialText = model.fileName
@@ -188,6 +192,7 @@ Item {
                 }
 
                 onPinToggled: {
+                    if (!model || !model.filePath) return
                     rubyFileModel.togglePin(model.filePath)
                 }
             }
@@ -321,33 +326,292 @@ Item {
         }
     }
 
-    // ── Speed dial ─────────────────────────────────────────────────────────
-    SpeedDialFab {
+    // ── Floating Action Button (Create) ────────────────────────────────────
+    Rectangle {
+        id: createFab
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         anchors.rightMargin: Theme.dp(Theme.spacingLg)
         anchors.bottomMargin: Theme.dp(44)
+        width: Theme.dp(56)
+        height: Theme.dp(56)
+        radius: Theme.dp(28)
+        color: fabMouseArea.pressed ? Theme.accentEnd : Theme.accentStart
+        border.color: Theme.alpha(Theme.accentInk, 0.5)
+        border.width: 1
+        visible: !createSheet.isOpen
 
-        onNewFileWizardRequested: {
-            newFileWizard.activeCategory = "All"
-            newFileWizard.selectedIndex = 0
-            newFileWizard.open()
+        Icon {
+            anchors.centerIn: parent
+            name: "plus"
+            size: Theme.dp(24)
+            weight: 2.2
+            color: Theme.onAccent
         }
 
-        onNewSceneRequested: {
-            newFileWizard.activeCategory = "Swordigo"
-            newFileWizard.selectedIndex = 0
-            newFileWizard.open()
+        MouseArea {
+            id: fabMouseArea
+            anchors.fill: parent
+            onClicked: createSheet.open(false)
         }
+    }
 
-        onNewScriptRequested: {
-            newFileWizard.activeCategory = "Scripting"
-            newFileWizard.selectedIndex = 0
-            newFileWizard.open()
-        }
+    // ── Create New BottomSheet ─────────────────────────────────────────────
+    BottomSheet {
+        id: createSheet
+        title: qsTr("Create New")
+        peekHeight: Theme.dp(360)
+        expandedHeight: Theme.dp(360)
 
-        onNewFolderRequested: {
-            newFolderDialog.open()
+        Column {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            spacing: Theme.dp(Theme.spacingSm)
+
+            // Option 1: New File Wizard
+            Rectangle {
+                width: parent.width
+                height: Theme.dp(58)
+                radius: Theme.radiusMd
+                color: opt1Mouse.pressed ? Theme.surface2 : Theme.surface1
+                border.color: opt1Mouse.pressed ? Theme.borderFocus : Theme.borderSubtle
+                border.width: 1
+
+                Row {
+                    anchors.fill: parent
+                    anchors.margins: Theme.dp(10)
+                    spacing: Theme.dp(12)
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Theme.dp(38)
+                        height: Theme.dp(38)
+                        radius: Theme.dp(19)
+                        color: Theme.accentSoft
+
+                        Icon {
+                            anchors.centerIn: parent
+                            name: "sparkles"
+                            size: Theme.dp(18)
+                            color: Theme.accentInk
+                        }
+                    }
+
+                    Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - Theme.dp(50)
+                        spacing: Theme.dp(2)
+
+                        Text {
+                            text: qsTr("New File...")
+                            font.pixelSize: Theme.dp(Theme.fontMd)
+                            font.weight: Font.DemiBold
+                            color: Theme.textPrimary
+                        }
+
+                        Text {
+                            text: qsTr("Create from 11 templates (Scenes, Lua, Shaders, JSON)")
+                            font.pixelSize: Theme.dp(Theme.fontXs)
+                            color: Theme.textMuted
+                            elide: Text.ElideRight
+                            width: parent.width
+                        }
+                    }
+                }
+
+                MouseArea {
+                    id: opt1Mouse
+                    anchors.fill: parent
+                    onClicked: {
+                        createSheet.close()
+                        root.openNewFileWizard("All", 0)
+                    }
+                }
+            }
+
+            // Option 2: New Folder
+            Rectangle {
+                width: parent.width
+                height: Theme.dp(58)
+                radius: Theme.radiusMd
+                color: opt2Mouse.pressed ? Theme.surface2 : Theme.surface1
+                border.color: opt2Mouse.pressed ? Theme.borderFocus : Theme.borderSubtle
+                border.width: 1
+
+                Row {
+                    anchors.fill: parent
+                    anchors.margins: Theme.dp(10)
+                    spacing: Theme.dp(12)
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Theme.dp(38)
+                        height: Theme.dp(38)
+                        radius: Theme.dp(19)
+                        color: Theme.alpha(Theme.colorFolder, 0.18)
+
+                        Icon {
+                            anchors.centerIn: parent
+                            name: "folder-plus"
+                            size: Theme.dp(18)
+                            color: Theme.colorFolder
+                        }
+                    }
+
+                    Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - Theme.dp(50)
+                        spacing: Theme.dp(2)
+
+                        Text {
+                            text: qsTr("New Folder")
+                            font.pixelSize: Theme.dp(Theme.fontMd)
+                            font.weight: Font.DemiBold
+                            color: Theme.textPrimary
+                        }
+
+                        Text {
+                            text: qsTr("Create a new directory in this location")
+                            font.pixelSize: Theme.dp(Theme.fontXs)
+                            color: Theme.textMuted
+                            elide: Text.ElideRight
+                            width: parent.width
+                        }
+                    }
+                }
+
+                MouseArea {
+                    id: opt2Mouse
+                    anchors.fill: parent
+                    onClicked: {
+                        createSheet.close()
+                        newFolderDialog.openWith("")
+                    }
+                }
+            }
+
+            // Option 3: Quick Swordigo Scene (.scene)
+            Rectangle {
+                width: parent.width
+                height: Theme.dp(58)
+                radius: Theme.radiusMd
+                color: opt3Mouse.pressed ? Theme.surface2 : Theme.surface1
+                border.color: opt3Mouse.pressed ? Theme.borderFocus : Theme.borderSubtle
+                border.width: 1
+
+                Row {
+                    anchors.fill: parent
+                    anchors.margins: Theme.dp(10)
+                    spacing: Theme.dp(12)
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Theme.dp(38)
+                        height: Theme.dp(38)
+                        radius: Theme.dp(19)
+                        color: Theme.alpha(Theme.colorScene, 0.18)
+
+                        Icon {
+                            anchors.centerIn: parent
+                            name: "map"
+                            size: Theme.dp(18)
+                            color: Theme.colorScene
+                        }
+                    }
+
+                    Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - Theme.dp(50)
+                        spacing: Theme.dp(2)
+
+                        Text {
+                            text: qsTr("New Scene (.scene)")
+                            font.pixelSize: Theme.dp(Theme.fontMd)
+                            font.weight: Font.DemiBold
+                            color: Theme.textPrimary
+                        }
+
+                        Text {
+                            text: qsTr("Swordigo 3D level with lights, background & platform")
+                            font.pixelSize: Theme.dp(Theme.fontXs)
+                            color: Theme.textMuted
+                            elide: Text.ElideRight
+                            width: parent.width
+                        }
+                    }
+                }
+
+                MouseArea {
+                    id: opt3Mouse
+                    anchors.fill: parent
+                    onClicked: {
+                        createSheet.close()
+                        root.openNewFileWizard("Swordigo", 0)
+                    }
+                }
+            }
+
+            // Option 4: Quick Lua Script (.lua)
+            Rectangle {
+                width: parent.width
+                height: Theme.dp(58)
+                radius: Theme.radiusMd
+                color: opt4Mouse.pressed ? Theme.surface2 : Theme.surface1
+                border.color: opt4Mouse.pressed ? Theme.borderFocus : Theme.borderSubtle
+                border.width: 1
+
+                Row {
+                    anchors.fill: parent
+                    anchors.margins: Theme.dp(10)
+                    spacing: Theme.dp(12)
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Theme.dp(38)
+                        height: Theme.dp(38)
+                        radius: Theme.dp(19)
+                        color: Theme.alpha(Theme.colorCode, 0.18)
+
+                        Icon {
+                            anchors.centerIn: parent
+                            name: "braces"
+                            size: Theme.dp(18)
+                            color: Theme.colorCode
+                        }
+                    }
+
+                    Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - Theme.dp(50)
+                        spacing: Theme.dp(2)
+
+                        Text {
+                            text: qsTr("New Script (.lua)")
+                            font.pixelSize: Theme.dp(Theme.fontMd)
+                            font.weight: Font.DemiBold
+                            color: Theme.textPrimary
+                        }
+
+                        Text {
+                            text: qsTr("Game logic script chunk with object callbacks")
+                            font.pixelSize: Theme.dp(Theme.fontXs)
+                            color: Theme.textMuted
+                            elide: Text.ElideRight
+                            width: parent.width
+                        }
+                    }
+                }
+
+                MouseArea {
+                    id: opt4Mouse
+                    anchors.fill: parent
+                    onClicked: {
+                        createSheet.close()
+                        root.openNewFileWizard("Scripting", 0)
+                    }
+                }
+            }
         }
     }
 
@@ -466,7 +730,7 @@ Item {
 
             MenuRow {
                 width: parent.width
-                visible: contextSheet.targetFileType === "scene"
+                visible: contextSheet.targetFileType === "scene" && rubyFileModel.playInGameAvailable
                 iconName: "play"
                 accent: true
                 text: qsTr("Start Scene in Game")
@@ -605,16 +869,15 @@ Item {
         onAccepted: (value) => rubyFileModel.renameItem(renameDialog.targetPath, value)
     }
 
-    function openNewFileWizard() {
-        newFileWizard.activeCategory = "All"
-        newFileWizard.selectedIndex = 0
-        newFileWizard.open()
+    function openNewFileWizard(category, index) {
+        newFileWizard.reset(category, index)
+        newFileWizard.open(true)
     }
 
     NewFileDialog {
         id: newFileWizard
         onFileCreated: (path, ext) => {
-            root.fileOpenRequested(path)
+            root.fileOpened(path, ext)
         }
     }
 

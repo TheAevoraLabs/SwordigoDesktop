@@ -81,22 +81,34 @@ Popup {
         "Fiery_Depths", "Snowy", "Icecastle", "Wasteland", "Florennum", "House"
     ]
 
+    Timer {
+        id: searchDebounceTimer
+        interval: 150
+        repeat: false
+        onTriggered: {
+            root.filterText = searchInput.text
+        }
+    }
+
     readonly property var filteredModels: {
-        var query = filterText.trim().toLowerCase()
-        if (query.length === 0) return availableModels
-        return availableModels.filter(function(m) {
-            return m.name.toLowerCase().indexOf(query) !== -1
+        var query = filterText ? filterText.trim().toLowerCase() : ""
+        var list = availableModels || []
+        if (query.length === 0) return list
+        return list.filter(function(m) {
+            return m && m.name && m.name.toLowerCase().indexOf(query) !== -1
         })
     }
 
     readonly property var filteredTemplates: {
-        var query = filterText.trim().toLowerCase()
-        var biome = selectedBiome.toLowerCase()
-        return libraryTemplates.filter(function(t) {
+        var query = filterText ? filterText.trim().toLowerCase() : ""
+        var biome = selectedBiome ? selectedBiome.toLowerCase() : "all"
+        var list = libraryTemplates || []
+        return list.filter(function(t) {
+            if (!t || !t.name) return false
             var nameMatch = query.length === 0 || t.name.toLowerCase().indexOf(query) !== -1
             if (!nameMatch) return false
-            if (selectedBiome === "All") return true
-            return t.name.toLowerCase().indexOf(biome) !== -1 ||
+            if (selectedBiome === "All" || biome === "all") return true
+            return (t.name && t.name.toLowerCase().indexOf(biome) !== -1) ||
                    (t.category && t.category.toLowerCase().indexOf(biome) !== -1)
         })
     }
@@ -172,7 +184,7 @@ Popup {
                 iconName: "cube"
                 count: root.availableModels.length
                 selected: root.currentTab === 0
-                onClicked: { root.currentTab = 0; searchInput.text = "" }
+                onClicked: { root.currentTab = 0; searchDebounceTimer.stop(); searchInput.text = ""; root.filterText = "" }
             }
 
             Chip {
@@ -180,7 +192,7 @@ Popup {
                 iconName: "layers"
                 count: root.libraryTemplates.length
                 selected: root.currentTab === 1
-                onClicked: { root.currentTab = 1; searchInput.text = "" }
+                onClicked: { root.currentTab = 1; searchDebounceTimer.stop(); searchInput.text = ""; root.filterText = "" }
             }
 
             Chip {
@@ -188,14 +200,14 @@ Popup {
                 iconName: "folder"
                 count: root.availableLibraries.length
                 selected: root.currentTab === 2
-                onClicked: { root.currentTab = 2; searchInput.text = "" }
+                onClicked: { root.currentTab = 2; searchDebounceTimer.stop(); searchInput.text = ""; root.filterText = "" }
             }
 
             Chip {
                 text: qsTr("Primitives")
                 iconName: "plus"
                 selected: root.currentTab === 3
-                onClicked: { root.currentTab = 3; searchInput.text = "" }
+                onClicked: { root.currentTab = 3; searchDebounceTimer.stop(); searchInput.text = ""; root.filterText = "" }
             }
 
             Item { Layout.fillWidth: true }
@@ -246,7 +258,14 @@ Popup {
                             font.pixelSize: Theme.dp(Theme.fontSm)
                         }
 
-                        onTextChanged: root.filterText = text
+                        onTextChanged: {
+                            if (text.trim().length === 0) {
+                                searchDebounceTimer.stop()
+                                root.filterText = ""
+                            } else {
+                                searchDebounceTimer.restart()
+                            }
+                        }
                     }
 
                     Rectangle {
@@ -266,6 +285,7 @@ Popup {
                         MouseArea {
                             anchors.fill: parent
                             onClicked: {
+                                searchDebounceTimer.stop()
                                 searchInput.text = ""
                                 root.filterText = ""
                             }
@@ -366,7 +386,7 @@ Popup {
 
                             Text {
                                 width: parent.width
-                                text: modelData.name
+                                text: modelData ? (modelData.name || "") : ""
                                 font.pixelSize: Theme.dp(Theme.fontSm)
                                 font.weight: Font.Medium
                                 color: Theme.textPrimary
@@ -374,7 +394,7 @@ Popup {
                             }
 
                             Text {
-                                text: modelData.sizeStr || "POD"
+                                text: modelData ? (modelData.sizeStr || "POD") : "POD"
                                 font.pixelSize: Theme.dp(Theme.fontXs)
                                 color: Theme.textMuted
                             }
@@ -386,7 +406,7 @@ Popup {
                         anchors.fill: parent
                         hoverEnabled: true
                         onClicked: {
-                            if (root.viewportItem) {
+                            if (root.viewportItem && modelData && modelData.name) {
                                 var idx = root.viewportItem.importModelObject(modelData.name)
                                 if (idx >= 0) {
                                     root.objectImported(modelData.name, "Model")
@@ -436,13 +456,13 @@ Popup {
                             width: Theme.dp(28)
                             height: Theme.dp(28)
                             radius: Theme.radiusSm
-                            color: Theme.alpha(modelData.hasGround ? "#22c55e" : "#3b82f6", 0.15)
+                            color: Theme.alpha(modelData && modelData.hasGround ? "#22c55e" : "#3b82f6", 0.15)
 
                             Icon {
                                 anchors.centerIn: parent
-                                name: modelData.hasGround ? "layers" : (modelData.hasModel ? "cube" : "star")
+                                name: modelData && modelData.hasGround ? "layers" : (modelData && modelData.hasModel ? "cube" : "star")
                                 size: Theme.dp(14)
-                                color: modelData.hasGround ? "#22c55e" : (modelData.hasModel ? "#3b82f6" : "#eab308")
+                                color: modelData && modelData.hasGround ? "#22c55e" : (modelData && modelData.hasModel ? "#3b82f6" : "#eab308")
                             }
                         }
 
@@ -452,7 +472,7 @@ Popup {
 
                             Text {
                                 width: parent.width
-                                text: modelData.name
+                                text: modelData ? (modelData.name || "") : ""
                                 font.pixelSize: Theme.dp(Theme.fontSm)
                                 font.weight: Font.Medium
                                 color: Theme.textPrimary
@@ -460,7 +480,7 @@ Popup {
                             }
 
                             Text {
-                                text: modelData.kind + (modelData.category ? (" • " + modelData.category) : "")
+                                text: modelData ? ((modelData.kind || "") + (modelData.category ? (" • " + modelData.category) : "")) : ""
                                 font.pixelSize: Theme.dp(Theme.fontXs)
                                 color: Theme.textMuted
                             }
@@ -472,10 +492,10 @@ Popup {
                         anchors.fill: parent
                         hoverEnabled: true
                         onClicked: {
-                            if (root.viewportItem) {
+                            if (root.viewportItem && modelData && modelData.name) {
                                 var idx = root.viewportItem.importTemplateObject(root.selectedLibrary, modelData.name)
                                 if (idx >= 0) {
-                                    root.objectImported(modelData.name, modelData.kind)
+                                    root.objectImported(modelData.name, modelData.kind || "")
                                     root.close()
                                 }
                             }
@@ -536,14 +556,14 @@ Popup {
                             spacing: Theme.dp(2)
 
                             Text {
-                                text: modelData.displayName || modelData.name
+                                text: modelData ? (modelData.displayName || modelData.name || "") : ""
                                 font.pixelSize: Theme.dp(Theme.fontSm)
                                 font.weight: Font.DemiBold
                                 color: Theme.textPrimary
                             }
 
                             Text {
-                                text: modelData.path && modelData.path.length > 0 ? modelData.path : qsTr("Embedded scene library")
+                                text: (modelData && modelData.path && modelData.path.length > 0) ? modelData.path : qsTr("Embedded scene library")
                                 font.pixelSize: Theme.dp(Theme.fontXs)
                                 color: Theme.textMuted
                                 elide: Text.ElideMiddle
@@ -562,7 +582,9 @@ Popup {
                         id: lArea
                         anchors.fill: parent
                         hoverEnabled: true
-                        onClicked: root.selectLibrary(modelData)
+                        onClicked: {
+                            if (modelData) root.selectLibrary(modelData)
+                        }
                     }
                 }
             }

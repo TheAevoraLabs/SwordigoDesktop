@@ -134,6 +134,12 @@ ApplicationWindow {
             HomeView {
                 id: homeView
                 onOpenFilesRequested: window.switchTab(1)
+                onOpenFolderRequested: (folderPath) => {
+                    if (typeof rubyFileModel !== "undefined" && rubyFileModel && folderPath) {
+                        rubyFileModel.navigateTo(folderPath)
+                    }
+                    window.switchTab(1)
+                }
                 onOpenPathRequested: (path) => {
                     window.openFileByExtension(path)
                 }

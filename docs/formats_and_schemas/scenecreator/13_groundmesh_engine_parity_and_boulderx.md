@@ -566,7 +566,9 @@ and `scene_save_preserves_edit_test` / `scene_undo_test` segfault in
 6. **Desktop viewport relief buttons** — the mobile mesh-edit HUD and both
    studios have a *Randomise Z* control (`boulderx::randomise_node_depths`), but
    the Ruby GG viewport only carries law-derived and imported depths; its toolbar
-   has no relief action yet.
+   has no relief action yet. **Superseded for this release by §9**: every one of
+   those controls is now staged off and tagged `#will be unlocked after`, and
+   the viewport imports flat planes instead of law-derived ones.
 7. **The ribbon's `u` (arc-length) parameterisation — newly open.** The baked
    mesh carries **two** `u` laws per node: the cap's is planar
    (`0.5 + x/scale`, confirmed exactly on every corpus object) and the ribbon's is
@@ -584,3 +586,157 @@ and `scene_save_preserves_edit_test` / `scene_undo_test` segfault in
    generated `u` agree with its own arc" — cannot see this at all, because a
    constant offset is self-consistent; it was reporting 0.0000 on meshes whose `u`
    differs from the bake's by 43.
+
+---
+
+## 8. Zypher (Gen 3) — the "absurdly oversized" mesh bug (fixed)
+
+Zypher (`src/tools/roller.*`) is the third selectable ground generator. Its terrain
+emitter used to write the mesh's **AABB** into the `GroundMeshGenerator`:
+
+```
+ggc.write_float_field(8, aw);        // SurfaceWidth := aabb_w + 20
+ggc.write_float_field(9, ah);        // HatHeight    := aabb_h + 20
+ggc.write_float_field(10, aw * 0.5); // HatWidthOffset1
+ggc.write_float_field(11, ah * 0.5); // HatWidthOffset2
+```
+
+That is self-consistent only if the object is never read again. `mesh_import`
+takes field 8 as the object's own `SurfaceWidth` and derives one per-node depth of
+**half that value** (`boulderx::engine_node_depths`), so an object whose plate is
+1100 wide declared a `SurfaceWidth` of 1120 and the next regenerate extruded a
+slab ~1120 deep — and the geometry then grew on every edit. Measured on
+`thecave_part15` `risingGround` with `.scratch/gen_corpus.cpp` (three simulated
+re-imports, i.e. the editor's own loop):
+
+| | before | after |
+|---|---|---|
+| declared `SurfaceWidth` | 3454 (the AABB) | 120 (the real input) |
+| XY span | 3434 | 1145 |
+| Z span | 2369 | 180 |
+
+The symptom is exactly "sometimes the mesh is very, very big in length and buggy":
+it appears on the *second* edit / on re-entering mesh edit, not on the first
+generate, which is why it read as intermittent. It poisons Zenith too, because
+Zenith also reads field 8 — so switching a Zypher-edited object to Zenith
+reproduced the oversized slab.
+
+Fix: `GeneratedMesh` carries the generator's own inputs
+(`gen_surface_width/…_height/…_offset_1/2`, `gen_horiz_noise`, `gen_seed`,
+`gen_mesh_type`, `tex_scale`), `terrain_generate` fills them from its
+`TerrainParams`, and `emit_scene_object` writes those instead of the AABB. The
+`LocalAabb` (field 7 / object field 8) is still the mesh bounds — that field really
+is the bounds. The same change fixes the hardcoded seed, `HorizNoise` and the
+texture scale (200 → the object's own `texture_scale`), and
+`tests/zypher_test.cpp` `test_terrain_roundtrip_stability` re-emits and re-parses
+the object to pin it.
+
+Separately, `tools/roller.cpp` was missing from both `RUBY_GG_SOURCES` and
+`RUBY_GG_MOBILE_SOURCES` in `cmake/components/ruby_gg.cmake`, so `ruby_gg` and
+every target built from those lists had an undefined reference to `zypher::` and
+could not link. It is now listed beside `boulderx.cpp`.
+
+The cap selection rule of §1.3.1 remains **unrecovered** for boulderx/Zenith: the
+current rule (sharpest-corner-first ear clip) reproduces 19 of the 57 cap
+triangles on `obj9#10` and matches the bake's concentration (busiest node 9 of 57
+vs the bake's 8), which is the "look" metric, but it is not the engine's rule.
+
+---
+
+## 9. The flat-Z ship contract (`#will be unlocked after`)
+
+Zenith's per-node relief was the newest and least-pinned part of the generator,
+and it is where the recent breakage came from. For this release it is **staged
+off** rather than removed: one constant decides it for all three surfaces
+(Ruby GG desktop, Ruby Touch mobile, Ground Mesh Studio), and the controls that
+would turn it back on are disabled and tagged `#will be unlocked after`.
+
+```cpp
+// tools/boulderx.h
+inline constexpr bool kPerNodeReliefUnlocked = false;   // #will be unlocked after
+```
+
+### 9.1 What "flat" means, exactly
+
+Every node of an imported object gets **one** plane, both sides:
+
+```
+plane = SurfaceWidth / 2
+      = |MaxDepth| - (MeshType 1 ? HatWidthOffset1 : 0)     // 205/205 objects
+front = +plane      back = -plane       // every node, both mesh types
+```
+
+`MeshType 1` does **not** change the plane: its `HatWidthOffset1` is added by
+`build_rim` and by the `GroundMeshGenerator` declaration, never by the plane
+itself. That is what makes the rule round-trip bit-identically — the emit
+derives `depth = max_front + (MT1 ? W1 : 0)` from the generated cap, so with
+`max_front = plane` the declaration written back is the one that was read, and
+the object's `SurfaceWidth` cannot drift on a second or third edit.
+
+`boulderx::flat_node_depths()` (the `SurfaceWidth` form) and
+`boulderx::flat_plane_declared()` (the declared-depth form, for a bake with no
+usable generator field) are the only two places the number is computed. The
+declared form subtracts the *same* `MeshType`/`W1` the emitter will use, so
+whatever the depth source was, `depth = plane + W1` comes back as the number
+that went in — this is the fix for the "it over-increases the Z" report, which
+was `|MaxDepth|` being handed back as a plane and `build_rim` then adding
+`HatWidthOffset1` a second time.
+
+### 9.2 Where it is wired
+
+| surface | site | was |
+|---|---|---|
+| desktop import | `Viewport3DWidget::mesh_import` | `engine_node_depths` / `recover_node_depths` |
+| desktop fallbacks | `mesh_sync_relief_to_polygon`, `mesh_apply` (BoulderX + Zypher) | `\|max_depth\|` / `\|min_depth\|` (declaration, incl. W1) |
+| mobile import | `RubyQuickViewport::meshImport` | `engine_node_depths` / `recover_node_depths` |
+| mobile fallbacks | `apply`-side BoulderX + Zypher branches | `gm.max_depth` / `gm.min_depth` raw |
+| tools bridge | `RubyToolsBridge::randomiseTerrainRelief` | `randomise_node_depths` |
+| desktop studio | `GroundMeshStudio` constructor + `randomise_relief` | live controls |
+| mobile studio | `GroundMeshStudioView.qml` + viewport HUD pill | live controls |
+
+The relief controls are disabled, not deleted, and each carries the marker:
+the Qt studio relabels its button `Randomise Z — #will be unlocked after`,
+disables the `Randomise +Z / -Z` spin boxes and tooltips them; the QML studio
+gates its section header, both fields and the button on
+`rubyToolsBridge.perNodeReliefUnlocked()`; the mobile viewport's Z pill reads
+`groundReliefStaged()`. `Flatten Z` stays live everywhere — it only ever moves a
+sheet *towards* the flat slab, so it is the safe direction. Each guarded entry
+point refuses with the marker in its status/toast rather than failing silently.
+
+### 9.3 What it buys, and what it costs
+
+Buys:
+
+* **No Z drift.** The plane depends on `SurfaceWidth` alone — no PRNG draw, no
+  XY matching, nothing that can fail to match or accumulate. The §8 growth bug
+  and the double-`W1` bug are both structurally impossible on this path.
+* **A planar cap in the generated mesh.** With `front[i]` constant, `build_cap`
+  receives a constant-z polygon, so the ear order of §1.3.1 (still unrecovered:
+  19/57 on `obj9#10`) cannot produce a non-planar or self-intersecting cap —
+  the mismatch it measures is against the *bake's* jittered cap, not against
+  our own output's validity.
+* **Determinism across platforms and re-imports**: the same object imports to
+  the same arrays every time, so a round trip is idempotent.
+
+Cost, stated plainly: vanilla bakes real `HorizNoise` per-node relief, and a
+regenerate now discards it. That is **not a regression against the default
+generator** — Boulder is flat and always has been, so editing an object with
+Boulder already threw the same relief away. Zenith keeps what Boulder cannot do
+(concave outlines, the rim/ribbon families, dome hats, v2 sheets) and now
+matches it on Z. Vanilla relief stays visible until the object is regenerated,
+because the renderer draws the shipped bake verbatim.
+
+### 9.4 Unlocking
+
+Set `kPerNodeReliefUnlocked = true` in `tools/boulderx.h`. That single constant
+restores `engine_node_depths()` at both import sites, re-enables `randomise_*`
+at every guarded entry point and re-labels the controls (the QML/Qt labels read
+the same constant through `perNodeReliefUnlocked()`); nothing was deleted, so
+unlocking is a one-line change, not a re-implementation.
+
+Locked by `tests/scene_mesh_edit_test`, `tests/ground_mesh_studio_test`,
+`tests/boulderx_test`, `tests/ground_mesh_compare_test`,
+`tests/boulderx_engine_parity_test` and `tests/zypher_test` (full `ctest`:
+48/54, the 6 failures pre-existing). `tests/ground_mesh_exact_test <dump>` is
+unchanged by this — it exercises the generator, not the import path: rim 42/42
+and ribbon 80/80 on `obj9#10`, cap 19/57.

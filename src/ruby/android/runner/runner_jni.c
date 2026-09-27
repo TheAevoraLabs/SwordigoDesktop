@@ -1,10 +1,20 @@
 #include "runner_vfs.h"
 #include "runner_scene.h"
+#include "runner_music.h"
+#include "runner_crasher.h"
 #include <jni.h>
 #include <android/log.h>
 
 #define LOG_TAG "RubyRunnerJNI"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+    (void)reserved;
+    LOGI("JNI_OnLoad called for ruby_runner");
+    runner_init_jvm(vm);
+    runner_init_crasher();
+    return JNI_VERSION_1_6;
+}
 
 JNIEXPORT void JNICALL
 Java_in_aevora_ruby_GameActivity_setResourceDirectory(JNIEnv *env, jclass clazz, jstring dirPath) {
@@ -17,6 +27,20 @@ Java_in_aevora_ruby_GameActivity_setResourceDirectory(JNIEnv *env, jclass clazz,
         }
     } else {
         runner_set_resource_dir(NULL);
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_in_aevora_ruby_GameActivity_setCrashLogPath(JNIEnv *env, jclass clazz, jstring logPath) {
+    (void)clazz;
+    if (logPath) {
+        const char *path = (*env)->GetStringUTFChars(env, logPath, NULL);
+        if (path) {
+            runner_set_crash_log_path(path);
+            (*env)->ReleaseStringUTFChars(env, logPath, path);
+        }
+    } else {
+        runner_set_crash_log_path(NULL);
     }
 }
 

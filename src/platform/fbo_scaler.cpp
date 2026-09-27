@@ -3050,6 +3050,7 @@ void graphics_apply_tier(PostFXState& s, GraphicsTier tier) {
             s.volumetric_light = false;
             s.god_rays = false;
             s.bloom = false;
+            s.bloom_emitter_key = false;  // Use legacy luminance threshold
             s.shadows = false;
             s.sharpen = false;
             s.color_adjust = true;
@@ -3072,6 +3073,7 @@ void graphics_apply_tier(PostFXState& s, GraphicsTier tier) {
             s.bloom = true;
             s.bloom_threshold = 0.85f;
             s.bloom_intensity = 0.40f;
+            s.bloom_emitter_key = true;  // Use authored-emitter key
             s.shadows = true;
             s.shadow_intensity = 0.20f;
             s.shadow_softness = 0.005f;
@@ -3102,6 +3104,7 @@ void graphics_apply_tier(PostFXState& s, GraphicsTier tier) {
             s.bloom = true;
             s.bloom_threshold = 0.82f;
             s.bloom_intensity = 0.55f;
+            s.bloom_emitter_key = true;  // Use authored-emitter key
             s.shadows = true;
             s.shadow_intensity = 0.30f;
             s.shadow_softness = 0.006f;
@@ -3149,6 +3152,7 @@ void graphics_apply_tier(PostFXState& s, GraphicsTier tier) {
             s.bloom = true;
             s.bloom_threshold = 0.80f;
             s.bloom_intensity = 0.65f;
+            s.bloom_emitter_key = true;  // Use authored-emitter key
             s.shadows = true;
             s.shadow_intensity = 0.22f;
             s.shadow_softness = 0.007f;
@@ -3184,6 +3188,7 @@ void graphics_apply_tier(PostFXState& s, GraphicsTier tier) {
             s.bloom = true;
             s.bloom_threshold = 0.78f;
             s.bloom_intensity = 0.75f;
+            s.bloom_emitter_key = true;  // Use authored-emitter key
             s.shadows = true;
             s.shadow_intensity = 0.25f;
             s.shadow_softness = 0.008f;

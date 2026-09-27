@@ -7,6 +7,17 @@
 //   Gen 2: boulderx.h / boulderx.cpp (Zenith — decompiled engine parity)
 //   Gen 3: roller.h   / roller.cpp   (Zypher — full 3D computational geometry)
 //
+// Generation lineage is NOT a quality ranking. Honest ranking as of 2026-09:
+//   Boulder (Gen 1)  closest to vanilla, dependable ONLY on simple meshes;
+//                    complex meshes make and cause several issues, so it is
+//                    regressive — right where the mesh is easy, broken where
+//                    it is hard.
+//   Zypher  (Gen 3)  works quite well on COMPLEX meshes, but the result does
+//                    not look vanilla — by design, that is Zypher's theme.
+//   Zenith  (Gen 2)  currently the WORST of the three and does not work yet;
+//                    #will be unlocked after. Do not hand it to a user.
+// See the reality-check comment on boulderx::GroundGenerator for the full note.
+//
 // Zypher builds on the same 32-byte interleaved vertex format
 // (pos xyz + normal xyz + uv) and the same Caver protobuf wire fields
 // (GroundPolygon=110, GroundMesh=111, Generator=112, TextureMapping=113,
@@ -172,6 +183,29 @@ struct GeneratedMesh {
 
     // Axis-aligned bounding box over all geometry
     double aabb_x = 0, aabb_y = 0, aabb_w = 0, aabb_h = 0;
+
+    // ── GroundMeshGenerator fields the emitted object must carry ─────────────
+    //
+    // These are the generator's INPUTS, not the mesh's AABB. The emitter used to
+    // write the AABB into SurfaceWidth/HatHeight/HatWidthOffset*, which is only
+    // self-consistent until the object is read again: mesh_import takes
+    // SurfaceWidth as the object's own parameter and derives one per-node depth
+    // of half that value, so an object whose plate is 1100 wide declared a
+    // SurfaceWidth of 1120 and the next regenerate extruded a slab ~1120 deep —
+    // and the geometry then grew every time the object was touched. Measured on
+    // thecave_part15 risingGround: three re-imports took the XY span 1126 -> 3434
+    // and the Z span 180 -> 2369 (see .scratch/gen_corpus.cpp). Emitting the real
+    // parameters makes a regenerate reproduce the same object instead of growing
+    // one.
+    double gen_surface_width = 100.0;      ///< field 8
+    double gen_hat_height = 20.0;          ///< field 9
+    double gen_hat_width_offset_1 = 5.0;   ///< field 10
+    double gen_hat_width_offset_2 = 5.0;   ///< field 11
+    double gen_horiz_noise = 0.0;          ///< field 6
+    uint32_t gen_seed = 1291618994u;       ///< field 5
+    int gen_mesh_type = 1;                 ///< field 7
+    float tex_scale = 250.0f;              ///< TextureMapping field 2
+
     size_t vertex_count() const;
     size_t triangle_count() const;
 };

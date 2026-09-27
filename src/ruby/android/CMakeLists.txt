@@ -30,6 +30,12 @@ endforeach()
 set(RUBY_MOBILE_SOURCES
     # Mobile-first modular UI & Android platform entry (Qt Quick + Material 3)
     ${CMAKE_CURRENT_SOURCE_DIR}/main_mobile.cpp
+    # aqt Qt 6.6.3 Android QtCore lacks qt_resourceFeatureZstd (see the file)
+    ${CMAKE_CURRENT_SOURCE_DIR}/qt_zstd_feature_fix.cpp
+    # The single stb_image implementation for this target (see the file). It has
+    # to live outside platform/embedded_assets.cpp, which this target no longer
+    # compiles.
+    ${CMAKE_CURRENT_SOURCE_DIR}/stb_image_impl.c
     ${CMAKE_CURRENT_SOURCE_DIR}/ruby_file_model.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ruby_audio_bridge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ruby_texture_provider.cpp
@@ -101,11 +107,28 @@ set(RUBY_MOBILE_SOURCES
     ${SRC_DIR}/platform/font_fallback.cpp
     ${SRC_DIR}/platform/gdb_compat.cpp
     ${SRC_DIR}/platform/io_thread.cpp
-    ${SRC_DIR}/platform/embedded_assets.cpp
+    # NOTE: platform/embedded_assets.cpp is deliberately NOT compiled here.
+    # It is a 657k-line generated table of 183 assets (10 MB decoded): desktop
+    # launcher icons, biome background art, UI atlases, fonts. Every caller of
+    # embedded_asset()/asset_decode_image() is a desktop-only TU (launcher.cpp,
+    # launcher_ui.cpp, asset_viewer.cpp, map_editor.cpp, swordfare_gui.cpp,
+    # display.cpp, loading_screen.cpp) and none of them is in this target, so
+    # the whole table used to be linked into libruby.so as ~10 MB of .rodata the
+    # Android app can never reach. Desktop builds (cmake/components/*.cmake) still
+    # compile it, so nothing there changes. Re-add it here only if a mobile source
+    # starts calling embedded_asset().
     ${SRC_DIR}/platform/os_external.cpp
     ${SRC_DIR}/android/log.c
     ${HOST_LUA_SRCS}
 )
+
+# ── FOSS-compliant flavor ───────────────────────────────────────────────────
+# ON  → build without the proprietary GlossHook prebuilt: GlossHook API calls
+#        become no-op stubs (runner/gloss_foss_stub.c) and the play-in-game
+#        feature is compiled out of the UI. Zero non-free dependencies.
+# OFF → full build (default): links the prebuilt libGlossHook.so and enables
+#        every feature. Used for our own first-party distribution.
+option(RUBY_FOSS_COMPLIANT "Build FOSS-compliant flavor without proprietary GlossHook" OFF)
 
 if (ANDROID)
     # Qt6 on Android creates a shared library loaded by QtActivity
@@ -168,27 +191,46 @@ if (ANDROID)
     set_property(TARGET ruby PROPERTY QT_ANDROID_PACKAGE_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
     # ── Swordigo In-Engine Runner (GlossHook VFS) ───────────────────────────
-    add_library(GlossHook SHARED IMPORTED)
-    set_target_properties(GlossHook PROPERTIES
-        IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/libGlossHook.so"
-    )
+    # Full builds link the proprietary prebuilt libGlossHook.so; FOSS builds
+    # skip it entirely and compile the no-op API stubs instead.
+    if (NOT RUBY_FOSS_COMPLIANT)
+        add_library(GlossHook SHARED IMPORTED)
+        set_target_properties(GlossHook PROPERTIES
+            IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/libs/${ANDROID_ABI}/libGlossHook.so"
+        )
+    endif()
 
     set(RUBY_RUNNER_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_vfs.c
         ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_scene.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_music.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_crasher.c
         ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_jni.c
         ${CMAKE_CURRENT_SOURCE_DIR}/runner/stdstring.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/runner/gloss_foss_stub.c
     )
     add_library(ruby_runner SHARED ${RUBY_RUNNER_SOURCES})
     target_include_directories(ruby_runner PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/runner
     )
-    target_link_libraries(ruby_runner PRIVATE
-        GlossHook
-        ZLIB::ZLIB
-        android
-        log
-    )
+    if (RUBY_FOSS_COMPLIANT)
+        target_compile_definitions(ruby_runner PRIVATE RUBY_FOSS_COMPLIANT)
+        target_compile_definitions(ruby PRIVATE RUBY_FOSS_COMPLIANT)
+        target_link_libraries(ruby_runner PRIVATE
+            ZLIB::ZLIB
+            android
+            log
+            dl
+        )
+    else()
+        target_link_libraries(ruby_runner PRIVATE
+            GlossHook
+            ZLIB::ZLIB
+            android
+            log
+            dl
+        )
+    endif()
 else()
     find_package(OpenGL REQUIRED)
     target_link_libraries(ruby PRIVATE OpenGL::GL)

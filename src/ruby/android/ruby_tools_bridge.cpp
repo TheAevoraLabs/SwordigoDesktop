@@ -593,10 +593,17 @@ QVariantList RubyToolsBridge::randomiseTerrainRelief(const QVariantList& points,
                                                     int seed) {
     std::vector<boulderx::Node> outline = outline_from_points(points, frontMax, -std::fabs(backMax));
 
-    // The seed comes from the UI so the number it displays is the one that
-    // reproduces this terrain; the generator is deterministic in it.
-    boulderx::randomise_node_depths(outline, std::fabs(frontMax), std::fabs(backMax),
-                                    seed > 0 ? uint32_t(seed) : 1u);
+    // #will be unlocked after — per-node Z sculpting is staged off for this
+    // release (boulderx::kPerNodeReliefUnlocked). The outline that comes back
+    // is then the constant pair the caller passed in, i.e. a flat slab, which
+    // is exactly what the sheet should ship as; nothing is randomised behind
+    // the UI's back.
+    if (boulderx::kPerNodeReliefUnlocked) {
+        // The seed comes from the UI so the number it displays is the one that
+        // reproduces this terrain; the generator is deterministic in it.
+        boulderx::randomise_node_depths(outline, std::fabs(frontMax), std::fabs(backMax),
+                                        seed > 0 ? uint32_t(seed) : 1u);
+    }
 
     QVariantList out;
     for (const auto& n : outline) {
@@ -610,11 +617,58 @@ QVariantList RubyToolsBridge::randomiseTerrainRelief(const QVariantList& points,
     return out;
 }
 
+// #will be unlocked after — see ruby_tools_bridge.h. One constant decides it
+// for all three surfaces (desktop studio, mobile studio, in-scene editor), so
+// the label and the behaviour cannot drift apart.
+bool RubyToolsBridge::perNodeReliefUnlocked() const {
+    return boulderx::kPerNodeReliefUnlocked;
+}
+
 QVariantMap RubyToolsBridge::generateScene(const QVariantMap& options) {
     QVariantMap res;
     res[QStringLiteral("ok")] = false;
 
-    int family = options.value(QStringLiteral("family"), 3).toInt();
+    // ── Algorithm selection ────────────────────────────────────────────────
+    // The studio picks an algorithm on THREE independent axes, because one flat
+    // number could not express them:
+    //   mode        "create"      -> an authored template (scenecreate::create)
+    //               "procedural"  -> noise-driven terrain (sgen)
+    //   generation  "v1" | "v2" | "v3"  -- procedural 2.5D only; meaningless in 3D
+    //   dimension   "2d" (2.5D layered side-on) | "3d" (voxel world, depth rows)
+    //
+    // Flattening these into a single `family` index is what made the old UI
+    // render ONE option list for every choice: 3D looked like "just another
+    // generation", and the per-family knobs had nowhere to live. `family` is
+    // still accepted as a fallback so an older QML bundle keeps working:
+    //   0 Scene Creator | 1 v1 | 2 v2 | 3 v3 | 4 v3 (biome DB) | 5 v2-3D
+    QString mode       = options.value(QStringLiteral("mode")).toString();
+    QString generation = options.value(QStringLiteral("generation")).toString();
+    QString dimension  = options.value(QStringLiteral("dimension")).toString();
+    int family = options.contains(QStringLiteral("family"))
+                     ? options.value(QStringLiteral("family")).toInt() : -1;
+
+    if (mode.isEmpty() || generation.isEmpty() || dimension.isEmpty()) {
+        if (family < 0) family = 3;                 // default family is v3
+        if (family == 0) {
+            mode = QStringLiteral("create");
+        } else {
+            mode = QStringLiteral("procedural");
+            if (family == 5) {
+                dimension  = QStringLiteral("3d");
+                generation = QStringLiteral("v1");  // 3D ignores generation
+            } else {
+                dimension  = QStringLiteral("2d");
+                generation = (family == 1) ? QStringLiteral("v1")
+                           : (family == 2) ? QStringLiteral("v2")
+                                           : QStringLiteral("v3");
+            }
+        }
+    }
+    if (dimension.isEmpty())  dimension  = QStringLiteral("2d");
+    if (generation.isEmpty()) generation = QStringLiteral("v3");
+    const bool is_create = (mode == QStringLiteral("create"));
+    const bool is_3d     = !is_create && (dimension == QStringLiteral("3d"));
+
     QString outPath = options.value(QStringLiteral("outputPath")).toString().trimmed();
     QString sceneName = options.value(QStringLiteral("sceneName"), QStringLiteral("procedural")).toString().trimmed();
     if (sceneName.isEmpty()) sceneName = QStringLiteral("procedural");
@@ -625,25 +679,33 @@ QVariantMap RubyToolsBridge::generateScene(const QVariantMap& options) {
         outPath += QStringLiteral("/") + sceneName + QStringLiteral(".scene");
     }
 
-    if (family == 0) {
-        // Scene Creator
+    if (is_create) {
+        // ── Scene Creator: an authored template, NOT procedural terrain ──────
+        // This branch must NOT read the procedural "width"/"height" keys. Both
+        // families used to share those key names, and the procedural fields
+        // default to 2400x900, so Scene Create was being handed a 2400-unit
+        // platform instead of its own authored 320x48 template. It now has
+        // dedicated platformWidth/platformHeight/platformDepth keys.
         scenecreate::Options o;
         o.output_path = outPath.toStdString();
-        o.level_name = sceneName.toStdString();
-        o.scene_template = static_cast<scenecreate::SceneTemplate>(options.value(QStringLiteral("templateIndex"), 1).toInt());
-        o.ground_top_texture = options.value(QStringLiteral("groundTopTexture"), QStringLiteral("fire_grass")).toString().toStdString();
-        o.ground_side_texture = options.value(QStringLiteral("groundSideTexture"), QStringLiteral("graveyard_ground")).toString().toStdString();
+        o.level_name  = sceneName.toStdString();
+        o.scene_template = static_cast<scenecreate::SceneTemplate>(
+            options.value(QStringLiteral("templateIndex"), 1).toInt());
+        o.ground_top_texture  = options.value(QStringLiteral("groundTopTexture"),
+                                              QStringLiteral("fire_grass")).toString().toStdString();
+        o.ground_side_texture = options.value(QStringLiteral("groundSideTexture"),
+                                              QStringLiteral("graveyard_ground")).toString().toStdString();
         o.background = options.value(QStringLiteral("background"), QStringLiteral("")).toString().toStdString();
-        o.platform_width = float(options.value(QStringLiteral("width"), 320.0).toDouble());
-        o.platform_height = float(options.value(QStringLiteral("height"), 48.0).toDouble());
-        o.platform_depth = float(options.value(QStringLiteral("depth"), 90.0).toDouble());
+        o.platform_width  = float(options.value(QStringLiteral("platformWidth"),  320.0).toDouble());
+        o.platform_height = float(options.value(QStringLiteral("platformHeight"),  48.0).toDouble());
+        o.platform_depth  = float(options.value(QStringLiteral("platformDepth"),   90.0).toDouble());
         o.spawn_x = float(options.value(QStringLiteral("spawnX"), 0.0).toDouble());
         o.spawn_y = float(options.value(QStringLiteral("spawnY"), 56.0).toDouble());
+        o.spawn_facing = options.value(QStringLiteral("spawnFacing"), 1).toInt();
 
         scenecreate::Result r;
         std::string err;
-        bool ok = scenecreate::create(o, r, err);
-        if (!ok) {
+        if (!scenecreate::create(o, r, err)) {
             m_lastStatus = QStringLiteral("Scene Creator failed: ") + QString::fromStdString(err);
             emit statusChanged();
             res[QStringLiteral("error")] = QString::fromStdString(err);
@@ -655,15 +717,16 @@ QVariantMap RubyToolsBridge::generateScene(const QVariantMap& options) {
         res[QStringLiteral("ok")] = true;
         res[QStringLiteral("outputPath")] = outPath;
         res[QStringLiteral("objects")] = r.object_count;
+        res[QStringLiteral("algorithm")] = QStringLiteral("scene-create");
         return res;
     }
 
-    // Procedural generators (V1, V2, V3, V3-DB, V2-3D)
+    // ── Procedural: shared options ─────────────────────────────────────────
     sgen::TerrainOptions o;
     o.biome = static_cast<sgen::Biome>(options.value(QStringLiteral("biome"), 0).toInt());
     o.seed = uint32_t(options.value(QStringLiteral("seed"), 12345).toUInt());
     o.scene_name = sceneName.toStdString();
-    o.width = float(options.value(QStringLiteral("width"), 2400.0).toDouble());
+    o.width  = float(options.value(QStringLiteral("width"), 2400.0).toDouble());
     o.height = float(options.value(QStringLiteral("height"), 900.0).toDouble());
     o.platform_count = options.value(QStringLiteral("platformCount"), 6).toInt();
     o.octaves = options.value(QStringLiteral("octaves"), 4).toInt();
@@ -674,33 +737,57 @@ QVariantMap RubyToolsBridge::generateScene(const QVariantMap& options) {
     o.mountains = options.value(QStringLiteral("mountains"), false).toBool();
     o.islands = options.value(QStringLiteral("islands"), false).toBool();
     o.add_portal = options.value(QStringLiteral("addPortal"), false).toBool();
-    o.portal_destination = options.value(QStringLiteral("portalDestination"), QStringLiteral("next_level")).toString().toStdString();
+    o.portal_destination = options.value(QStringLiteral("portalDestination"),
+                                         QStringLiteral("next_level")).toString().toStdString();
+    o.randomize_deco_rotation = options.value(QStringLiteral("randomizeDecoRotation"), true).toBool();
+    o.randomize_deco_scale    = options.value(QStringLiteral("randomizeDecoScale"), true).toBool();
 
     sgen::Result r;
-    if (family == 1) {
-        r = sgen::generate_biome_scene(o);
-    } else if (family == 2) {
-        sgen::v2::TerrainOptionsV2 x;
-        static_cast<sgen::TerrainOptions&>(x) = o;
-        x.bg_layers = options.value(QStringLiteral("bgLayers"), 2).toInt();
-        x.add_overhangs = options.value(QStringLiteral("addOverhangs"), false).toBool();
-        x.add_terracing = options.value(QStringLiteral("addTerracing"), false).toBool();
-        r = sgen::v2::generate_biome_scene_v2(x);
-    } else if (family == 3 || family == 4) {
-        r = sgen::v3::generate_biome_scene_v3(o);
-    } else {
+    QString algorithm;
+    if (is_3d) {
+        // The voxel world is its own generator, not a "generation": it has depth
+        // rows and block sizes where the 2.5D ones have Z-layers and octaves.
         sgen::v2_3d::TerrainOptions3D x;
         static_cast<sgen::TerrainOptions&>(x) = o;
-        x.blocky = options.value(QStringLiteral("blocky"), false).toBool();
-        x.add_caves = options.value(QStringLiteral("addCaves"), true).toBool();
-        x.sky_islands = options.value(QStringLiteral("skyIslands"), true).toBool();
+        x.depth_rows  = options.value(QStringLiteral("depthRows"), x.depth_rows).toInt();
+        x.front_rows  = options.value(QStringLiteral("frontRows"), x.front_rows).toInt();
+        x.row_band    = float(options.value(QStringLiteral("rowBand"), x.row_band).toDouble());
+        x.block_size  = float(options.value(QStringLiteral("blockSize"), x.block_size).toDouble());
+        x.blocky      = options.value(QStringLiteral("blocky"), x.blocky).toBool();
+        x.add_caves   = options.value(QStringLiteral("addCaves"), x.add_caves).toBool();
+        x.sky_islands = options.value(QStringLiteral("skyIslands"), x.sky_islands).toBool();
+        x.scatter_far_trees = options.value(QStringLiteral("farTrees"), x.scatter_far_trees).toBool();
         r = sgen::v2_3d::generate_biome_scene_v2_3d(x);
+        algorithm = QStringLiteral("v2-3d");
+    } else if (generation == QStringLiteral("v1")) {
+        r = sgen::generate_biome_scene(o);
+        algorithm = QStringLiteral("v1");
+    } else if (generation == QStringLiteral("v2")) {
+        sgen::v2::TerrainOptionsV2 x;
+        static_cast<sgen::TerrainOptions&>(x) = o;
+        x.enable_bg_terrain = options.value(QStringLiteral("bgTerrain"), x.enable_bg_terrain).toBool();
+        x.enable_fg_terrain = options.value(QStringLiteral("fgTerrain"), x.enable_fg_terrain).toBool();
+        x.enable_z_path     = options.value(QStringLiteral("zPath"), x.enable_z_path).toBool();
+        x.z_path_amplitude  = float(options.value(QStringLiteral("zAmplitude"), x.z_path_amplitude).toDouble());
+        x.bg_layers         = options.value(QStringLiteral("bgLayers"), x.bg_layers).toInt();
+        x.scatter_background_decos = options.value(QStringLiteral("bgDecos"), x.scatter_background_decos).toBool();
+        x.scatter_foreground_decos = options.value(QStringLiteral("fgDecos"), x.scatter_foreground_decos).toBool();
+        x.add_overhangs     = options.value(QStringLiteral("addOverhangs"), x.add_overhangs).toBool();
+        x.add_terracing     = options.value(QStringLiteral("addTerracing"), x.add_terracing).toBool();
+        x.terrace_strength  = float(options.value(QStringLiteral("terraceStrength"), x.terrace_strength).toDouble());
+        x.emit_camera_shapes= options.value(QStringLiteral("cameraShapes"), x.emit_camera_shapes).toBool();
+        r = sgen::v2::generate_biome_scene_v2(x);
+        algorithm = QStringLiteral("v2");
+    } else {
+        r = sgen::v3::generate_biome_scene_v3(o);
+        algorithm = QStringLiteral("v3");
     }
 
     if (!r.ok()) {
         m_lastStatus = QStringLiteral("Generation failed: ") + QString::fromStdString(r.error);
         emit statusChanged();
         res[QStringLiteral("error")] = QString::fromStdString(r.error);
+        res[QStringLiteral("algorithm")] = algorithm;
         return res;
     }
 
@@ -711,19 +798,21 @@ QVariantMap RubyToolsBridge::generateScene(const QVariantMap& options) {
         m_lastStatus = QStringLiteral("Could not write ") + outPath;
         emit statusChanged();
         res[QStringLiteral("error")] = QStringLiteral("Failed to open file for writing");
+        res[QStringLiteral("algorithm")] = algorithm;
         return res;
     }
     f.write(r.scene_bytes.data(), qint64(r.scene_bytes.size()));
     f.close();
 
-    m_lastStatus = QStringLiteral("Generated %1 objects (%2 KB) -> %3")
-        .arg(int(r.objects)).arg(int(r.scene_bytes.size() / 1024)).arg(outPath);
+    m_lastStatus = QStringLiteral("%1 wrote %2 objects (%3 KB) -> %4")
+        .arg(algorithm).arg(int(r.objects)).arg(int(r.scene_bytes.size() / 1024)).arg(outPath);
     emit statusChanged();
 
     res[QStringLiteral("ok")] = true;
     res[QStringLiteral("outputPath")] = outPath;
     res[QStringLiteral("objects")] = int(r.objects);
     res[QStringLiteral("bytes")] = int(r.scene_bytes.size());
+    res[QStringLiteral("algorithm")] = algorithm;
     return res;
 }
 

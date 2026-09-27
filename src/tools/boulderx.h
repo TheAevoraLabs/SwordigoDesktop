@@ -239,8 +239,63 @@ private:
 void engine_node_depths(const Params& params, size_t node_count,
                         std::vector<double>& front_out, std::vector<double>& back_out);
 
+// The one switch behind all of it. false = this ship is flat-Z: imports fill
+// flat_node_depths() and every editor's relief control is disabled and tagged
+// "#will be unlocked after". Set it to true and the same call sites go back to
+// engine_node_depths() and re-enable those controls — nothing is deleted, the
+// feature is staged.
+inline constexpr bool kPerNodeReliefUnlocked = false;
+
+// ── The flat-Z ship path — #will be unlocked after ─────────────────────────
+// NOTE: Zenith as a whole does not work yet — it is the worst of the three
+// generators (see the reality check on GroundGenerator above). Flat-Z is not a
+// fix for that, it is containment: it removes the one failure mode (Z drifting
+// across an import/regenerate) that did the most damage, so an unfinished
+// generator can no longer corrupt a shipped mesh while the rest is recovered.
+//
+// Zenith's per-node relief is STAGED OFF for this release. An imported object
+// gets ONE constant plane for every node instead of the HorizNoise law, so a
+// round trip through the editor can neither invent relief nor lose any — the
+// "equalise z max and min to a constant" behaviour Boulder has always had.
+//
+// The relief controls that would turn it back on (Randomise Z and the per-node
+// sculpt) are disabled in all three editors and tagged "#will be unlocked after"
+// in their labels; re-enabling them means calling engine_node_depths() again.
+//
+// The plane is vanilla-exact, measured over the shipped corpus (205/205
+// objects):
+//     plane = |MaxDepth| - (MeshType 1 ? HatWidthOffset1 : 0)
+//           = SurfaceWidth / 2
+// The second form is what the generator declaration round-trips through, so
+// emitting with these planes writes back the SurfaceWidth it read: the
+// declaration does not drift by a single float. Note the plane is SurfaceWidth/2
+// for BOTH mesh types — MeshType 1's HatWidthOffset1 is added by the rim and by
+// the declaration, never by the plane itself, so front = +half, back = -half at
+// every node either way.
+//
+// Why this gets past Boulder's limits instead of just deleting a feature: with
+// every node on one z the cap is a PLANAR polygon, so which ear the
+// triangulator picks stops mattering. The one engine rule still unrecovered
+// (the cap's ear order — 19/57 on obj9#10) becomes invisible rather than a
+// source of broken geometry, while Zenith keeps everything Boulder cannot
+// express: concave outlines, the rim/ribbon families, hats, v2 sheets.
+void flat_node_depths(double plane, size_t node_count,
+                      std::vector<double>& front_out, std::vector<double>& back_out);
+void flat_node_depths(const Params& params, size_t node_count,
+                      std::vector<double>& front_out, std::vector<double>& back_out);
+
+// The same constant, read off an object's DECLARED MaxDepth instead of its
+// SurfaceWidth, for the path where no generator field is usable. It subtracts
+// the same MeshType/HatWidthOffset1 the emitter itself will use, so the pair is
+// self-consistent: depth = plane + W1 comes back as the number that went in,
+// whether the declaration was intact or the depth came from the bake's z
+// extremes.
+double flat_plane_declared(double abs_max_depth, int mesh_type,
+                           double hat_width_offset_1);
+
 // ── Recovering per-node depth from a baked mesh (the FALLBACK) ──────────────
-// Prefer engine_node_depths(): GenerateMesh *computes* the array from the
+// Prefer flat_node_depths() (the ship path) or engine_node_depths():
+// GenerateMesh *computes* the array from the
 // generator's parameters, so where those exist there is nothing to recover and
 // nothing that can fail to match. This is for a bake whose generator is gone.
 //
@@ -357,6 +412,37 @@ std::string generate_ground_mesh_object_swdm(const std::string& swdm_text,
 // RUBY_GROUND_GENERATOR=boulderx (or =boulder) overrides the initial value only —
 // handy for A/B-ing a scene without a rebuild — and a saved user choice in the
 // GUI takes precedence over it; see ruby_settings_bridge.cpp.
+//
+// ── Generator reality check — state as of 2026-09 ──────────────────────────
+// Three generators ship. Read against the baked meshes that ship in the 202
+// decoded scenes, the honest ranking is this, and it is NOT the enum order:
+//
+//   1. Boulder — closest to vanilla, and the only one that is dependable, but
+//      only for SIMPLE meshes. It needs the polygon's top edges near-horizontal;
+//      an arc, a slope or a concave outline produces no surface at all, and
+//      pushing a complex mesh through it makes and causes several issues. So it
+//      is regressive by construction: it looks right exactly where the mesh is
+//      easy and falls apart where the mesh is hard. We know this well by now —
+//      it is why it is still the default despite that ceiling.
+//   2. Zypher — the surprise. It works quite well on COMPLEX meshes (splines,
+//      beveled profiles, fBm/Worley strata) and stays geometrically sound on the
+//      concave, curved outlines Boulder refuses. Its output does not look
+//      vanilla, and that is expected: Zypher's whole theme is a modern procedural
+//      generator, not a 2011 bake. Judged on "does the mesh hold together" it
+//      wins on complex input; judged on "does it match shipped terrain" it loses
+//      on purpose.
+//   3. Zenith (BoulderX) — currently the WORST of the three, and as of 2026-09
+//      it does not work yet. It is the engine-parity port: it declines whatever
+//      it cannot reproduce, its per-node relief can drift across a round trip,
+//      and the engine's cap ear-order rule is still unrecovered. #will be
+//      unlocked after — treat Zenith as unfinished internal work, never as an
+//      option to hand a user, and never as a reason to change the default.
+//
+// The enum below lists them in LINEAGE order (1st, 2nd, 3rd generation), which
+// is why Boulder sits first. The quality order is the list above, and it is the
+// whole reason Boulder is the default and Zenith's 3D features are staged off
+// behind kPerNodeReliefUnlocked — an UNFINISHED generator must not be able to
+// corrupt a shipped scene just by being selected.
 enum class GroundGenerator {
     Boulder,    // the original generator (src/tools/boulder.cpp)
     BoulderX,   // engine-parity generator; declines what it cannot reproduce

@@ -82,6 +82,9 @@ public:
     explicit RubyQuickViewport(QQuickItem* parent = nullptr);
     ~RubyQuickViewport() override;
 
+    static RubyQuickViewport* activeInstance();
+    QString filePath() const { return m_filePath; }
+
     Renderer* createRenderer() const override;
 
     int gizmoMode() const { return m_gizmoMode; }
@@ -199,8 +202,15 @@ public:
     //
     // `seed` is reported back through groundReliefSeed() and makes the result
     // reproducible — re-entering a seed you liked gives that mesh back.
+    //
+    // #will be unlocked after: for this release per-node relief is staged off
+    // (boulderx::kPerNodeReliefUnlocked), so this REFUSES and reports the staged
+    // state instead of reshaping the sheet — imports arrive flat and stay flat.
     Q_INVOKABLE bool randomiseGroundRelief(float frontMagnitude, float backMagnitude,
                                            int seed = -1);
+    // True while per-node relief is staged off, so the UI can label the control
+    // "#will be unlocked after" instead of letting a tap fail silently.
+    Q_INVOKABLE bool groundReliefStaged() const { return !boulderx::kPerNodeReliefUnlocked; }
     // Puts the per-node depth back to the object's OWN baked depths — what the
     // import recovered — rather than flattening the sheet. Flattening is what
     // "clear" used to mean, and on an object with real relief that is a

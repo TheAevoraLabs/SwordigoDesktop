@@ -532,6 +532,18 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
     // ── 10. AABB & Depths ─────────────────────────────────────────────────────
     compute_aabb(result);
     result.depth_z = max_depth + hat_w + 5.0;
+    // The generator's own inputs, for the emitted GroundMeshGenerator. NOT the
+    // AABB: see GeneratedMesh::gen_surface_width. A re-import that reads the
+    // AABB back as SurfaceWidth derives a depth of half the plate and grows the
+    // mesh on every edit.
+    result.gen_surface_width = params.surface_width > 0 ? params.surface_width : def_hw * 2.0;
+    result.gen_hat_height = hat_h;
+    result.gen_hat_width_offset_1 = hat_w;
+    result.gen_hat_width_offset_2 = hat_w;
+    result.gen_horiz_noise = 0.0;
+    result.gen_seed = params.seed;
+    result.gen_mesh_type = 1;
+    result.tex_scale = TSCALE;
     result.ok = true;
     return result;
 }
@@ -1267,13 +1279,16 @@ std::string emit_scene_object(const GeneratedMesh& mesh,
     ggc.write_varint_field(2, static_cast<uint64_t>(ids.mesh_id));
     ggc.write_varint_field(3, static_cast<uint64_t>(ids.tm_front_id));
     ggc.write_varint_field(4, static_cast<uint64_t>(ids.tm_surface_id));
-    ggc.write_varint_field(5, 1291618994ULL);
-    ggc.write_float_field(6, 0.f);
-    ggc.write_varint_field(7, 1);
-    ggc.write_float_field(8, aw);
-    ggc.write_float_field(9, ah);
-    ggc.write_float_field(10, aw * 0.5f);
-    ggc.write_float_field(11, ah * 0.5f);
+    // The generator's own parameters — see GeneratedMesh::gen_surface_width for
+    // why these are NOT the AABB. (aw/ah remain the LocalAabb below, which is
+    // the field that genuinely is the mesh bounds.)
+    ggc.write_varint_field(5, static_cast<uint64_t>(mesh.gen_seed));
+    ggc.write_float_field(6, static_cast<float>(mesh.gen_horiz_noise));
+    ggc.write_varint_field(7, static_cast<uint64_t>(mesh.gen_mesh_type));
+    ggc.write_float_field(8, static_cast<float>(mesh.gen_surface_width));
+    ggc.write_float_field(9, static_cast<float>(mesh.gen_hat_height));
+    ggc.write_float_field(10, static_cast<float>(mesh.gen_hat_width_offset_1));
+    ggc.write_float_field(11, static_cast<float>(mesh.gen_hat_width_offset_2));
 
     proto::Writer comp_gen;
     comp_gen.write_string_field(1, "GroundMeshGenerator");
@@ -1299,7 +1314,7 @@ std::string emit_scene_object(const GeneratedMesh& mesh,
     auto make_tm = [&](const std::string& tex, int cid) {
         proto::Writer tm;
         tm.write_string_field(1, tex);
-        tm.write_float_field(2, 200.f);
+        tm.write_float_field(2, mesh.tex_scale > 0.f ? mesh.tex_scale : 250.f);
         tm.write_nested_field(3, pw_v2(0, 0));
         proto::Writer c;
         c.write_string_field(1, "TextureMapping");

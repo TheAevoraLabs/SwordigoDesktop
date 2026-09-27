@@ -383,11 +383,22 @@ public class RubyActivity extends QtActivity {
     }
 
     @Override
+    public void onBackPressed() {
+        // Move task to back gracefully instead of destroying Qt C++ runtime,
+        // allowing instant resume without freeze or cold starts.
+        moveTaskToBack(true);
+    }
+
+    @Override
     protected void onDestroy() {
         if (sInstance == this) {
             sInstance = null;
         }
         super.onDestroy();
+        // Qt C++ runtime does not support re-initialization in the same Linux process.
+        // Cleanly terminate so the next launch from launcher or recents always starts fresh.
+        android.os.Process.killProcess(android.os.Process.myPid());
+        System.exit(0);
     }
 
     /**

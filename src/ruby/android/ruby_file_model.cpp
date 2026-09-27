@@ -11,6 +11,7 @@
 #include "platform/scl_parser.h"
 #include "platform/pvr_loader.h"
 #include "tools/filerift.h"
+#include "ruby_quick_viewport.h"
 #include <algorithm>
 #include <QDebug>
 #if defined(Q_OS_ANDROID)
@@ -78,6 +79,7 @@ void RubyFileModel::navigateTo(const QString& path) {
     if (dir.exists()) {
         m_currentDir = dir;
         m_filter.clear();
+        m_allItems.clear();
         reload();
         emit currentPathChanged();
     }
@@ -86,18 +88,26 @@ void RubyFileModel::navigateTo(const QString& path) {
 void RubyFileModel::navigateUp() {
     if (m_currentDir.cdUp()) {
         m_filter.clear();
+        m_allItems.clear();
         reload();
         emit currentPathChanged();
     }
 }
 
 void RubyFileModel::refresh() {
+    m_allItems.clear();
     reload();
 }
 
 void RubyFileModel::setFilter(const QString& text) {
-    m_filter = text.trimmed();
-    reload();
+    QString trimmed = text.trimmed();
+    if (trimmed == m_filter) return;
+    m_filter = trimmed;
+    if (!m_allItems.isEmpty() && m_lastLoadedDir == m_currentDir) {
+        applyFilterAndSort();
+    } else {
+        reload();
+    }
 }
 
 bool RubyFileModel::deleteItem(const QString& path) {
@@ -111,6 +121,7 @@ bool RubyFileModel::deleteItem(const QString& path) {
     }
     if (success) {
         m_pinnedPaths.remove(path);
+        m_allItems.clear();
         reload();
     }
     return success;
@@ -125,6 +136,7 @@ bool RubyFileModel::renameItem(const QString& path, const QString& newName) {
             m_pinnedPaths.remove(path);
             m_pinnedPaths.insert(newPath);
         }
+        m_allItems.clear();
         reload();
     }
     return success;
@@ -134,6 +146,7 @@ bool RubyFileModel::createDirectory(const QString& name) {
     if (name.trimmed().isEmpty()) return false;
     bool success = m_currentDir.mkdir(name.trimmed());
     if (success) {
+        m_allItems.clear();
         reload();
     }
     return success;
@@ -148,6 +161,7 @@ bool RubyFileModel::createFile(const QString& name, const QString& ext) {
     QFile file(fullPath);
     if (file.open(QIODevice::WriteOnly)) {
         file.close();
+        m_allItems.clear();
         reload();
         return true;
     }
@@ -450,6 +464,7 @@ QString RubyFileModel::createFileFromTemplate(const QString& name, const QString
             if (out_file.open(QIODevice::WriteOnly)) {
                 out_file.write(binary_bytes.data(), static_cast<qint64>(binary_bytes.size()));
                 out_file.close();
+                m_allItems.clear();
                 reload();
                 return fullPath;
             }
@@ -462,6 +477,7 @@ QString RubyFileModel::createFileFromTemplate(const QString& name, const QString
     if (out_file.open(QIODevice::WriteOnly | QIODevice::Text)) {
         out_file.write(content.toUtf8());
         out_file.close();
+        m_allItems.clear();
         reload();
         return fullPath;
     }
@@ -474,7 +490,17 @@ void RubyFileModel::togglePin(const QString& path) {
     } else {
         m_pinnedPaths.insert(path);
     }
-    reload();
+    for (auto& item : m_allItems) {
+        if (item.filePath == path) {
+            item.isPinned = m_pinnedPaths.contains(path);
+            break;
+        }
+    }
+    if (!m_allItems.isEmpty() && m_lastLoadedDir == m_currentDir) {
+        applyFilterAndSort();
+    } else {
+        reload();
+    }
 }
 
 void RubyFileModel::copyToClipboard(const QString& text) {
@@ -495,7 +521,11 @@ void RubyFileModel::setCategory(const QString& category) {
     const QString c = category.toLower();
     if (c == m_category) return;
     m_category = c;
-    reload();
+    if (!m_allItems.isEmpty() && m_lastLoadedDir == m_currentDir) {
+        applyFilterAndSort();
+    } else {
+        reload();
+    }
     emit categoryChanged();
 }
 
@@ -503,28 +533,36 @@ void RubyFileModel::setSortMode(const QString& mode) {
     const QString m = mode.toLower();
     if (m == m_sortMode) return;
     m_sortMode = m;
-    reload();
+    if (!m_allItems.isEmpty() && m_lastLoadedDir == m_currentDir) {
+        applyFilterAndSort();
+    } else {
+        reload();
+    }
     emit sortChanged();
 }
 
 void RubyFileModel::setSortAscending(bool ascending) {
     if (ascending == m_sortAscending) return;
     m_sortAscending = ascending;
-    reload();
+    if (!m_allItems.isEmpty() && m_lastLoadedDir == m_currentDir) {
+        applyFilterAndSort();
+    } else {
+        reload();
+    }
     emit sortChanged();
 }
 
 void RubyFileModel::setShowHidden(bool show) {
     if (show == m_showHidden) return;
     m_showHidden = show;
+    m_allItems.clear();
     reload();
     emit showHiddenChanged();
 }
 
-bool RubyFileModel::passesCategory(const QFileInfo& fi, const QString& cat) {
+bool RubyFileModel::passesCategorySuffix(const QString& ext, const QString& cat) {
     if (cat.isEmpty() || cat == QLatin1String("all")) return true;
 
-    const QString ext = fi.suffix().toLower();
     if (cat == QLatin1String("scene"))    return ext == QLatin1String("scene");
     if (cat == QLatin1String("scl"))      return ext == QLatin1String("scl");
     if (cat == QLatin1String("models"))   return ext == QLatin1String("pod") || ext == QLatin1String("glb");
@@ -534,43 +572,97 @@ bool RubyFileModel::passesCategory(const QFileInfo& fi, const QString& cat) {
     return true;
 }
 
+bool RubyFileModel::passesCategory(const QFileInfo& fi, const QString& cat) {
+    return passesCategorySuffix(fi.suffix().toLower(), cat);
+}
+
+void RubyFileModel::applyFilterAndSort() {
+    QVector<FileItem> filtered;
+    filtered.reserve(m_allItems.size());
+    int dCount = 0;
+    int fCount = 0;
+
+    const QString filter = m_filter;
+    const QString cat = m_category;
+
+    for (const auto& item : m_allItems) {
+        if (!filter.isEmpty() && !item.fileName.contains(filter, Qt::CaseInsensitive)) {
+            continue;
+        }
+
+        if (!item.isDir && !passesCategorySuffix(item.suffix.toLower(), cat)) {
+            continue;
+        }
+
+        filtered.append(item);
+    }
+
+    const QString sortMode = m_sortMode;
+    const bool sortAscending = m_sortAscending;
+
+    std::sort(filtered.begin(), filtered.end(), [sortMode, sortAscending](const FileItem& a, const FileItem& b) {
+        if (a.isPinned != b.isPinned) return a.isPinned > b.isPinned;
+        if (a.isDir != b.isDir) return a.isDir;
+
+        const FileItem& first = sortAscending ? a : b;
+        const FileItem& second = sortAscending ? b : a;
+
+        if (sortMode == QLatin1String("date")) {
+            if (first.modified != second.modified) {
+                return first.modified < second.modified;
+            }
+        } else if (sortMode == QLatin1String("size")) {
+            if (first.bytes != second.bytes) {
+                return first.bytes < second.bytes;
+            }
+        } else if (sortMode == QLatin1String("type")) {
+            int cmp = first.suffix.localeAwareCompare(second.suffix);
+            if (cmp != 0) return cmp < 0;
+        } else { // "name"
+            int cmp = first.fileName.localeAwareCompare(second.fileName);
+            if (cmp != 0) return cmp < 0;
+        }
+
+        // Tie-breaker: always sort by filePath ascending for deterministic strict weak ordering
+        return a.filePath < b.filePath;
+    });
+
+    for (const auto& item : filtered) {
+        if (item.isDir) ++dCount; else ++fCount;
+    }
+
+    beginResetModel();
+    m_items = std::move(filtered);
+    m_dirCount = dCount;
+    m_fileCount = fCount;
+    endResetModel();
+    emit countChanged();
+}
+
 void RubyFileModel::reload() {
     uint64_t gen = ++m_scanGeneration;
     m_isLoading = true;
     emit isLoadingChanged();
 
+    QPointer<RubyFileModel> self(this);
     QDir targetDir = m_currentDir;
-    QString filter = m_filter;
-    QString cat = m_category;
     bool showHidden = m_showHidden;
     QSet<QString> pinned = m_pinnedPaths;
-    QString sortMode = m_sortMode;
-    bool sortAscending = m_sortAscending;
 
-    QThreadPool::globalInstance()->start([this, gen, targetDir, filter, cat, showHidden, pinned, sortMode, sortAscending]() {
+    QThreadPool::globalInstance()->start([self, gen, targetDir, showHidden, pinned]() {
+        if (!self || self->m_scanGeneration.load() != gen) return;
+
         QDir::Filters filters = QDir::AllEntries | QDir::NoDotAndDotDot;
         if (showHidden) filters |= QDir::Hidden;
 
         QFileInfoList entries = targetDir.entryInfoList(filters);
 
-        if (m_scanGeneration.load() != gen) return;
+        if (!self || self->m_scanGeneration.load() != gen) return;
 
         QVector<FileItem> items;
         items.reserve(entries.size());
-        int dCount = 0;
-        int fCount = 0;
 
         for (const auto& fi : entries) {
-            if (!filter.isEmpty()) {
-                if (!fi.fileName().contains(filter, Qt::CaseInsensitive)) {
-                    continue;
-                }
-            }
-
-            if (!fi.isDir() && !passesCategory(fi, cat)) {
-                continue;
-            }
-
             FileItem item;
             item.fileName = fi.fileName();
             item.filePath = fi.absoluteFilePath();
@@ -592,46 +684,24 @@ void RubyFileModel::reload() {
             items.append(item);
         }
 
-        if (m_scanGeneration.load() != gen) return;
-
-        std::sort(items.begin(), items.end(), [sortMode, sortAscending](const FileItem& a, const FileItem& b) {
-            if (a.isPinned != b.isPinned) return a.isPinned > b.isPinned;
-            if (a.isDir != b.isDir) return a.isDir;
-
-            bool less = false;
-            if (sortMode == QLatin1String("date")) {
-                less = a.modified < b.modified;
-            } else if (sortMode == QLatin1String("size")) {
-                less = a.bytes < b.bytes;
-            } else if (sortMode == QLatin1String("type")) {
-                less = a.suffix.localeAwareCompare(b.suffix) < 0;
-            } else { // "name"
-                less = a.fileName.localeAwareCompare(b.fileName) < 0;
-            }
-            return sortAscending ? less : !less;
-        });
-
         bool isRes = checkSwordigoResourceRoot(targetDir.absolutePath());
 
-        for (const auto& item : items) {
-            if (item.isDir) ++dCount; else ++fCount;
-        }
+        if (!self || self->m_scanGeneration.load() != gen) return;
 
-        if (m_scanGeneration.load() != gen) return;
+        QMetaObject::invokeMethod(self, [self, gen, targetDir, showHidden, items = std::move(items), isRes]() mutable {
+            if (!self || self->m_scanGeneration.load() != gen) return;
 
-        QMetaObject::invokeMethod(this, [this, gen, items = std::move(items), dCount, fCount, isRes]() mutable {
-            if (m_scanGeneration.load() != gen) return;
-            beginResetModel();
-            m_items = std::move(items);
-            m_dirCount = dCount;
-            m_fileCount = fCount;
-            endResetModel();
-            m_isLoading = false;
-            bool resChanged = (m_isResourceRoot != isRes);
-            m_isResourceRoot = isRes;
-            emit isLoadingChanged();
-            emit countChanged();
-            if (resChanged) emit resourceRootChanged();
+            self->m_allItems = std::move(items);
+            self->m_lastLoadedDir = targetDir;
+            self->m_lastShowHidden = showHidden;
+
+            self->applyFilterAndSort();
+
+            self->m_isLoading = false;
+            bool resChanged = (self->m_isResourceRoot != isRes);
+            self->m_isResourceRoot = isRes;
+            emit self->isLoadingChanged();
+            if (resChanged) emit self->resourceRootChanged();
         }, Qt::QueuedConnection);
     });
 }
@@ -664,7 +734,35 @@ bool RubyFileModel::checkSwordigoResourceRoot(const QString& dirPath) {
     return (hits >= 3);
 }
 
+bool RubyFileModel::isPlayInGameAvailable() const {
+#ifdef RUBY_FOSS_COMPLIANT
+    return false; // play-in-game needs the proprietary GlossHook engine
+#else
+    return true;
+#endif
+}
+
 void RubyFileModel::launchGame() {
+#ifdef RUBY_FOSS_COMPLIANT
+    // FOSS flavor: the in-engine runner needs the proprietary GlossHook
+    // library, which this build excludes. The play button is hidden in QML
+    // via playInGameAvailable; this is a backstop.
+    emit statusMessage(QStringLiteral("Play in game needs the full release — this FOSS build excludes the proprietary GlossHook engine."));
+    return;
+#endif
+
+    RubyQuickViewport* vp = RubyQuickViewport::activeInstance();
+    if (vp) {
+        if (vp->meshEditActive()) {
+            qDebug() << "[RubyFileModel] Active viewport has active mesh edit; applying edit before game launch";
+            vp->applyMeshEdit();
+        }
+        if (vp->isDirty()) {
+            qDebug() << "[RubyFileModel] Active viewport is dirty; saving scene before game launch:" << vp->filePath();
+            vp->saveScene();
+        }
+    }
+
     QString resDir = m_currentDir.absolutePath();
     if (!QFile::exists(resDir + QStringLiteral("/hiro.POD")) &&
         QFile::exists(resDir + QStringLiteral("/resources/hiro.POD"))) {
@@ -709,11 +807,36 @@ bool RubyFileModel::canStartSceneInGame(const QString& scenePath) const {
 }
 
 bool RubyFileModel::startSceneInGame(const QString& scenePath) {
+#ifdef RUBY_FOSS_COMPLIANT
+    // FOSS flavor: direct scene boot needs the proprietary GlossHook engine.
+    // The context-menu entry is hidden in QML via playInGameAvailable.
+    Q_UNUSED(scenePath);
+    emit statusMessage(QStringLiteral("Start scene in game needs the full release — this FOSS build excludes the proprietary GlossHook engine."));
+    return false;
+#endif
     QFileInfo fi(scenePath);
     if (!canStartSceneInGame(scenePath)) {
         emit statusMessage(QStringLiteral("Not a scene file: ") + scenePath);
         return false;
     }
+
+    // Flush any pending mesh edits or unwritten scene changes
+    RubyQuickViewport* vp = RubyQuickViewport::activeInstance();
+    if (vp) {
+        if (vp->meshEditActive()) {
+            qDebug() << "[RubyFileModel] Active viewport has active mesh edit; applying edit before scene launch";
+            vp->applyMeshEdit();
+        }
+        if (vp->isDirty()) {
+            qDebug() << "[RubyFileModel] Active viewport is dirty; saving scene before scene launch:" << vp->filePath();
+            vp->saveScene();
+        }
+    }
+
+    // Refresh file info to log accurate on-disk size and mtime
+    fi.refresh();
+    qDebug() << "[RubyFileModel] Scene on disk before launch:" << fi.absoluteFilePath()
+             << "size:" << fi.size() << "bytes, mtime:" << fi.lastModified().toString(Qt::ISODate);
 
     // The engine appends ".scene" to whatever we hand it, so strip the extension here.
     const QString sceneName = fi.completeBaseName();
@@ -1199,6 +1322,14 @@ void RubyFileModel::addRecentFile(const QString& path) {
     while (recents.size() > 20) {
         recents.removeLast();
     }
+    settings.setValue(QStringLiteral("ruby_mobile/recent_files"), recents);
+    emit recentFilesChanged();
+}
+
+void RubyFileModel::removeRecentFile(const QString& path) {
+    QSettings settings;
+    QStringList recents = settings.value(QStringLiteral("ruby_mobile/recent_files")).toStringList();
+    recents.removeAll(path);
     settings.setValue(QStringLiteral("ruby_mobile/recent_files"), recents);
     emit recentFilesChanged();
 }

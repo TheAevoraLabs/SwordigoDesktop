@@ -64,6 +64,13 @@ Item {
     width: drawerWidth
     height: parent ? parent.height : 0
 
+    Timer {
+        id: filterDebounceTimer
+        interval: 150
+        repeat: false
+        onTriggered: root.applyFilter()
+    }
+
     // ── Data ──────────────────────────────────────────────────────────────
     function refresh() {
         root.rows = root.host ? root.host.objectsSnapshot() : []
@@ -72,14 +79,16 @@ Item {
     }
 
     function applyFilter() {
-        var q = root.filterText.trim().toLowerCase()
+        var q = root.filterText ? root.filterText.trim().toLowerCase() : ""
         if (q.length === 0) {
-            root.visibleRows = root.rows
+            root.visibleRows = root.rows || []
             return
         }
+        var src = root.rows || []
         var out = []
-        for (var i = 0; i < root.rows.length; ++i) {
-            var r = root.rows[i]
+        for (var i = 0; i < src.length; ++i) {
+            var r = src[i]
+            if (!r) continue
             var name = (r.name || "").toLowerCase()
             var sub = (r.subtitle || "").toLowerCase()
             if (name.indexOf(q) >= 0 || sub.indexOf(q) >= 0) {
@@ -97,21 +106,26 @@ Item {
     }
 
     function syncSelection() {
-        if (root.selectedIndex < 0) {
+        if (root.selectedIndex < 0 || !root.visibleRows) {
             listView.currentIndex = -1
             return
         }
         for (var i = 0; i < root.visibleRows.length; ++i) {
-            if (root.visibleRows[i].index === root.selectedIndex) {
+            var row = root.visibleRows[i]
+            if (row && row.index === root.selectedIndex) {
                 listView.currentIndex = i
-                listView.positionViewAtIndex(i, ListView.Contain)
+                var targetIdx = i
+                Qt.callLater(function() {
+                    if (listView && targetIdx >= 0 && targetIdx < listView.count) {
+                        listView.positionViewAtIndex(targetIdx, ListView.Contain)
+                    }
+                })
                 return
             }
         }
         listView.currentIndex = -1
     }
 
-    onFilterTextChanged: applyFilter()
     onVisibleRowsChanged: syncSelection()
 
     Component.onCompleted: refresh()
@@ -242,7 +256,15 @@ Item {
                             visible: !filterField.text && !filterField.activeFocus
                         }
 
-                        onTextChanged: root.filterText = text
+                        onTextChanged: {
+                            root.filterText = text
+                            if (text.trim().length === 0) {
+                                filterDebounceTimer.stop()
+                                root.applyFilter()
+                            } else {
+                                filterDebounceTimer.restart()
+                            }
+                        }
                     }
                 }
             }
@@ -270,10 +292,10 @@ Item {
                 height: Theme.dp(48)
                 radius: Theme.radiusSm
                 color: rowArea.pressed ? Theme.surface2
-                                       : (root.selectedIndex === modelData.index
+                                       : ((modelData && root.selectedIndex === modelData.index)
                                           ? Theme.alpha(Theme.accentInk, 0.16)
                                           : "transparent")
-                border.color: root.selectedIndex === modelData.index
+                border.color: (modelData && root.selectedIndex === modelData.index)
                               ? Theme.alpha(Theme.accentInk, 0.40) : "transparent"
                 border.width: 1
 
@@ -286,7 +308,7 @@ Item {
                     Text {
                         anchors.verticalCenter: parent.verticalCenter
                         width: Theme.dp(24)
-                        text: modelData.index + "."
+                        text: (modelData && modelData.index !== undefined ? modelData.index : "") + "."
                         font.pixelSize: Theme.dp(Theme.fontSm)
                         font.family: Theme.monoFamily
                         color: Theme.textMuted
@@ -299,36 +321,38 @@ Item {
 
                         Text {
                             width: parent.width
-                            text: modelData.name
+                            text: modelData ? (modelData.name || "") : ""
                             font.pixelSize: Theme.dp(Theme.fontMd)
-                            font.weight: root.selectedIndex === modelData.index ? Font.DemiBold : Font.Medium
-                            color: modelData.hidden ? Theme.textMuted : Theme.textPrimary
+                            font.weight: (modelData && root.selectedIndex === modelData.index) ? Font.DemiBold : Font.Medium
+                            color: (modelData && modelData.hidden) ? Theme.textMuted : Theme.textPrimary
                             elide: Text.ElideRight
                         }
 
                         Text {
                             width: parent.width
-                            visible: modelData.subtitle && modelData.subtitle.length > 0
-                            text: "[" + modelData.subtitle + "]"
+                            visible: Boolean(modelData && modelData.subtitle && modelData.subtitle.length > 0)
+                            text: (modelData && modelData.subtitle) ? ("[" + modelData.subtitle + "]") : ""
                             font.pixelSize: Theme.dp(Theme.fontXs)
                             color: Theme.textMuted
                             elide: Text.ElideRight
                         }
                     }
 
-                    // Visibility toggle. Emits the REQUESTED new visibility
-                    // (!hidden); the legacy widget declared this signal but never
-                    // emitted it, so there is no shipped consumer to match.
+                    // Visibility toggle.
                     Icon {
                         anchors.verticalCenter: parent.verticalCenter
-                        name: modelData.hidden ? "eye-off" : "eye"
+                        name: (modelData && modelData.hidden) ? "eye-off" : "eye"
                         size: Theme.dp(Theme.iconSm)
-                        color: modelData.hidden ? Theme.textDisabled : Theme.accentInk
+                        color: (modelData && modelData.hidden) ? Theme.textDisabled : Theme.accentInk
 
                         MouseArea {
                             anchors.fill: parent
                             anchors.margins: -Theme.dp(10)
-                            onClicked: root.objectVisibilityToggled(modelData.index, !modelData.hidden)
+                            onClicked: {
+                                if (modelData && modelData.index !== undefined) {
+                                    root.objectVisibilityToggled(modelData.index, !modelData.hidden)
+                                }
+                            }
                         }
                     }
                 }
@@ -338,8 +362,10 @@ Item {
                     anchors.fill: parent
                     anchors.rightMargin: Theme.dp(40) // keep the eye hit area usable
                     onClicked: {
-                        root.selectObject(modelData.index)
-                        root.objectSelected(modelData.index)
+                        if (modelData && modelData.index !== undefined) {
+                            root.selectObject(modelData.index)
+                            root.objectSelected(modelData.index)
+                        }
                     }
                 }
             }

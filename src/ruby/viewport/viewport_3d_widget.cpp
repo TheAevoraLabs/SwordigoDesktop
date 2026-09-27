@@ -5930,32 +5930,46 @@ void Viewport3DWidget::mesh_import(int idx) {
     // its back plane at 33/36, and each of the 3 misses is exactly 5.00 —
     // HatWidthOffset1 — too deep. (.scratch/rim_noise_probe.py is that run.)
     //
-    // So the array is not recovered, it is recomputed: GenerateMesh derives one
-    // depth per node from the generator's own parameters and nothing else, and a
-    // ground object always carries them. No XY matching, so no node can fail to
-    // match, and every node keeps the depth the engine would have given it.
+    // So the array is neither recovered nor, for this release, jittered: it is
+    // computed FLAT. #will be unlocked after — Zenith's per-node relief is
+    // staged off for the stable ship, so an import gets ONE constant plane
+    // instead of the HorizNoise law, exactly like Boulder. Nothing vanilla is
+    // lost in the process: the object's own plane IS that constant
+    // (SurfaceWidth/2, measured on 205/205 shipped objects), so it bakes back
+    // to the shape it arrived with — and with every node on one z the cap is a
+    // PLANAR polygon, so the triangulator's ear order (the one engine rule
+    // still not reproduced) can no longer corrupt it.
+    //
+    // Re-enabling relief means calling boulderx::engine_node_depths() here
+    // again; the controls that would do it are tagged "#will be unlocked after"
+    // in the studios. Until then no XY matching exists to fail and no node can
+    // collapse onto another's depth.
     m_mesh_vanilla_front_z.clear();
     m_mesh_vanilla_back_z.clear();
-    // Every shipped ground object carries a GroundMeshGenerator, but a
-    // hand-authored or truncated one may not: only when there is no usable
-    // SurfaceWidth does this fall back to reading the bake.
+    boulderx::Params law;
+    law.mesh_type = mesh_type;
+    law.surface_width = surface_width;
+    law.horiz_noise = horiz_noise;
+    law.random_seed = random_seed;
     if (surface_width > 0.0f) {
-        boulderx::Params law;
-        law.mesh_type = mesh_type;
-        law.surface_width = surface_width;
-        law.horiz_noise = horiz_noise;
-        law.random_seed = random_seed;
-        boulderx::engine_node_depths(law, m_mesh_points.size(),
-                                     m_mesh_vanilla_front_z, m_mesh_vanilla_back_z);
+        // #will be unlocked after: kPerNodeReliefUnlocked flips this one call
+        // back to the HorizNoise law and the whole feature returns.
+        if (boulderx::kPerNodeReliefUnlocked)
+            boulderx::engine_node_depths(law, m_mesh_points.size(),
+                                         m_mesh_vanilla_front_z, m_mesh_vanilla_back_z);
+        else
+            boulderx::flat_node_depths(law, m_mesh_points.size(),
+                                       m_mesh_vanilla_front_z, m_mesh_vanilla_back_z);
     } else {
-        std::vector<boulderx::Node> outline;
-        outline.reserve(m_mesh_points.size());
-        for (const auto& pt : m_mesh_points) outline.push_back({pt.x, pt.y, 0.0, 0.0});
-        std::vector<float> positions;
-        for (const auto& pm : obj.ground_meshes)
-            positions.insert(positions.end(), pm.positions.begin(), pm.positions.end());
-        boulderx::recover_node_depths(outline, positions, 0.5,
-                                      m_mesh_vanilla_front_z, m_mesh_vanilla_back_z);
+        // Every shipped ground object carries a GroundMeshGenerator, but a
+        // hand-authored or truncated one may not. No SurfaceWidth means no
+        // measured plane, so take the constant off the depth the object
+        // declares, minus the rim the emitter adds back — the same rule, and
+        // the same numbers, just sourced from the declaration.
+        const double plane = boulderx::flat_plane_declared(
+            std::fabs((double)max_depth), mesh_type, hat_offset_1);
+        boulderx::flat_node_depths(plane, m_mesh_points.size(),
+                                   m_mesh_vanilla_front_z, m_mesh_vanilla_back_z);
     }
     m_mesh_front_z = m_mesh_vanilla_front_z;
     m_mesh_back_z = m_mesh_vanilla_back_z;
@@ -5990,8 +6004,15 @@ void Viewport3DWidget::mesh_sync_relief_to_polygon() {
         return;
     }
 
-    const double uniform_front = std::fabs((double)m_mesh_params.max_depth);
-    const double uniform_back = -std::fabs((double)m_mesh_params.min_depth);
+    // The last-resort pair is the flat plane, not the raw declaration: a
+    // MeshType 1 object DECLARES plane + HatWidthOffset1, and handing that back
+    // as a plane lets build_rim add W1 a SECOND time — the "it over-increases
+    // the Z" report. Same rule as the import, and equal by construction, so
+    // z_max and z_min stay the constant pair the object shipped with.
+    const double uniform_front =
+        boulderx::flat_plane_declared(std::fabs((double)m_mesh_params.max_depth),
+                                      m_mesh_type, m_mesh_params.hat_width_offset_1);
+    const double uniform_back = -uniform_front;
 
     // Rebuilt rather than resized: a live value wins at its own index, then the
     // object's vanilla depth there, then the uniform one. Truncating or padding
@@ -6171,9 +6192,17 @@ bool Viewport3DWidget::mesh_apply() {
                 n.front_depth = m_mesh_front_z[i];
                 n.back_depth = m_mesh_back_z[i];
             } else {
-                double hw = gm.surface_width > 0 ? gm.surface_width * 0.5 : 50.0;
-                n.front_depth = hw;
-                n.back_depth = -hw;
+                // The flat plane, never a bare declaration: for MeshType 1 the
+                // declaration already includes HatWidthOffset1, which the rim
+                // would then add a second time.
+                const double plane =
+                    gm.surface_width > 0
+                        ? gm.surface_width * 0.5
+                        : boulderx::flat_plane_declared(std::fabs((double)gm.max_depth),
+                                                        m_mesh_type,
+                                                        gm.hat_width_offset_1);
+                n.front_depth = plane;
+                n.back_depth = -plane;
             }
             n.height = std::fabs(n.front_depth - n.back_depth);
             nodes.push_back(n);
@@ -6205,8 +6234,15 @@ bool Viewport3DWidget::mesh_apply() {
         // The uniform pair is only ever the fallback for a node that has no depth
         // of its own, never for the whole outline: keying the choice on the
         // arrays' LENGTH meant one inserted vertex flattened the entire sheet.
-        const double uniform_front = std::fabs(gm.max_depth);
-        const double uniform_back = -std::fabs(gm.min_depth);
+        // It is the flat plane (SurfaceWidth/2, or the declared depth minus the
+        // rim) rather than |MaxDepth| itself, for the same reason as above:
+        // MeshType 1's declaration already carries HatWidthOffset1.
+        const double uniform_front =
+            gm.surface_width > 0
+                ? gm.surface_width * 0.5
+                : boulderx::flat_plane_declared(std::fabs((double)gm.max_depth),
+                                                m_mesh_type, gm.hat_width_offset_1);
+        const double uniform_back = -uniform_front;
         std::vector<boulderx::Node> outline;
         outline.reserve(m_mesh_points.size());
         for (size_t i = 0; i < m_mesh_points.size(); ++i) {

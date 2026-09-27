@@ -37,6 +37,7 @@ bin/libs/libsre.so
 *.o
 *.so
 *.so.*
+!src/ruby/android/libs/**/*.so
 # Old source snapshots (archived in trash/)
 # Archives (game asset bundles, compressed builds, etc.)
 *.zip
@@ -178,6 +179,8 @@ deps/dynarmic/build/
 *.dll
 *.lib
 *.jar
+!src/ruby/android/libs/
+!src/ruby/android/libs/**
 
 # -------- EMBEDDED ASSETS GENERATED SOURCE --------
 src/platform/embedded_assets.cpp

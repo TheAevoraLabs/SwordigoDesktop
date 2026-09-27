@@ -8,6 +8,16 @@
         <item name="android:windowContentOverlay">@null</item>
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
         <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <style name="Theme.Ruby.CodeStudio" parent="@android:style/Theme.NoTitleBar">
+        <item name="android:windowBackground">#121316</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowFullscreen">false</item>
+        <item name="android:statusBarColor">#181A20</item>
+        <item name="android:navigationBarColor">#15171C</item>
+        <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
     </style>
 </resources>

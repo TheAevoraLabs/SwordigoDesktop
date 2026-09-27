@@ -1,14 +1,26 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
+    <!--
+      QtLoader preloads each entry here as lib<name>.so, AND separately loads the
+      main library as lib<android.app.lib_name>_<abi>.so (see QtLoader.java: it
+      sets MAIN_LIBRARY_KEY from android.app.lib_name, then appends
+      libPrefix + lib + ".so" for every bundled_libs entry). Naming this entry
+      plainly "ruby" therefore forced the SAME 15 MB libruby.so to be shipped a
+      second time as lib/arm64-v8a/libruby.so, because the main library is
+      libruby_arm64-v8a.so. Naming it "ruby_<abi>" makes one file satisfy both
+      loads, which is the whole reason the APK was 15 MB fatter than it needed
+      to be. Keep these names in sync with android.app.lib_name in
+      AndroidManifest.xml if either side changes.
+    -->
     <array name="bundled_libs">
         <item>arm64-v8a;c++_shared</item>
-        <item>arm64-v8a;ruby</item>
+        <item>arm64-v8a;ruby_arm64-v8a</item>
         <item>armeabi-v7a;c++_shared</item>
-        <item>armeabi-v7a;ruby</item>
+        <item>armeabi-v7a;ruby_armeabi-v7a</item>
         <item>x86_64;c++_shared</item>
-        <item>x86_64;ruby</item>
+        <item>x86_64;ruby_x86_64</item>
         <item>x86;c++_shared</item>
-        <item>x86;ruby</item>
+        <item>x86;ruby_x86</item>
     </array>
 
     <array name="qt_libs">

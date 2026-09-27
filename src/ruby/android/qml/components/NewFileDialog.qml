@@ -11,7 +11,8 @@ BottomSheet {
     id: root
 
     title: qsTr("New File")
-    peekHeight: Theme.dp(560)
+    peekHeight: Math.min(root.height * 0.90, Theme.dp(620))
+    expandedHeight: root.height * 0.94
 
     signal fileCreated(string fullPath, string extension)
 
@@ -144,6 +145,26 @@ BottomSheet {
     onSelectedTemplateChanged: {
         if (selectedTemplate) {
             fileNameField.text = selectedTemplate.defaultName
+            boilerplateText.text = rubyFileModel.getTemplateBoilerplate(selectedTemplate.id)
+        }
+    }
+
+    function reset(category, index) {
+        if (category !== undefined && category.length > 0) activeCategory = category
+        else activeCategory = "All"
+        if (index !== undefined) selectedIndex = index
+        else selectedIndex = 0
+        if (selectedTemplate) {
+            fileNameField.text = selectedTemplate.defaultName
+            boilerplateText.text = rubyFileModel.getTemplateBoilerplate(selectedTemplate.id)
+        }
+    }
+
+    onOpened: {
+        if (selectedTemplate) {
+            if (fileNameField.text.trim().length === 0) {
+                fileNameField.text = selectedTemplate.defaultName
+            }
             boilerplateText.text = rubyFileModel.getTemplateBoilerplate(selectedTemplate.id)
         }
     }
@@ -386,30 +407,72 @@ BottomSheet {
                 anchors.right: parent.right
                 spacing: Theme.dp(Theme.spacingSm)
 
-                Button {
-                    text: qsTr("Cancel")
-                    flat: true
-                    onClicked: root.close()
+                Rectangle {
+                    width: cancelBtnText.implicitWidth + Theme.dp(28)
+                    height: Theme.dp(40)
+                    radius: Theme.radiusPill
+                    color: cancelMouse.pressed ? Theme.surface2 : Theme.surface1
+                    border.color: Theme.border
+                    border.width: 1
+
+                    Text {
+                        id: cancelBtnText
+                        anchors.centerIn: parent
+                        text: qsTr("Cancel")
+                        font.pixelSize: Theme.dp(Theme.fontSm)
+                        font.weight: Font.DemiBold
+                        color: Theme.textSecondary
+                    }
+
+                    MouseArea {
+                        id: cancelMouse
+                        anchors.fill: parent
+                        onClicked: root.close()
+                    }
                 }
 
-                Button {
-                    text: qsTr("Create & Open")
-                    highlighted: true
-                    onClicked: {
-                        if (!root.selectedTemplate) return
-                        var name = fileNameField.text.trim()
-                        if (name.length === 0) name = root.selectedTemplate.defaultName
-                        var created = rubyFileModel.createFileFromTemplate(
-                            name,
-                            root.selectedTemplate.id,
-                            compileBinaryCheck.checked
-                        )
-                        if (created && created.length > 0) {
-                            root.close()
-                            root.fileCreated(created, root.selectedTemplate.ext)
+                Rectangle {
+                    width: createBtnText.implicitWidth + Theme.dp(32)
+                    height: Theme.dp(40)
+                    radius: Theme.radiusPill
+                    color: createMouse.pressed ? Theme.accentEnd : Theme.accentStart
+                    border.color: Theme.alpha(Theme.accentInk, 0.45)
+                    border.width: 1
+
+                    Text {
+                        id: createBtnText
+                        anchors.centerIn: parent
+                        text: qsTr("Create & Open")
+                        font.pixelSize: Theme.dp(Theme.fontSm)
+                        font.weight: Font.Bold
+                        color: Theme.onAccent
+                    }
+
+                    MouseArea {
+                        id: createMouse
+                        anchors.fill: parent
+                        onClicked: {
+                            if (!root.selectedTemplate) return
+                            var name = fileNameField.text.trim()
+                            if (name.length === 0) name = root.selectedTemplate.defaultName
+                            var created = rubyFileModel.createFileFromTemplate(
+                                name,
+                                root.selectedTemplate.id,
+                                compileBinaryCheck.checked
+                            )
+                            if (created && created.length > 0) {
+                                root.close()
+                                root.fileCreated(created, root.selectedTemplate.ext)
+                            }
                         }
                     }
                 }
+            }
+
+            // Bottom spacer for comfortable scrolling
+            Item {
+                width: 1
+                height: Theme.dp(48)
             }
         }
     }

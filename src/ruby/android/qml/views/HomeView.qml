@@ -7,6 +7,7 @@ Item {
     id: root
 
     signal openFilesRequested()
+    signal openFolderRequested(string folderPath)
     signal openPathRequested(string path)
     signal openToolsRequested(string toolName)
     signal openSettingsRequested()
@@ -404,6 +405,11 @@ Item {
                                 id: recentMouse
                                 anchors.fill: parent
                                 onClicked: root.openPathRequested(recentCard.rawPath)
+                                onPressAndHold: {
+                                    recentOptionsSheet.targetFilePath = recentCard.rawPath
+                                    recentOptionsSheet.targetFileName = recentCard.fn
+                                    recentOptionsSheet.open()
+                                }
                             }
                         }
                     }
@@ -721,6 +727,70 @@ Item {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // ── Context Actions for Recent File ────────────────────────────────────
+    BottomSheet {
+        id: recentOptionsSheet
+        property string targetFilePath: ""
+        property string targetFileName: ""
+        title: targetFileName.length > 0 ? targetFileName : qsTr("Recent File")
+        peekHeight: Theme.dp(250)
+
+        Column {
+            anchors.fill: parent
+            anchors.margins: Theme.dp(Theme.spacingLg)
+            spacing: Theme.dp(Theme.spacingSm)
+
+            MenuRow {
+                width: parent.width
+                iconName: "play"
+                text: qsTr("Open File")
+                accent: true
+                onClicked: {
+                    recentOptionsSheet.close()
+                    root.openPathRequested(recentOptionsSheet.targetFilePath)
+                }
+            }
+
+            MenuRow {
+                width: parent.width
+                iconName: "folder"
+                text: qsTr("Open Containing Folder")
+                onClicked: {
+                    recentOptionsSheet.close()
+                    var p = recentOptionsSheet.targetFilePath
+                    var lastSlash = p.lastIndexOf("/")
+                    var folder = lastSlash > 0 ? p.substring(0, lastSlash) : "/storage/emulated/0"
+                    root.openFolderRequested(folder)
+                }
+            }
+
+            MenuRow {
+                width: parent.width
+                iconName: "link"
+                text: qsTr("Copy Full Path")
+                onClicked: {
+                    if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
+                        rubyFileModel.copyToClipboard(recentOptionsSheet.targetFilePath)
+                    }
+                    recentOptionsSheet.close()
+                }
+            }
+
+            MenuRow {
+                width: parent.width
+                iconName: "trash"
+                text: qsTr("Remove from Recents")
+                danger: true
+                onClicked: {
+                    if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
+                        rubyFileModel.removeRecentFile(recentOptionsSheet.targetFilePath)
+                    }
+                    recentOptionsSheet.close()
                 }
             }
         }

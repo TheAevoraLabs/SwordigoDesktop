@@ -74,6 +74,11 @@ Item {
         border.color: Theme.border
         border.width: 1
 
+        // Consume touch events so they don't leak through to views behind
+        MouseArea {
+            anchors.fill: parent
+        }
+
         // Drag handle
         Item {
             id: handleZone
