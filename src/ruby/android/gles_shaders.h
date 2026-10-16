@@ -24,6 +24,10 @@ public:
     // Inverted-hull silhouette outline shader
     static const char* outline_vertex_shader_source();
     static const char* outline_fragment_shader_source();
+
+    // Animated fluid water sheet shaders
+    static const char* water_vertex_shader_source();
+    static const char* water_fragment_shader_source();
 };
 
 } // namespace ruby::android

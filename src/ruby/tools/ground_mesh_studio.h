@@ -16,6 +16,7 @@
 
 class QComboBox;
 class QDoubleSpinBox;
+class QGroupBox;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
@@ -140,6 +141,10 @@ private slots:
     // editor uses), Clear puts the sheet back to a uniform slab.
     void randomise_relief();
     void clear_relief();
+    // Enable the Zypher look group only while the Zypher generator is the one
+    // selected, so the styles GUI is discoverable but never a live-looking
+    // control on a generator that ignores it.
+    void sync_zypher_controls();
     // Drops per-node relief whose vertex no longer exists, so an edit to the ring
     // cannot pair a depth with the wrong node.
     void sync_relief_to_polygon();
@@ -161,6 +166,15 @@ private:
     // Which generator this sheet is authored for. BoulderX writes format v2
     // (per-node depth); Boulder writes v1, which both generators can read.
     QComboBox*      m_generator = nullptr;
+    // Zypher look (Gen 3): hat/top silhouettes + the three tuning dials. Shared
+    // with the in-scene mesh editor through ruby/tools/zypher_look.h, so both
+    // offer the same set and neither can drift from the other.
+    QGroupBox*      m_zypher_box = nullptr;
+    QComboBox*      m_hat_style = nullptr;
+    QComboBox*      m_top_style = nullptr;
+    QDoubleSpinBox* m_zyp_freq = nullptr;
+    QDoubleSpinBox* m_zyp_depth = nullptr;
+    QDoubleSpinBox* m_zyp_mincoll = nullptr;
     QDoubleSpinBox* m_relief_front = nullptr;   // max +Z magnitude for relief
     QDoubleSpinBox* m_relief_back = nullptr;    // max -Z magnitude for relief
     QLabel*         m_relief_status = nullptr;

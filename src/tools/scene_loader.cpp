@@ -2556,6 +2556,44 @@ static bool read_shape_rectangle(const SceneObject& obj, int bounds_id, float re
     return false;
 }
 
+// Extract Polygon points { x, y, ... } from a ShapeComponent payload if available.
+static void read_shape_polygon(const SceneObject& obj, int bounds_id, std::vector<float>& out_pts) {
+    const auto& comps = obj.resolved_components.empty() ? obj.components : obj.resolved_components;
+    for (const auto& comp : comps) {
+        if (comp.type_id != bounds_id) continue;
+        const int payload = component_payload_field(comp);
+        if (payload == 0) continue;
+        try {
+            proto::Reader wrapper(comp.raw_data);
+            proto::Field field;
+            while (wrapper.read_field(field)) {
+                if (field.field_number != static_cast<uint32_t>(payload) ||
+                    field.wire_type != proto::WIRE_LEN)
+                    continue;
+                proto::Reader shape(field.bytes_val);
+                proto::Field sf;
+                while (shape.read_field(sf)) {
+                    // ShapeComponent field 3 = Polygon { points: [x, y, ...] }
+                    if (sf.field_number == 3 && sf.wire_type == proto::WIRE_LEN) {
+                        proto::Reader poly(sf.bytes_val);
+                        proto::Field pf;
+                        while (poly.read_field(pf)) {
+                            if (pf.field_number == 1 && pf.wire_type == proto::WIRE_LEN) {
+                                proto::Reader pt_reader(pf.bytes_val);
+                                proto::Field coord;
+                                while (pt_reader.read_field(coord)) {
+                                    if (coord.wire_type == proto::WIRE_I32)
+                                        out_pts.push_back(coord.float_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (...) {}
+    }
+}
+
 // Extract texture name / tile size / offset from a TextureMapping component
 // whose type_id == tex_id. Payload 113: f1 texture name, f2 tile size,
 // f3 offset { x, y }.
@@ -2643,6 +2681,7 @@ static void parse_scene_waters(SceneData& scene) {
             memcpy(water.surface_color, surface, sizeof(surface));
             read_texture_mapping(obj, tex_id, water.texture, water.tile_size, water.tex_offset);
             if (water.tile_size <= 0.0f) water.tile_size = 64.0f;
+            read_shape_polygon(obj, bounds_id, water.polygon_points);
             scene.waters.push_back(std::move(water));
         }
     }

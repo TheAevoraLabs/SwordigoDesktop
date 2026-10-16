@@ -1,4 +1,5 @@
 #include "ruby_quick_viewport.h"
+#include "ruby_settings_bridge.h"  // zypher_look — shared style keys with the studio
 #include "gles_shaders.h"
 #include "platform/pvr_loader.h"
 #include "tools/scene_asset_resolver.h"
@@ -11,6 +12,9 @@
 #include <QTouchEvent>
 #include <QMouseEvent>
 #include <QDateTime>
+#include <QTimer>
+#include <QElapsedTimer>
+#include <QSettings>
 #include <QFileInfo>
 #include <QFile>
 #include <QImage>
@@ -40,6 +44,23 @@ static inline void calc_object_world_matrix(const av::SceneObject& obj, float ou
     float s = obj.template_scaling;
     m.scale(obj.scale_x * s, obj.scale_y * s, obj.scale_z * s);
     std::memcpy(out, m.constData(), 16 * sizeof(float));
+}
+
+// Camera-local pan basis (Right/Up) for a yaw/pitch pair. This is the same
+// basis Viewport3DWidget::mouseMoveEvent() pans in — including the pitch term
+// in Up — so a drag moves the scene parallel to the screen instead of tilting
+// with the camera. Shared by the QML NavPad path and the touch gesture path so
+// the two can never drift apart.
+static inline void camera_pan_basis(float yaw_deg, float pitch_deg, float right[3], float up[3]) {
+    constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
+    const float ry = yaw_deg * kDegToRad;
+    const float rp = pitch_deg * kDegToRad;
+    right[0] =  std::cos(ry);
+    right[1] =  0.0f;
+    right[2] = -std::sin(ry);
+    up[0] = -std::sin(rp) * std::sin(ry);
+    up[1] =  std::cos(rp);
+    up[2] = -std::sin(rp) * std::cos(ry);
 }
 
 static inline void calc_object_render_matrix(const av::SceneObject& obj, float out[16]) {
@@ -354,12 +375,16 @@ public:
         initializeOpenGLFunctions();
         initShaders();
         initGrid();
+        m_renderTimer.start();
     }
 
     ~RubyViewportRenderer() override {
         delete m_shader;
         delete m_unlitShader;
         delete m_outlineShader;
+        delete m_waterShader;
+        if (m_waterVbo) glDeleteBuffers(1, &m_waterVbo);
+        if (m_waterEbo) glDeleteBuffers(1, &m_waterEbo);
         if (m_gridVbo) glDeleteBuffers(1, &m_gridVbo);
         if (m_cubeVbo) glDeleteBuffers(1, &m_cubeVbo);
         for (auto& pair : m_selLineCache) {
@@ -387,7 +412,7 @@ public:
     QOpenGLFramebufferObject* createFramebufferObject(const QSize& size) override {
         QOpenGLFramebufferObjectFormat format;
         format.setAttachment(QOpenGLFramebufferObject::CombinedDepthStencil);
-        format.setSamples(4); // 4x MSAA
+        format.setSamples(0); // 0 samples: high-DPI mobile screens do not need 4x MSAA resolve overhead
         return new QOpenGLFramebufferObject(size, format);
     }
 
@@ -404,6 +429,11 @@ public:
         m_meshEditObject = vp->m_meshEditObject;
         m_selectedMeshVertex = vp->m_selectedMeshVertex;
         m_meshEditPoints = vp->m_meshEditPoints;
+        m_waterEditActive = vp->m_waterEditActive;
+        m_waterEditObject = vp->m_waterEditObject;
+        m_selectedWaterVertex = vp->m_selectedWaterVertex;
+        m_waterEditPoints = vp->m_waterEditPoints;
+        m_wireframeMode = vp->wireframeMode();
 
         if (vp->m_modelLoadedFlag) {
             m_hasModel = vp->m_hasModel;
@@ -411,11 +441,13 @@ public:
             m_model = vp->m_model;
             m_modelPath = vp->m_filePath.toStdString();
             m_modelGpuValid = false;
+            m_modelSkinnedFrame = -999.0f;
             vp->m_modelLoadedFlag = false;
         } else if (vp->m_sceneLoadedFlag) {
             m_hasScene = vp->m_hasScene;
             m_hasModel = false;
             m_sceneObjects = vp->m_scene.objects;
+            m_sceneWaters = vp->m_scene.waters;
             m_sceneRevision = vp->m_sceneRevision.load(std::memory_order_acquire);
             m_geomRevision  = vp->m_sceneGeometryRevision.load(std::memory_order_acquire);
             m_scenePath = vp->m_filePath.toStdString();
@@ -432,6 +464,7 @@ public:
             if (rev != m_sceneRevision) {
                 m_sceneRevision = rev;
                 m_sceneObjects = vp->m_scene.objects;
+                m_sceneWaters = vp->m_scene.waters;
                 m_boundsValid = false;
             }
         }
@@ -492,6 +525,10 @@ public:
         // Draw 3D Model or Scene
         if (m_shader && m_shader->isLinked()) {
             if (m_hasModel && m_modelGpuValid) {
+                if (m_modelSkinnedFrame != m_frame) {
+                    update_pod_skinning(m_model, m_modelGpuMeshes, m_frame);
+                    m_modelSkinnedFrame = m_frame;
+                }
                 m_shader->bind();
                 QVector3D sunDirView = view.mapVector(QVector3D(0.4f, 0.8f, 0.5f)).normalized();
                 m_shader->setUniformValue("uSunDir", sunDirView);
@@ -522,6 +559,7 @@ public:
 
                 Frustum frustum = Frustum::fromMatrix(proj * view);
                 QVector3D camPos = eye;
+                std::vector<size_t> markerIndices;
 
                 for (size_t i = 0; i < m_sceneObjects.size(); ++i) {
                     const auto& obj = m_sceneObjects[i];
@@ -557,6 +595,12 @@ public:
 
                         m_shader->setUniformValue("uProj", proj);
                         m_shader->setUniformValue("uModelView", view * worldMat);
+
+                        const bool isSelected = (int(i) == m_selectedObject);
+                        m_shader->setUniformValue("uIsSelected", isSelected ? 1 : 0);
+                        if (isSelected) {
+                            m_shader->setUniformValue("uSelectionColor", QVector4D(0.16f, 0.82f, 1.0f, 0.32f));
+                        }
 
                         for (size_t mi = 0; mi < ggpu.meshes.size(); ++mi) {
                             const auto& g = ggpu.meshes[mi];
@@ -621,31 +665,72 @@ public:
                                                      obj.model_diffuse_color[2], 1.0f);
                                 }
 
-                                draw_pod_instance(itM->second, m_podTexCache[sp], m_podGpuCache[sp], objWorld, view, proj, tint);
+                                draw_pod_instance(itM->second, m_podTexCache[sp], m_podGpuCache[sp], objWorld, view, proj, tint, int(i) == m_selectedObject);
                                 drawn = true;
                             }
                         }
                     }
 
-                    // 3. Logic Markers / Non-visual objects (portal, spawn, camera, triggers)
+                    // 3. Collect non-visual logic markers to draw batched
                     if (!drawn) {
-                        m_shader->release();
-                        float outMat[16];
-                        calc_object_world_matrix(obj, outMat);
-                        QMatrix4x4 objWorld;
-                        std::memcpy(objWorld.data(), outMat, 16 * sizeof(float));
-                        renderObjectMarker(view * objWorld, proj, obj, int(i) == m_selectedObject);
-                        m_shader->bind();
+                        bool is_water = false;
+                        for (const auto& w : m_sceneWaters) {
+                            if (w.object_index == int(i)) { is_water = true; break; }
+                        }
+                        if (!is_water) {
+                            markerIndices.push_back(i);
+                        }
                     }
                 }
                 m_shader->release();
+
+                // Draw batched logic markers in ONE pass with m_unlitShader bound once
+                if (!markerIndices.empty() && m_unlitShader && m_unlitShader->isLinked()) {
+                    m_unlitShader->bind();
+                    m_unlitShader->setUniformValue("uProj", proj);
+                    glBindBuffer(GL_ARRAY_BUFFER, m_cubeVbo);
+                    glEnableVertexAttribArray(0);
+                    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+
+                    for (size_t mi : markerIndices) {
+                        const auto& mobj = m_sceneObjects[mi];
+                        float outMat[16];
+                        calc_object_world_matrix(mobj, outMat);
+                        QMatrix4x4 objWorld;
+                        std::memcpy(objWorld.data(), outMat, 16 * sizeof(float));
+                        m_unlitShader->setUniformValue("uModelView", view * objWorld);
+
+                        if (int(mi) == m_selectedObject) {
+                            m_unlitShader->setUniformValue("uColor", QVector4D(0.88f, 0.42f, 0.46f, 1.0f));
+                        } else if (mobj.is_portal) {
+                            m_unlitShader->setUniformValue("uColor", QVector4D(0.24f, 0.60f, 0.96f, 0.85f));
+                        } else if (mobj.is_spawn_point) {
+                            m_unlitShader->setUniformValue("uColor", QVector4D(0.96f, 0.76f, 0.20f, 0.85f));
+                        } else if (mobj.is_camera) {
+                            m_unlitShader->setUniformValue("uColor", QVector4D(0.20f, 0.85f, 0.80f, 0.85f));
+                        } else {
+                            m_unlitShader->setUniformValue("uColor", QVector4D(0.40f, 0.44f, 0.52f, 0.5f));
+                        }
+                        glDrawArrays(GL_LINES, 0, 24);
+                    }
+                    glDisableVertexAttribArray(0);
+                    glBindBuffer(GL_ARRAY_BUFFER, 0);
+                    m_unlitShader->release();
+                }
             }
+        }
+
+        // Draw animated fluid sheets (Pass 6: Caver::WaterMeshComponent::Draw)
+        if (m_hasScene && !m_sceneWaters.empty()) {
+            renderWaters(view, proj);
         }
 
         // Draw Selection Box & Gizmo if object selected, or Mesh Edit overlay if editing
         if (m_hasScene) {
             if (m_meshEditActive) {
                 renderMeshEditOverlay(view, proj);
+            } else if (m_waterEditActive) {
+                renderWaterMeshEditOverlay(view, proj);
             } else if (m_selectedObject >= 0 && m_selectedObject < int(m_sceneObjects.size())) {
                 renderSelectionHighlight(view, proj, m_sceneObjects[m_selectedObject], m_selectedObject);
                 if (m_gizmoMode > 0) {
@@ -671,6 +756,11 @@ private:
         m_outlineShader->addShaderFromSourceCode(QOpenGLShader::Vertex, GLESShaders::outline_vertex_shader_source());
         m_outlineShader->addShaderFromSourceCode(QOpenGLShader::Fragment, GLESShaders::outline_fragment_shader_source());
         m_outlineShader->link();
+
+        m_waterShader = new QOpenGLShaderProgram();
+        m_waterShader->addShaderFromSourceCode(QOpenGLShader::Vertex, GLESShaders::water_vertex_shader_source());
+        m_waterShader->addShaderFromSourceCode(QOpenGLShader::Fragment, GLESShaders::water_fragment_shader_source());
+        m_waterShader->link();
     }
 
     void initGrid() {
@@ -713,21 +803,22 @@ private:
         glBindBuffer(GL_ARRAY_BUFFER, 0);
     }
 
-    MeshGpu upload_mesh_gpu(const av::PODMesh& mesh) {
+    MeshGpu upload_mesh_gpu(const av::PODMesh& mesh, bool isDynamic = false) {
         MeshGpu g;
         if (mesh.positions.empty()) return g;
         g.vertex_count = static_cast<int>(mesh.positions.size() / 3);
+        const GLenum usage = isDynamic ? GL_DYNAMIC_DRAW : GL_STATIC_DRAW;
 
         glGenBuffers(1, &g.pos_vbo);
         glBindBuffer(GL_ARRAY_BUFFER, g.pos_vbo);
         glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(mesh.positions.size() * sizeof(float)),
-                     mesh.positions.data(), GL_STATIC_DRAW);
+                     mesh.positions.data(), usage);
 
         if (!mesh.normals.empty()) {
             glGenBuffers(1, &g.nrm_vbo);
             glBindBuffer(GL_ARRAY_BUFFER, g.nrm_vbo);
             glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(mesh.normals.size() * sizeof(float)),
-                         mesh.normals.data(), GL_STATIC_DRAW);
+                         mesh.normals.data(), usage);
         }
 
         if (!mesh.uvs.empty()) {
@@ -770,15 +861,49 @@ private:
                     av::PODMesh baked = mesh;
                     baked.positions = std::move(skin_pos);
                     baked.normals = std::move(skin_norm);
-                    out.push_back(upload_mesh_gpu(baked));
+                    out.push_back(upload_mesh_gpu(baked, true));
                 } else {
-                    out.push_back(upload_mesh_gpu(mesh));
+                    out.push_back(upload_mesh_gpu(mesh, true));
                 }
             } else {
-                out.push_back(upload_mesh_gpu(mesh));
+                out.push_back(upload_mesh_gpu(mesh, false));
             }
         }
         return out;
+    }
+
+    void update_pod_skinning(const av::PODModel& model, std::vector<MeshGpu>& gpu_meshes, float frame) {
+        for (size_t mi = 0; mi < model.meshes.size(); ++mi) {
+            const auto& mesh = model.meshes[mi];
+            if (mesh.bones_per_vertex == 0 || mi >= gpu_meshes.size()) continue;
+            if (!gpu_meshes[mi].pos_vbo) continue;
+
+            int node_idx = -1;
+            for (int ni = 0; ni < static_cast<int>(model.nodes.size()); ++ni) {
+                if (model.nodes[ni].object_index == static_cast<int>(mi)) {
+                    node_idx = ni;
+                    break;
+                }
+            }
+            if (node_idx < 0) continue;
+
+            std::vector<float> skin_pos, skin_norm;
+            if (av::skin_mesh(model, node_idx, frame, skin_pos, skin_norm)) {
+                if (!skin_pos.empty()) {
+                    glBindBuffer(GL_ARRAY_BUFFER, gpu_meshes[mi].pos_vbo);
+                    glBufferSubData(GL_ARRAY_BUFFER, 0,
+                                    static_cast<GLsizeiptr>(skin_pos.size() * sizeof(float)),
+                                    skin_pos.data());
+                }
+                if (gpu_meshes[mi].nrm_vbo && !skin_norm.empty()) {
+                    glBindBuffer(GL_ARRAY_BUFFER, gpu_meshes[mi].nrm_vbo);
+                    glBufferSubData(GL_ARRAY_BUFFER, 0,
+                                    static_cast<GLsizeiptr>(skin_norm.size() * sizeof(float)),
+                                    skin_norm.data());
+                }
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+            }
+        }
     }
 
     GLuint load_texture_any(const std::string& path) {
@@ -1127,6 +1252,7 @@ private:
         glDepthMask(GL_FALSE);
 
         m_shader->bind();
+        m_shader->setUniformValue("uIsSelected", 0);
         m_shader->setUniformValue("uProj", QMatrix4x4());
         m_shader->setUniformValue("uModelView", QMatrix4x4());
         m_shader->setUniformValue("uDiffuseColor", QVector4D(1.0f, 1.0f, 1.0f, 1.0f));
@@ -1214,7 +1340,9 @@ private:
                            const QMatrix4x4& worldMatrix,
                            const QMatrix4x4& view,
                            const QMatrix4x4& proj,
-                           const QVector4D& tintColor = QVector4D(1.0f, 1.0f, 1.0f, 1.0f)) {
+                           const QVector4D& tintColor = QVector4D(1.0f, 1.0f, 1.0f, 1.0f),
+                           bool isSelected = false,
+                           const QVector4D& selectionColor = QVector4D(0.16f, 0.82f, 1.0f, 0.32f)) {
         if (gpu_meshes.empty()) return;
 
         for (size_t node_index = 0; node_index < model.nodes.size(); ++node_index) {
@@ -1255,6 +1383,10 @@ private:
             m_shader->setUniformValue("uProj", proj);
             m_shader->setUniformValue("uModelView", view * modelMat);
             m_shader->setUniformValue("uDiffuseColor", diffColor);
+            m_shader->setUniformValue("uIsSelected", isSelected ? 1 : 0);
+            if (isSelected) {
+                m_shader->setUniformValue("uSelectionColor", selectionColor);
+            }
 
             if (tex) {
                 glActiveTexture(GL_TEXTURE0);
@@ -1267,6 +1399,193 @@ private:
 
             draw_mesh_gpu(gpu_meshes[node.object_index]);
         }
+    }
+
+    void renderWaters(const QMatrix4x4& view, const QMatrix4x4& proj) {
+        if (!m_waterShader || !m_waterShader->isLinked() || m_sceneWaters.empty()) return;
+
+        if (!m_waterVbo) glGenBuffers(1, &m_waterVbo);
+        if (!m_waterEbo) glGenBuffers(1, &m_waterEbo);
+
+        const float time_sec = float(m_renderTimer.elapsed()) / 1000.0f;
+        constexpr float k_two_pi = 6.28318530718f;
+
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(-1.0f, -1.0f);
+
+        m_waterShader->bind();
+        m_waterShader->setUniformValue("uTexture", 0);
+        m_waterShader->setUniformValue("uTime", time_sec);
+        m_waterShader->setUniformValue("uScroll", time_sec * 0.05f);
+
+        for (const auto& w : m_sceneWaters) {
+            if (w.object_index < 0 || w.object_index >= static_cast<int>(m_sceneObjects.size())) continue;
+            const auto& obj = m_sceneObjects[w.object_index];
+            if (obj.hidden) continue;
+
+            const float rx = w.rect[0], ry = w.rect[1], rw = w.rect[2], rh = w.rect[3];
+            if (rw <= 0.0f || rh <= 0.0f) continue;
+
+            int cols = std::max(1, static_cast<int>(std::round(rw / 20.0f)));
+            cols = std::min(cols, 128);
+            const float col_w = rw / static_cast<float>(cols);
+            const int m = cols + 1;
+            const int num_verts = m * 4;
+
+            const float front_z = 40.0f;
+            const float back_z  = -20.0f;
+
+            const size_t vertCount = static_cast<size_t>(num_verts) * 5;
+            const size_t idxCount  = static_cast<size_t>(cols) * 12;
+            if (m_waterVertScratch.size() < vertCount) m_waterVertScratch.resize(vertCount);
+            if (m_waterIdxScratch.size() < idxCount) m_waterIdxScratch.resize(idxCount);
+
+            float* verts = m_waterVertScratch.data();
+            uint16_t* idx = m_waterIdxScratch.data();
+
+            const float tile = w.tile_size > 0.0f ? w.tile_size : 64.0f;
+            const float ox = w.tex_offset[0], oy = w.tex_offset[1];
+            const float baseline_surface = ry + rh;
+
+            for (int i = 0; i < m; ++i) {
+                const float x = rx + i * col_w;
+                const float phase1 = (x / 160.0f + time_sec * 0.2f) * k_two_pi;
+                const float phase2 = (x / 320.0f + time_sec * 0.6f) * k_two_pi;
+                const float wave = std::sin(phase1) * 6.0f + std::sin(phase2) * 6.0f;
+                const float surface_y = baseline_surface + wave;
+
+                const float u_scroll = std::sin((i / 20.0f + time_sec * 0.5f) * k_two_pi) * 0.2f;
+                const size_t base = static_cast<size_t>(i) * 4 * 5;
+
+                const float vx[4] = { x, x, x, x };
+                const float vy[4] = { ry, surface_y, surface_y, surface_y };
+                const float vz[4] = { front_z, front_z, front_z, back_z };
+
+                const float u_base = (x - ox) / tile + 0.5f;
+                const float uv_u[4] = { u_base, u_base + u_scroll, u_base + u_scroll, u_base + u_scroll };
+                const float uv_v[4] = {
+                    (ry - oy) / tile + 0.5f,
+                    (surface_y - oy) / tile + 0.5f,
+                    (surface_y - oy) / tile + 0.5f,
+                    (surface_y - oy) / tile + 0.5f
+                };
+
+                for (int v = 0; v < 4; ++v) {
+                    float* out = &verts[base + static_cast<size_t>(v) * 5];
+                    out[0] = vx[v];
+                    out[1] = vy[v];
+                    out[2] = vz[v];
+                    out[3] = uv_u[v];
+                    out[4] = uv_v[v];
+                }
+
+                if (i < cols) {
+                    const uint16_t n = static_cast<uint16_t>(i * 4);
+                    idx[i * 6 + 0] = n;
+                    idx[i * 6 + 1] = n + 1;
+                    idx[i * 6 + 2] = n + 4;
+                    idx[i * 6 + 3] = n + 1;
+                    idx[i * 6 + 4] = n + 5;
+                    idx[i * 6 + 5] = n + 4;
+
+                    const size_t surf_offset = static_cast<size_t>(cols) * 6;
+                    idx[surf_offset + i * 6 + 0] = n + 3;
+                    idx[surf_offset + i * 6 + 1] = n + 2;
+                    idx[surf_offset + i * 6 + 2] = n + 6;
+                    idx[surf_offset + i * 6 + 3] = n + 3;
+                    idx[surf_offset + i * 6 + 4] = n + 6;
+                    idx[surf_offset + i * 6 + 5] = n + 7;
+                }
+            }
+
+            const size_t vertBytes = vertCount * sizeof(float);
+            const size_t idxBytes  = idxCount * sizeof(uint16_t);
+
+            glBindBuffer(GL_ARRAY_BUFFER, m_waterVbo);
+            if (vertBytes > m_waterVboCapacityBytes) {
+                m_waterVboCapacityBytes = vertBytes * 2;
+                glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_waterVboCapacityBytes), nullptr, GL_DYNAMIC_DRAW);
+            }
+            glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(vertBytes), verts);
+
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_waterEbo);
+            if (idxBytes > m_waterEboCapacityBytes) {
+                m_waterEboCapacityBytes = idxBytes * 2;
+                glBufferData(GL_ELEMENT_ARRAY_BUFFER, static_cast<GLsizeiptr>(m_waterEboCapacityBytes), nullptr, GL_DYNAMIC_DRAW);
+            }
+            glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(idxBytes), idx);
+
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
+
+            float outMat[16];
+            calc_object_world_matrix(obj, outMat);
+            QMatrix4x4 worldMat;
+            std::memcpy(worldMat.data(), outMat, 16 * sizeof(float));
+
+            QMatrix4x4 mvp = proj * view * worldMat;
+            m_waterShader->setUniformValue("uMVP", mvp);
+
+            GLuint tex_id = 0;
+            if (!w.texture.empty()) {
+                auto it = m_texCache.find(w.texture);
+                if (it != m_texCache.end()) {
+                    tex_id = it->second;
+                } else {
+                    fs::path scPath(m_scenePath);
+                    auto cands = av::assets::texture_candidates(scPath, w.texture, asset_roots_cached(m_scenePath));
+                    for (const auto& cand : cands) {
+                        if (fs::exists(cand)) {
+                            GLuint t = load_texture_any(cand.string());
+                            if (t) {
+                                m_texCache[w.texture] = t;
+                                tex_id = t;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            m_waterShader->setUniformValue("uHasTex", tex_id != 0 ? 1 : 0);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex_id);
+
+            m_waterShader->setUniformValue("uFrontColor", QVector4D(w.front_color[0], w.front_color[1], w.front_color[2], w.front_color[3]));
+            m_waterShader->setUniformValue("uSurfaceColor", QVector4D(w.surface_color[0], w.surface_color[1], w.surface_color[2], w.surface_color[3]));
+
+            const bool isSelected = (w.object_index == m_selectedObject);
+            m_waterShader->setUniformValue("uIsSelected", isSelected ? 1 : 0);
+            if (isSelected) {
+                m_waterShader->setUniformValue("uSelectionColor", QVector4D(0.16f, 0.82f, 1.0f, 0.35f));
+            }
+
+            // 1. Draw Front Face
+            m_waterShader->setUniformValue("uIsBackFace", 0);
+            glDrawElements(GL_TRIANGLES, cols * 6, GL_UNSIGNED_SHORT, nullptr);
+
+            // 2. Draw Top Surface Sheet
+            m_waterShader->setUniformValue("uIsBackFace", 1);
+            glDrawElements(GL_TRIANGLES, cols * 6, GL_UNSIGNED_SHORT,
+                           (void*)(size_t)(cols * 6 * sizeof(uint16_t)));
+
+            glDisableVertexAttribArray(0);
+            glDisableVertexAttribArray(1);
+        }
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        glDepthMask(GL_TRUE);
+        m_waterShader->release();
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glDisable(GL_BLEND);
     }
 
     void renderGrid(const QMatrix4x4& view, const QMatrix4x4& proj) {
@@ -1358,18 +1677,13 @@ private:
         QMatrix4x4 baseWorld;
         std::memcpy(baseWorld.data(), outMat, 16 * sizeof(float));
 
-        // The rim is displaced in OBJECT space by the outline shader, so the
-        // offset has to be divided by the object's world scale to read as a
-        // constant distance on screen (desktop scales it by the view distance).
-        const float objScale = std::max(1e-3f,
-            std::max(std::abs(obj.scale_x), std::max(std::abs(obj.scale_y), std::abs(obj.scale_z)))
-            * std::abs(obj.template_scaling));
-        const float rim_world = std::clamp(0.006f * std::max(1.0f, m_distance), 0.02f, 4.0f);
-        const float rim_offset = rim_world / objScale;
+        // Wireframe edges: Only drawn when wireframe mode is explicitly enabled.
+        // In standard mode, uniform shader shading provides clean, non-cluttered highlight without dense edge noise.
+        const float edgeFade = m_wireframeMode ? 0.85f : 0.0f;
 
-        // 1. Inverted-hull silhouette outline for 3D Models
+        // 1. Crisp wireframe edges for 3D Models
         const std::string modelName = !obj.mesh_name.empty() ? obj.mesh_name : obj.template_name;
-        if (!modelName.empty() && m_outlineShader && m_outlineShader->isLinked()) {
+        if (!modelName.empty() && edgeFade > 0.05f) {
             fs::path scPath(m_scenePath);
             std::vector<fs::path> roots = build_asset_roots(scPath);
             fs::path podPath = av::assets::resolve_pod(scPath, modelName, roots);
@@ -1377,55 +1691,20 @@ private:
                 auto itM = m_scenePodCache.find(podPath.string());
                 auto itG = m_podGpuCache.find(podPath.string());
                 if (itM != m_scenePodCache.end() && itG != m_podGpuCache.end()) {
-                    glEnable(GL_DEPTH_TEST);
-                    glDepthMask(GL_FALSE);
-                    glEnable(GL_BLEND);
-                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                    glEnable(GL_CULL_FACE);
-                    glCullFace(GL_FRONT);
-
-                    m_outlineShader->bind();
-                    m_outlineShader->setUniformValue("uProj", proj);
-                    // The shader's uniform is uOutlineOffset; the old code set
-                    // "uOutlineWidth", which exists nowhere in it — so the rim was
-                    // drawn with a zero offset and was invisible.
-                    m_outlineShader->setUniformValue("uOutlineOffset", rim_offset);
-                    m_outlineShader->setUniformValue("uColor", QVector4D(0.72f, 0.25f, 0.98f, 0.45f));
-
                     float renderMat[16];
                     calc_object_render_matrix(obj, renderMat);
                     QMatrix4x4 objWorld;
                     std::memcpy(objWorld.data(), renderMat, 16 * sizeof(float));
 
-                    for (size_t ni = 0; ni < itM->second.nodes.size(); ++ni) {
-                        const auto& node = itM->second.nodes[ni];
-                        if (node.object_index < 0 || node.object_index >= static_cast<int>(itM->second.meshes.size())) continue;
-                        if (node.object_index >= static_cast<int>(itG->second.size()) || !itG->second[node.object_index].valid()) continue;
-
-                        float node_mat[16];
-                        av::get_node_matrix(itM->second, static_cast<int>(ni), m_frame, node_mat);
-                        QMatrix4x4 nodeMat;
-                        std::memcpy(nodeMat.data(), node_mat, 16 * sizeof(float));
-
-                        QMatrix4x4 modelMat = objWorld;
-                        if (itM->second.has_center_point) {
-                            modelMat.translate(-itM->second.center_point[0], -itM->second.center_point[1], -itM->second.center_point[2]);
-                        }
-                        modelMat = modelMat * nodeMat;
-                        m_outlineShader->setUniformValue("uModelView", view * modelMat);
-                        draw_mesh_gpu(itG->second[node.object_index]);
-                    }
-                    m_outlineShader->release();
-
-                    glCullFace(GL_BACK);
-                    glDisable(GL_CULL_FACE);
-                    glDepthMask(GL_TRUE);
-                    glDisable(GL_BLEND);
-
-                    // Triangle-edge wireframe, per node, exactly as desktop does.
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                     m_unlitShader->bind();
                     m_unlitShader->setUniformValue("uProj", proj);
-                    glDisable(GL_DEPTH_TEST);
+                    m_unlitShader->setUniformValue("uColor", QVector4D(0.16f, 0.82f, 1.0f, edgeFade));
+                    glLineWidth(1.5f);
+                    glEnable(GL_DEPTH_TEST);
+                    glDepthFunc(GL_LEQUAL);
+
                     for (size_t ni = 0; ni < itM->second.nodes.size(); ++ni) {
                         const auto& node = itM->second.nodes[ni];
                         if (node.object_index < 0 || node.object_index >= static_cast<int>(itM->second.meshes.size())) continue;
@@ -1444,68 +1723,86 @@ private:
                         }
                         modelMat = modelMat * nodeMat;
                         m_unlitShader->setUniformValue("uModelView", view * modelMat);
-                        m_unlitShader->setUniformValue("uColor", QVector4D(0.16f, 0.82f, 1.0f, 0.95f));
-                        glLineWidth(2.0f);
                         draw_mesh_edges(g, itM->second.meshes[node.object_index],
-                                        sel_line_key(0x504F44ull, g.pos_vbo), 1.6f);
+                                        sel_line_key(0x504F44ull, g.pos_vbo), 1.5f);
                     }
                     m_unlitShader->release();
-                    glEnable(GL_DEPTH_TEST);
+                    glDisable(GL_BLEND);
                 }
             }
         }
 
-        // 2. Ground meshes: the REAL terrain, not a box and not the flat
-        //    GroundPolygon contour.
-        //
-        //    Desktop draws exactly this for `ro->ground_gpu`: an inverted-hull rim
-        //    of the shipped submeshes plus a wireframe of their own triangles. It
-        //    is the only highlight that works for a baked-only object (no polygon
-        //    component → no contour to draw) and it never encloses the level in a
-        //    fake cube, which is what the old `!renderedSilhouette` branch did.
-        if (objIdx >= 0 && objIdx < int(m_sceneGroundGpu.size()) && !obj.ground_meshes.empty()) {
+        // 2. Crisp wireframe edges for Ground Meshes (platforms / terrain)
+        if (objIdx >= 0 && objIdx < int(m_sceneGroundGpu.size()) && !obj.ground_meshes.empty() && edgeFade > 0.05f) {
             const auto& ggpu = m_sceneGroundGpu[objIdx].meshes;
-
-            // Rim pass — back faces pushed out along their normals.
-            if (!ggpu.empty() && m_outlineShader && m_outlineShader->isLinked()) {
-                glEnable(GL_DEPTH_TEST);
-                glDepthMask(GL_FALSE);
+            if (!ggpu.empty()) {
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                glEnable(GL_CULL_FACE);
-                glCullFace(GL_FRONT);
+                m_unlitShader->bind();
+                m_unlitShader->setUniformValue("uProj", proj);
+                m_unlitShader->setUniformValue("uModelView", view * baseWorld);
+                m_unlitShader->setUniformValue("uColor", QVector4D(0.16f, 0.82f, 1.0f, edgeFade));
+                glLineWidth(1.5f);
+                glEnable(GL_DEPTH_TEST);
+                glDepthFunc(GL_LEQUAL);
 
-                m_outlineShader->bind();
-                m_outlineShader->setUniformValue("uProj", proj);
-                m_outlineShader->setUniformValue("uOutlineOffset", rim_offset);
-                m_outlineShader->setUniformValue("uColor", QVector4D(0.72f, 0.25f, 0.98f, 0.35f));
-                m_outlineShader->setUniformValue("uModelView", view * baseWorld);
-                for (const MeshGpu& g : ggpu) {
-                    if (g.valid()) draw_mesh_gpu(g);
+                const size_t meshCount = std::min(ggpu.size(), obj.ground_meshes.size());
+                for (size_t mi = 0; mi < meshCount; ++mi) {
+                    const MeshGpu& g = ggpu[mi];
+                    if (!g.valid()) continue;
+                    draw_mesh_edges(g, obj.ground_meshes[mi], sel_line_key(0x4772ull, g.pos_vbo), 1.5f);
                 }
-                m_outlineShader->release();
-
-                glCullFace(GL_BACK);
-                glDisable(GL_CULL_FACE);
-                glDepthMask(GL_TRUE);
+                m_unlitShader->release();
                 glDisable(GL_BLEND);
             }
+        }
 
-            // Edge pass — the mesh's own triangle edges.
-            m_unlitShader->bind();
-            m_unlitShader->setUniformValue("uProj", proj);
-            m_unlitShader->setUniformValue("uModelView", view * baseWorld);
-            m_unlitShader->setUniformValue("uColor", QVector4D(0.16f, 0.82f, 1.0f, 0.95f));
-            glLineWidth(2.0f);
-            glDisable(GL_DEPTH_TEST);
-            const size_t meshCount = std::min(ggpu.size(), obj.ground_meshes.size());
-            for (size_t mi = 0; mi < meshCount; ++mi) {
-                const MeshGpu& g = ggpu[mi];
-                if (!g.valid()) continue;
-                draw_mesh_edges(g, obj.ground_meshes[mi], sel_line_key(0x4772ull, g.pos_vbo), 2.0f);
+        // 3. Water sheets: draw radiant translucent bounding volume
+        for (const auto& w : m_sceneWaters) {
+            if (w.object_index == objIdx) {
+                const float rx = w.rect[0], ry = w.rect[1], rw = w.rect[2], rh = w.rect[3];
+                if (rw <= 0.0f || rh <= 0.0f) continue;
+
+                m_unlitShader->bind();
+                m_unlitShader->setUniformValue("uProj", proj);
+                m_unlitShader->setUniformValue("uModelView", view * baseWorld);
+                m_unlitShader->setUniformValue("uColor", QVector4D(0.20f, 0.85f, 1.0f, 0.95f));
+                glLineWidth(2.5f);
+
+                const float x0 = rx, x1 = rx + rw;
+                const float y0 = ry, y1 = ry + rh;
+                const float z0 = -20.0f, z1 = 40.0f;
+
+                float boxVerts[] = {
+                    x0, y0, z1,  x1, y0, z1,
+                    x1, y0, z1,  x1, y1, z1,
+                    x1, y1, z1,  x0, y1, z1,
+                    x0, y1, z1,  x0, y0, z1,
+
+                    x0, y0, z0,  x1, y0, z0,
+                    x1, y0, z0,  x1, y1, z0,
+                    x1, y1, z0,  x0, y1, z0,
+                    x0, y1, z0,  x0, y0, z0,
+
+                    x0, y0, z0,  x0, y0, z1,
+                    x1, y0, z0,  x1, y0, z1,
+                    x1, y1, z0,  x1, y1, z1,
+                    x0, y1, z0,  x0, y1, z1
+                };
+
+                GLuint bVbo = 0;
+                glGenBuffers(1, &bVbo);
+                glBindBuffer(GL_ARRAY_BUFFER, bVbo);
+                glBufferData(GL_ARRAY_BUFFER, sizeof(boxVerts), boxVerts, GL_STATIC_DRAW);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+                glDrawArrays(GL_LINES, 0, 24);
+                glDisableVertexAttribArray(0);
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+                glDeleteBuffers(1, &bVbo);
+                m_unlitShader->release();
+                break;
             }
-            m_unlitShader->release();
-            glEnable(GL_DEPTH_TEST);
         }
 
         // Center origin indicator (amber diamond / pivot)
@@ -1651,6 +1948,128 @@ private:
         glEnable(GL_DEPTH_TEST);
     }
 
+    // ====================================================================
+    // In-Scene WaterMesh (W-Mesh) Edit Wireframe Overlay
+    // ====================================================================
+    void renderWaterMeshEditOverlay(const QMatrix4x4& view, const QMatrix4x4& proj) {
+        if (!m_waterEditActive || m_waterEditObject < 0 ||
+            m_waterEditObject >= int(m_sceneObjects.size()) ||
+            !m_unlitShader || !m_unlitShader->isLinked() || m_waterEditPoints.empty())
+        {
+            return;
+        }
+        const auto& obj = m_sceneObjects[m_waterEditObject];
+        float outMat[16];
+        calc_object_world_matrix(obj, outMat);
+        QMatrix4x4 worldMat;
+        std::memcpy(worldMat.data(), outMat, 16 * sizeof(float));
+
+        glDisable(GL_DEPTH_TEST);
+        m_unlitShader->bind();
+        m_unlitShader->setUniformValue("uProj", proj);
+        m_unlitShader->setUniformValue("uModelView", view * worldMat);
+
+        // 1. Water Perimeter Wireframe Outline
+        std::vector<float> outlineVerts;
+        outlineVerts.reserve(m_waterEditPoints.size() * 3);
+        for (const auto& pt : m_waterEditPoints) {
+            outlineVerts.push_back(float(pt.x));
+            outlineVerts.push_back(float(pt.y));
+            outlineVerts.push_back(0.0f);
+        }
+
+        // Outer Radiant Aquatic Glow
+        glLineWidth(5.0f);
+        m_unlitShader->setUniformValue("uColor", QVector4D(0.0f, 0.75f, 1.0f, 0.40f));
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, outlineVerts.data());
+        glDrawArrays(GL_LINE_LOOP, 0, int(outlineVerts.size() / 3));
+
+        // Inner Core Sharp Cyan Line
+        glLineWidth(2.5f);
+        m_unlitShader->setUniformValue("uColor", QVector4D(0.20f, 0.95f, 1.0f, 0.95f));
+        glDrawArrays(GL_LINE_LOOP, 0, int(outlineVerts.size() / 3));
+
+        // 2. Animated Surface Wave Crest Line (along top boundary)
+        const float time_sec = float(m_renderTimer.elapsed()) / 1000.0f;
+        constexpr float k_two_pi = 6.28318530718f;
+        double max_y = -1e30, min_x = 1e30, max_x = -1e30;
+        for (const auto& pt : m_waterEditPoints) {
+            max_y = std::max(max_y, pt.y);
+            min_x = std::min(min_x, pt.x);
+            max_x = std::max(max_x, pt.x);
+        }
+        std::vector<float> waveVerts;
+        int waveSteps = std::max(12, int((max_x - min_x) / 15.0));
+        waveSteps = std::min(waveSteps, 64);
+        float stepW = float(max_x - min_x) / float(std::max(1, waveSteps));
+        for (int wi = 0; wi <= waveSteps; ++wi) {
+            float wx = float(min_x) + wi * stepW;
+            float phase1 = (wx / 160.0f + time_sec * 0.2f) * k_two_pi;
+            float phase2 = (wx / 320.0f + time_sec * 0.6f) * k_two_pi;
+            float wWave = std::sin(phase1) * 6.0f + std::sin(phase2) * 6.0f;
+            waveVerts.push_back(wx);
+            waveVerts.push_back(float(max_y) + wWave);
+            waveVerts.push_back(40.0f); // front crest plane
+        }
+        glLineWidth(3.0f);
+        m_unlitShader->setUniformValue("uColor", QVector4D(0.60f, 1.0f, 0.95f, 0.85f));
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, waveVerts.data());
+        glDrawArrays(GL_LINE_STRIP, 0, int(waveVerts.size() / 3));
+
+        // 3. Vertex Handles (3D Diamonds)
+        for (size_t vi = 0; vi < m_waterEditPoints.size(); ++vi) {
+            const auto& pt = m_waterEditPoints[vi];
+            bool isSel = (int(vi) == m_selectedWaterVertex);
+
+            float hSize = isSel ? 24.0f : 15.0f;
+            float hx = float(pt.x), hy = float(pt.y);
+
+            float diamond[18] = {
+                hx, hy + hSize, 0.0f,   hx - hSize, hy, 0.0f,   hx, hy - hSize, 0.0f,
+                hx, hy + hSize, 0.0f,   hx, hy - hSize, 0.0f,   hx + hSize, hy, 0.0f
+            };
+
+            if (isSel) {
+                m_unlitShader->setUniformValue("uColor", QVector4D(1.0f, 0.82f, 0.10f, 1.0f)); // Radiant gold
+            } else {
+                m_unlitShader->setUniformValue("uColor", QVector4D(0.05f, 0.70f, 0.95f, 0.95f)); // Vivid ocean cyan
+            }
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, diamond);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+
+            float diamondBorder[24] = {
+                hx, hy + hSize, 0.0f,   hx - hSize, hy, 0.0f,
+                hx - hSize, hy, 0.0f,   hx, hy - hSize, 0.0f,
+                hx, hy - hSize, 0.0f,   hx + hSize, hy, 0.0f,
+                hx + hSize, hy, 0.0f,   hx, hy + hSize, 0.0f
+            };
+            glLineWidth(2.2f);
+            m_unlitShader->setUniformValue("uColor", isSel ? QVector4D(1.0f, 1.0f, 1.0f, 1.0f) : QVector4D(0.0f, 0.25f, 0.50f, 1.0f));
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, diamondBorder);
+            glDrawArrays(GL_LINES, 0, 8);
+        }
+
+        // 4. Edge Midpoint Indicators (+ button affordance)
+        for (size_t ei = 0; ei < m_waterEditPoints.size(); ++ei) {
+            size_t nextEi = (ei + 1) % m_waterEditPoints.size();
+            float mx = float(m_waterEditPoints[ei].x + m_waterEditPoints[nextEi].x) * 0.5f;
+            float my = float(m_waterEditPoints[ei].y + m_waterEditPoints[nextEi].y) * 0.5f;
+            float mSize = 7.0f;
+            float midBox[18] = {
+                mx - mSize, my - mSize, 0.0f,  mx + mSize, my - mSize, 0.0f,  mx + mSize, my + mSize, 0.0f,
+                mx - mSize, my - mSize, 0.0f,  mx + mSize, my + mSize, 0.0f,  mx - mSize, my + mSize, 0.0f
+            };
+            m_unlitShader->setUniformValue("uColor", QVector4D(0.85f, 0.95f, 1.0f, 0.70f));
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, midBox);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+        }
+
+        glDisableVertexAttribArray(0);
+        m_unlitShader->release();
+        glEnable(GL_DEPTH_TEST);
+    }
+
     float m_pitch = 20.0f;
     float m_yaw = -45.0f;
     float m_distance = 15.0f;
@@ -1662,6 +2081,10 @@ private:
     int m_meshEditObject = -1;
     int m_selectedMeshVertex = -1;
     std::vector<boulder::PolygonPoint> m_meshEditPoints;
+    bool m_waterEditActive = false;
+    int m_waterEditObject = -1;
+    int m_selectedWaterVertex = -1;
+    std::vector<boulder::PolygonPoint> m_waterEditPoints;
 
     bool m_hasScene = false;
     std::string m_scenePath;
@@ -1728,6 +2151,17 @@ private:
     QOpenGLShaderProgram* m_shader = nullptr;
     QOpenGLShaderProgram* m_unlitShader = nullptr;
     QOpenGLShaderProgram* m_outlineShader = nullptr;
+    QOpenGLShaderProgram* m_waterShader = nullptr;
+    GLuint m_waterVbo = 0;
+    GLuint m_waterEbo = 0;
+    std::vector<float> m_waterVertScratch;
+    std::vector<uint16_t> m_waterIdxScratch;
+    size_t m_waterVboCapacityBytes = 0;
+    size_t m_waterEboCapacityBytes = 0;
+    QElapsedTimer m_renderTimer;
+    std::vector<av::SceneData::SceneWater> m_sceneWaters;
+    bool m_wireframeMode = false;
+    float m_modelSkinnedFrame = -999.0f;
     GLuint m_gridVbo = 0;
     int m_gridVertexCount = 0;
     GLuint m_cubeVbo = 0;
@@ -1752,6 +2186,16 @@ RubyQuickViewport::RubyQuickViewport(QQuickItem* parent)
 }
 
 RubyQuickViewport::~RubyQuickViewport() {
+    if (m_camDynamicsTimer) {
+        m_camDynamicsTimer->stop();
+        delete m_camDynamicsTimer;
+        m_camDynamicsTimer = nullptr;
+    }
+    if (m_holdSelectTimer) {
+        m_holdSelectTimer->stop();
+        delete m_holdSelectTimer;
+        m_holdSelectTimer = nullptr;
+    }
     if (s_activeViewport == this) {
         s_activeViewport = nullptr;
     }
@@ -1808,6 +2252,32 @@ float RubyQuickViewport::selectedScale() const {
         return m_scene.objects[m_selectedObject].scale_x * m_scene.objects[m_selectedObject].template_scaling;
     }
     return 1.0f;
+}
+
+void RubyQuickViewport::setHoldToSelect(bool val) {
+    if (m_holdToSelect != val) {
+        m_holdToSelect = val;
+        emit holdToSelectChanged();
+    }
+}
+
+void RubyQuickViewport::clearTouchExclusionRects() {
+    m_touchExclusionRects.clear();
+}
+
+void RubyQuickViewport::addTouchExclusionRect(float x, float y, float width, float height) {
+    if (width > 0.0f && height > 0.0f) {
+        m_touchExclusionRects.push_back(QRectF(x, y, width, height));
+    }
+}
+
+bool RubyQuickViewport::isPointInExclusion(float x, float y) const {
+    const QPointF pt(x, y);
+    // 18dp safety envelope around controls so fingertip edges near buttons don't leak into the 3D scene
+    for (const auto& r : m_touchExclusionRects) {
+        if (r.adjusted(-18.0, -18.0, 18.0, 18.0).contains(pt)) return true;
+    }
+    return false;
 }
 
 void RubyQuickViewport::setCameraMode(int mode) {
@@ -1899,7 +2369,7 @@ void RubyQuickViewport::nudgeSelectedCoord(int axis, float delta) {
 }
 
 void RubyQuickViewport::rotateSelectedZ(float angleDeg) {
-    if (m_meshEditActive) return; // Disallow object rotation during mesh edit mode
+    if (m_meshEditActive || m_waterEditActive) return; // Disallow object rotation during mesh/water edit mode
     if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
         // Same coalescing as the nudge path: rotating by repeated taps is one
         // intent, not thirty undo steps.
@@ -2044,6 +2514,35 @@ void RubyQuickViewport::validateAndRepairScene() {
     touch_scene(/*geometry_changed=*/true);
 }
 
+bool RubyQuickViewport::wireframeMode() const {
+    QSettings s;
+    return s.value(QStringLiteral("ruby_mobile/wireframe_mode"), false).toBool();
+}
+
+void RubyQuickViewport::updateWaterAnimationState() {
+    const bool needsWaterAnim = m_waterEditActive;
+    if (needsWaterAnim) {
+        if (!m_waterAnimTimer) {
+            m_waterAnimTimer = new QTimer(this);
+            m_waterAnimTimer->setInterval(33); // ~30 fps fluid surface animation during edit
+            connect(m_waterAnimTimer, &QTimer::timeout, this, [this]() {
+                if (m_waterEditActive) {
+                    update();
+                } else if (m_waterAnimTimer) {
+                    m_waterAnimTimer->stop();
+                }
+            });
+        }
+        if (!m_waterAnimTimer->isActive()) {
+            m_waterAnimTimer->start();
+        }
+    } else {
+        if (m_waterAnimTimer && m_waterAnimTimer->isActive()) {
+            m_waterAnimTimer->stop();
+        }
+    }
+}
+
 bool RubyQuickViewport::loadScene(const QString& path) {
     m_filePath = path;
     m_scene = av::scene_load(path.toStdString());
@@ -2061,6 +2560,7 @@ bool RubyQuickViewport::loadScene(const QString& path) {
     }
     frameScene();
     markDirty(false);
+    updateWaterAnimationState();
     emit sceneLoaded();
     emit objectListChanged();
     emit selectedObjectChanged();
@@ -2081,9 +2581,10 @@ void RubyQuickViewport::loadSceneAsync(const QString& path) {
     std::string stdPath = path.toStdString();
 
     QThreadPool::globalInstance()->start([this, gen, stdPath, path]() {
-        // 1. Parse scene from disk in worker thread
-        av::SceneData scene = av::scene_load(stdPath);
-        if (m_sceneLoadGen.load() != gen) return;
+        try {
+            // 1. Parse scene from disk in worker thread
+            av::SceneData scene = av::scene_load(stdPath);
+            if (m_sceneLoadGen.load() != gen) return;
 
         QMetaObject::invokeMethod(this, [this, gen]() {
             if (m_sceneLoadGen.load() != gen) return;
@@ -2293,6 +2794,7 @@ void RubyQuickViewport::loadSceneAsync(const QString& path) {
             m_loadingStatus = tr("Ready");
             m_isSceneLoading = false;
 
+            updateWaterAnimationState();
             emit isSceneLoadingChanged();
             emit loadingProgressChanged();
             emit loadingStatusChanged();
@@ -2301,6 +2803,23 @@ void RubyQuickViewport::loadSceneAsync(const QString& path) {
             emit selectedObjectChanged();
             update();
         }, Qt::QueuedConnection);
+        } catch (const std::exception& e) {
+            QMetaObject::invokeMethod(this, [this, gen, err = QString::fromUtf8(e.what())]() {
+                if (m_sceneLoadGen.load() != gen) return;
+                m_isSceneLoading = false;
+                m_loadingStatus = tr("Error: %1").arg(err);
+                emit isSceneLoadingChanged();
+                emit loadingStatusChanged();
+            }, Qt::QueuedConnection);
+        } catch (...) {
+            QMetaObject::invokeMethod(this, [this, gen]() {
+                if (m_sceneLoadGen.load() != gen) return;
+                m_isSceneLoading = false;
+                m_loadingStatus = tr("Failed to load scene.");
+                emit isSceneLoadingChanged();
+                emit loadingStatusChanged();
+            }, Qt::QueuedConnection);
+        }
     });
 }
 
@@ -2313,6 +2832,7 @@ bool RubyQuickViewport::loadModel(const QString& path) {
     m_modelLoadedFlag = true;
     m_sceneLoadedFlag = false;
     m_selectedObject = -1;
+    updateWaterAnimationState();
 
     if (m_hasModel) {
         if (m_model.radius <= 0.0f) {
@@ -2387,6 +2907,7 @@ void RubyQuickViewport::markDirty(bool dirty) {
 void RubyQuickViewport::undo() {
     if (m_undoSnapshots.empty()) return;
     if (m_meshEditActive) discardMeshEdit();
+    if (m_waterEditActive) discardWaterMeshEdit();
     std::string current = av::scene_serialize(m_scene);
     m_redoSnapshots.push_back(std::vector<uint8_t>(current.begin(), current.end()));
     trim_snapshot_history(m_redoSnapshots);
@@ -2410,6 +2931,7 @@ void RubyQuickViewport::undo() {
 void RubyQuickViewport::redo() {
     if (m_redoSnapshots.empty()) return;
     if (m_meshEditActive) discardMeshEdit();
+    if (m_waterEditActive) discardWaterMeshEdit();
     std::string current = av::scene_serialize(m_scene);
     m_undoSnapshots.push_back(std::vector<uint8_t>(current.begin(), current.end()));
     trim_snapshot_history(m_undoSnapshots);
@@ -2435,14 +2957,25 @@ void RubyQuickViewport::selectObject(int idx) {
         m_selectedObject = idx;
         m_lastNudgeMs = 0;
         emit selectedObjectChanged();
+        emit selectedWaterChanged();
+        emit selectedWaterPropertiesChanged();
         update();
     }
 }
 
 int RubyQuickViewport::pickObjectAt(float x, float y) {
-    if (!m_hasScene || m_scene.objects.empty()) return -1;
+    return pickObjectAtInternal(x, y, /*allow_cycle=*/true);
+}
 
-    float aspect = float(width()) / qMax(1.0f, float(height()));
+int RubyQuickViewport::pickObjectAtInternal(float x, float y, bool allow_cycle) {
+    if (!m_hasScene || m_scene.objects.empty()) return -1;
+    if (isPointInExclusion(x, y)) return -1;
+
+    const float vpW = float(width());
+    const float vpH = float(height());
+    if (vpW <= 1.0f || vpH <= 1.0f) return -1;
+
+    float aspect = vpW / qMax(1.0f, vpH);
     QMatrix4x4 proj;
     proj.perspective(45.0f, aspect, 1.0f, 30000.0f);
 
@@ -2463,43 +2996,39 @@ int RubyQuickViewport::pickObjectAt(float x, float y) {
     QMatrix4x4 view;
     view.lookAt(eye, m_cameraTarget, up);
 
-    Ray ray = ruby::picking::get_mouse_ray(x, y, float(width()), float(height()), view, proj);
+    Ray ray = ruby::picking::get_mouse_ray(x, y, vpW, vpH, view, proj);
+    QMatrix4x4 viewProj = proj * view;
 
-    // ── Why this is not a scale-derived box anymore ────────────────────────
-    // The old picker tested every object against an AXIS-ALIGNED box of
-    // `scale * template_scaling * 1.5` clamped to a 40-unit minimum, and fell
-    // back to "nearest object ORIGIN within 140 px". Two ways that fails:
-    //   * a ground object (or any authored-large object) whose visible extent is
-    //     hundreds of units while its scale-derived box is 40 → the box test
-    //     misses the tap entirely and only the 140 px origin fallback can match,
-    //     i.e. "you have to know where the object's centre is";
-    //   * a rotated object's world-space AABB is not its extent in any
-    //     meaningful sense.
-    // Now: real geometry where we have it (exact ray/triangle against the ground
-    // submeshes, same kernel `Viewport3DWidget::pick_object_at()` uses), and a
-    // rotation-aware extent test from each object's ACTUAL local AABB elsewhere.
-    int bestIdx = -1;
-    int bestCurrent = -1;
-    float bestDist = 1e30f;
-
-    auto consider_world_box = [&](const float matrix[16], const float lmin[3], const float lmax[3]) {
-        float bmin[3], bmax[3];
-        if (!world_box_of(matrix, lmin, lmax, bmin, bmax)) return;
-        BoundingBox box;
-        box.min = Vector3{ bmin[0], bmin[1], bmin[2] };
-        box.max = Vector3{ bmax[0], bmax[1], bmax[2] };
-        RayCollision col = ruby::picking::get_ray_collision_box(ray, box);
-        if (col.hit && col.distance < bestDist) {
-            bestDist = col.distance;
-            bestIdx = bestCurrent;
-        }
+    auto project_point_to_screen = [&](const QVector3D& worldPos, float& outPx, float& outPy, float& outDepth) -> bool {
+        QVector4D clip = viewProj * QVector4D(worldPos, 1.0f);
+        if (clip.w() <= 0.001f) return false;
+        float ndcX = clip.x() / clip.w();
+        float ndcY = clip.y() / clip.w();
+        float ndcZ = clip.z() / clip.w();
+        if (ndcZ < -1.0f || ndcZ > 1.0f) return false;
+        outPx = (ndcX * 0.5f + 0.5f) * vpW;
+        outPy = (1.0f - (ndcY * 0.5f + 0.5f)) * vpH;
+        outDepth = clip.w();
+        return true;
     };
+
+    struct PickCandidate {
+        int index = -1;
+        bool is_ground = false;
+        bool is_direct_hit = false;
+        float screen_dist = 1e30f;
+        float depth = 1e30f;
+        float score = 1e30f;
+    };
+
+    std::vector<PickCandidate> candidates;
+    candidates.reserve(32);
+
+    const float kProximityMaxPx = 36.0f; // Only small entities qualify for proximity tap
 
     for (size_t i = 0; i < m_scene.objects.size(); ++i) {
         const av::SceneObject& obj = m_scene.objects[i];
         if (obj.hidden) continue;
-        // Backgrounds / sky planes and dimension-rift objects are not clickable
-        // (the same exclusions desktop picking makes).
         if (!obj.background_name.empty() || obj.is_dimension_object) continue;
         {
             std::string low = obj.name;
@@ -2512,16 +3041,14 @@ int RubyQuickViewport::pickObjectAt(float x, float y) {
         const std::string modelName = !obj.mesh_name.empty() ? obj.mesh_name : obj.template_name;
         const bool has_model = !modelName.empty();
 
-        float mat[16];
-        if (has_ground) calc_object_world_matrix(obj, mat);
-        else            calc_object_render_matrix(obj, mat);
-
-        bestCurrent = static_cast<int>(i);
-
-        // 1. Ground meshes: exact ray/triangle. The cheap per-submesh box reject
-        //    keeps the triangle sweep to the submeshes the ray can reach at all.
+        // 1. Embedded Ground Meshes (platforms / terrain)
         if (has_ground) {
+            float mat[16];
+            calc_object_world_matrix(obj, mat);
             const Matrix rmat = ruby::math::from_gl(mat);
+            float bestGmDist = 1e30f;
+            bool gmHit = false;
+
             for (const auto& gm : obj.ground_meshes) {
                 if (gm.positions.empty()) continue;
                 if (gm.min_x <= gm.max_x && gm.min_y <= gm.max_y && gm.min_z <= gm.max_z) {
@@ -2541,42 +3068,170 @@ int RubyQuickViewport::pickObjectAt(float x, float y) {
                     gm.positions.size() / 3,
                     gm.indices.empty() ? nullptr : gm.indices.data(),
                     gm.indices.size(), &rmat);
-                if (c.hit && c.distance < bestDist) {
-                    bestDist = c.distance;
-                    bestIdx = static_cast<int>(i);
+                if (c.hit && c.distance < bestGmDist) {
+                    bestGmDist = c.distance;
+                    gmHit = true;
+                }
+            }
+
+            if (gmHit) {
+                PickCandidate cand;
+                cand.index = static_cast<int>(i);
+                cand.is_ground = true;
+                cand.is_direct_hit = true;
+                cand.screen_dist = 0.0f;
+                cand.depth = bestGmDist;
+                cand.score = bestGmDist;
+                candidates.push_back(cand);
+            }
+            continue; // Ground meshes only accept direct ray hits, never false proximity!
+        }
+
+        // 2. Water sheets: test fluid bounding box
+        bool has_water = false;
+        float water_rect[4] = {0, 0, 0, 0};
+        for (const auto& w : m_scene.waters) {
+            if (w.object_index == static_cast<int>(i)) {
+                has_water = true;
+                water_rect[0] = w.rect[0]; water_rect[1] = w.rect[1];
+                water_rect[2] = w.rect[2]; water_rect[3] = w.rect[3];
+                break;
+            }
+        }
+
+        if (has_water) {
+            float mat[16];
+            calc_object_world_matrix(obj, mat);
+            const float lmin[3] = { water_rect[0], water_rect[1], -20.0f };
+            const float lmax[3] = { water_rect[0] + water_rect[2], water_rect[1] + water_rect[3], 40.0f };
+            float bmin[3], bmax[3];
+            if (world_box_of(mat, lmin, lmax, bmin, bmax)) {
+                BoundingBox b;
+                b.min = Vector3{ bmin[0], bmin[1], bmin[2] };
+                b.max = Vector3{ bmax[0], bmax[1], bmax[2] };
+                RayCollision c = ruby::picking::get_ray_collision_box(ray, b);
+                if (c.hit) {
+                    PickCandidate cand;
+                    cand.index = static_cast<int>(i);
+                    cand.is_ground = false;
+                    cand.is_direct_hit = true;
+                    cand.screen_dist = 0.0f;
+                    cand.depth = c.distance;
+                    cand.score = c.distance;
+                    candidates.push_back(cand);
+                    continue;
                 }
             }
         }
 
-        // 2. POD / 3D model instances: the model's own local AABB, transformed by
-        //    the object matrix, so a tap anywhere on the prop selects it. Falls
-        //    back to the authored scale box if the model was never parsed.
+        // 3. 3D Model Instances & Logic Markers: oriented bounding box raycast
+        float renderMat[16];
+        calc_object_render_matrix(obj, renderMat);
+
+        bool isDirectHit = false;
+        float hitDepth = 1e30f;
+
+        // Bounding box calculation for hit testing & center proximity
+        float lmin[3], lmax[3];
         if (has_model) {
             auto itb = m_podLocalBounds.find(modelName);
             if (itb != m_podLocalBounds.end()) {
-                consider_world_box(mat, itb->second.min, itb->second.max);
+                const float pad = 12.0f;
+                lmin[0] = itb->second.min[0] - pad; lmin[1] = itb->second.min[1] - pad; lmin[2] = itb->second.min[2] - pad;
+                lmax[0] = itb->second.max[0] + pad; lmax[1] = itb->second.max[1] + pad; lmax[2] = itb->second.max[2] + pad;
             } else {
-                const float half = std::max(20.0f, std::abs(obj.scale_x * obj.template_scaling) * 0.5f);
-                const float lmin[3] = { -half, -half, -half };
-                const float lmax[3] = {  half,  half,  half };
-                consider_world_box(mat, lmin, lmax);
+                const float half = std::max(35.0f, std::abs(obj.scale_x * obj.template_scaling) * 0.5f);
+                lmin[0] = -half; lmin[1] = -half; lmin[2] = -half;
+                lmax[0] =  half; lmax[1] =  half; lmax[2] =  half;
+            }
+        } else {
+            // Logic marker
+            const float half = std::max(40.0f, 30.0f * std::max(0.2f, std::abs(obj.scale_x * obj.template_scaling)));
+            lmin[0] = -half; lmin[1] = -half; lmin[2] = -half;
+            lmax[0] =  half; lmax[1] =  half; lmax[2] =  half;
+        }
+
+        float bmin[3], bmax[3];
+        if (!world_box_of(renderMat, lmin, lmax, bmin, bmax)) continue;
+
+        BoundingBox box;
+        box.min = Vector3{ bmin[0], bmin[1], bmin[2] };
+        box.max = Vector3{ bmax[0], bmax[1], bmax[2] };
+        RayCollision col = ruby::picking::get_ray_collision_box(ray, box);
+        if (col.hit) {
+            isDirectHit = true;
+            hitDepth = col.distance;
+        }
+
+        // Proximity check ONLY from object world center (never screen 2D bounding boxes!)
+        QVector3D worldCenter((bmin[0] + bmax[0]) * 0.5f,
+                              (bmin[1] + bmax[1]) * 0.5f,
+                              (bmin[2] + bmax[2]) * 0.5f);
+
+        float centerPx = 0.0f, centerPy = 0.0f, centerDepth = 0.0f;
+        bool centerVisible = project_point_to_screen(worldCenter, centerPx, centerPy, centerDepth);
+
+        float centerDistPx = 1e30f;
+        if (centerVisible) {
+            centerDistPx = std::hypot(centerPx - x, centerPy - y);
+        }
+
+        bool isProximityHit = (!isDirectHit && centerVisible && centerDistPx <= kProximityMaxPx);
+        if (!isDirectHit && !isProximityHit) continue;
+
+        if (!isDirectHit) {
+            hitDepth = (eye - worldCenter).length();
+        }
+
+        PickCandidate cand;
+        cand.index = static_cast<int>(i);
+        cand.is_ground = false;
+        cand.is_direct_hit = isDirectHit;
+        cand.screen_dist = centerDistPx;
+        cand.depth = hitDepth;
+        cand.score = isDirectHit ? hitDepth : (10000.0f + centerDistPx * 10.0f);
+        candidates.push_back(cand);
+    }
+
+    if (candidates.empty()) return -1;
+
+    std::sort(candidates.begin(), candidates.end(), [](const PickCandidate& a, const PickCandidate& b) {
+        if (a.is_direct_hit != b.is_direct_hit) return a.is_direct_hit; // Direct ray hit ALWAYS beats proximity
+        if (a.is_direct_hit && b.is_direct_hit) {
+            // Both are direct ray hits.
+            // If physically separated along the ray, the closer one wins
+            if (std::abs(a.depth - b.depth) > 30.0f) {
+                return a.depth < b.depth;
+            }
+            // If near identical depth (e.g. coin / prop on ground mesh), entities win over terrain!
+            if (a.is_ground != b.is_ground) {
+                return !a.is_ground;
+            }
+            return a.depth < b.depth;
+        }
+        // Both are proximity hits: prefer closest to center
+        if (std::abs(a.screen_dist - b.screen_dist) > 4.0f) {
+            return a.screen_dist < b.screen_dist;
+        }
+        return a.depth < b.depth;
+    });
+
+    int chosenIdx = candidates.front().index;
+
+    // Multi-candidate cycling
+    if (allow_cycle && m_selectedObject == chosenIdx && candidates.size() > 1) {
+        for (size_t k = 1; k < candidates.size(); ++k) {
+            if (candidates[k].index != m_selectedObject) {
+                chosenIdx = candidates[k].index;
+                break;
             }
         }
-
-        // 3. Logic markers with no geometry (portal, spawn, camera, triggers):
-        //    desktop's 30-unit cube, scaled by the object.
-        if (!has_ground && !has_model) {
-            const float half = 30.0f * std::max(0.2f, std::abs(obj.scale_x * obj.template_scaling));
-            const float lmin[3] = { -half, -half, -half };
-            const float lmax[3] = {  half,  half,  half };
-            consider_world_box(mat, lmin, lmax);
-        }
     }
 
-    if (bestIdx >= 0) {
-        selectObject(bestIdx);
+    if (chosenIdx >= 0) {
+        selectObject(chosenIdx);
     }
-    return bestIdx;
+    return chosenIdx;
 }
 
 // 8-corner transform of a local box by `matrix` into a world-space AABB — the
@@ -2621,14 +3276,16 @@ void RubyQuickViewport::toggleObjectVisibility(int idx) {
 
 void RubyQuickViewport::panCamera(float dx, float dy) {
     const float speed = m_cameraDistance * 0.018f;
-    const float yaw_rad = m_cameraYaw * (M_PI / 180.0f);
 
-    const float right_x = std::cos(yaw_rad);
-    const float right_z = -std::sin(yaw_rad);
+    // Camera-local Right/Up basis. Using the pitch-aware Up (instead of
+    // world-up) keeps the NavPad pan screen-parallel in a pitched 3D view; in
+    // Game View pitch is 0 so the result is identical to the old world-axis pan.
+    float right[3], up[3];
+    camera_pan_basis(m_cameraYaw, m_cameraPitch, right, up);
 
-    m_cameraTarget.setX(m_cameraTarget.x() + (right_x * dx) * speed);
-    m_cameraTarget.setY(m_cameraTarget.y() + dy * speed);
-    m_cameraTarget.setZ(m_cameraTarget.z() + (right_z * dx) * speed);
+    m_cameraTarget.setX(m_cameraTarget.x() + (right[0] * dx + up[0] * dy) * speed);
+    m_cameraTarget.setY(m_cameraTarget.y() + (right[1] * dx + up[1] * dy) * speed);
+    m_cameraTarget.setZ(m_cameraTarget.z() + (right[2] * dx + up[2] * dy) * speed);
 
     emit cameraChanged();
     if (m_meshEditActive) emit meshEditVerticesChanged();
@@ -2681,13 +3338,60 @@ QVariantList RubyQuickViewport::objectsSnapshot() const {
     return out;
 }
 
-void RubyQuickViewport::focusObject(int idx) {
+// Frame an object: recenter the target on it AND size the distance to its
+// real extent so a chest and a level-sized terrain both end up filling a
+// sensible share of the screen. Focusing before just moved the pivot and left
+// the zoom untouched, so "Frame selected object" on a large prop could pull
+// the camera inside it, and on a small prop it stayed a speck.
+void RubyQuickViewport::frameObject(int idx) {
     if (idx < 0 || idx >= int(m_scene.objects.size())) return;
     const auto& obj = m_scene.objects[idx];
     m_cameraTarget = QVector3D(obj.pos_x, obj.pos_y, obj.pos_z);
+
+    float local_min[3] = { -45.0f, -45.0f, -45.0f };
+    float local_max[3] = {  45.0f,  45.0f,  45.0f };
+    bool have_box = false;
+
+    if (!obj.ground_meshes.empty()) {
+        const auto& gm = obj.ground_meshes.front();
+        if (gm.min_x <= gm.max_x && gm.min_y <= gm.max_y && gm.min_z <= gm.max_z) {
+            local_min[0] = gm.min_x; local_min[1] = gm.min_y; local_min[2] = gm.min_z;
+            local_max[0] = gm.max_x; local_max[1] = gm.max_y; local_max[2] = gm.max_z;
+            have_box = true;
+        }
+    } else {
+        const std::string modelName = !obj.mesh_name.empty() ? obj.mesh_name : obj.template_name;
+        auto itb = m_podLocalBounds.find(modelName);
+        if (itb != m_podLocalBounds.end()) {
+            std::memcpy(local_min, itb->second.min, sizeof(local_min));
+            std::memcpy(local_max, itb->second.max, sizeof(local_max));
+            have_box = true;
+        }
+    }
+
+    float mat[16];
+    if (!obj.ground_meshes.empty()) calc_object_world_matrix(obj, mat);
+    else                            calc_object_render_matrix(obj, mat);
+
+    float radius = 60.0f;
+    if (have_box) {
+        float bmin[3], bmax[3];
+        if (world_box_of(mat, local_min, local_max, bmin, bmax)) {
+            const QVector3D extent(bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]);
+            radius = std::max(8.0f, 0.5f * extent.length());
+        }
+    }
+
+    m_cameraDistance = std::clamp(radius * 3.2f, 80.0f, 15000.0f);
     m_selectedObject = idx;
+    m_lastNudgeMs = 0;
     emit selectedObjectChanged();
+    emit cameraChanged();
     update();
+}
+
+void RubyQuickViewport::focusObject(int idx) {
+    frameObject(idx);
 }
 
 void RubyQuickViewport::addObject() {
@@ -3096,6 +3800,833 @@ int RubyQuickViewport::importTemplateObject(const QString& sclPathOrName, const 
     return new_idx;
 }
 
+static proto::Writer make_water_float_color(float r, float g, float b, float a) {
+    proto::Writer w;
+    w.write_float_field(1, r);
+    w.write_float_field(2, g);
+    w.write_float_field(3, b);
+    w.write_float_field(4, a);
+    return w;
+}
+
+static proto::Writer make_water_rect(float x, float y, float w, float h) {
+    proto::Writer r;
+    r.write_float_field(1, x);
+    r.write_float_field(2, y);
+    r.write_float_field(3, w);
+    r.write_float_field(4, h);
+    return r;
+}
+
+static proto::Writer make_water_v2(float x, float y) {
+    proto::Writer v;
+    v.write_float_field(1, x);
+    v.write_float_field(2, y);
+    return v;
+}
+
+static av::SceneComponent make_water_component(int id, int shape_id, int tex_id,
+                                              const float front_rgba[4],
+                                              const float surface_rgba[4]) {
+    av::SceneComponent comp;
+    comp.type_name = "WaterMesh";
+    comp.type_id = id;
+    comp.payload_field = 114;
+
+    proto::Writer wmc;
+    wmc.write_varint_field(1, shape_id);
+    wmc.write_varint_field(2, tex_id);
+    wmc.write_nested_field(3, make_water_float_color(front_rgba[0], front_rgba[1], front_rgba[2], front_rgba[3]));
+    wmc.write_nested_field(4, make_water_float_color(surface_rgba[0], surface_rgba[1], surface_rgba[2], surface_rgba[3]));
+
+    proto::Writer wrapper;
+    wrapper.write_string_field(1, "WaterMesh");
+    wrapper.write_varint_field(2, id);
+    wrapper.write_nested_field(114, wmc);
+
+    comp.raw_data = wrapper.to_string();
+    return comp;
+}
+
+static av::SceneComponent make_shape_rect_component(int id, float x, float y, float w, float h) {
+    av::SceneComponent comp;
+    comp.type_name = "UtilityShape";
+    comp.type_id = id;
+    comp.payload_field = 120;
+
+    proto::Writer shape;
+    shape.write_nested_field(1, make_water_rect(x, y, w, h));
+
+    proto::Writer wrapper;
+    wrapper.write_string_field(1, "UtilityShape");
+    wrapper.write_varint_field(2, id);
+    wrapper.write_nested_field(120, shape);
+
+    comp.raw_data = wrapper.to_string();
+    return comp;
+}
+
+static proto::Writer make_water_polygon(const std::vector<boulder::PolygonPoint>& pts) {
+    proto::Writer poly;
+    for (const auto& pt : pts) {
+        proto::Writer v;
+        v.write_float_field(1, float(pt.x));
+        v.write_float_field(2, float(pt.y));
+        poly.write_nested_field(1, v);
+    }
+    poly.write_varint_field(2, 0); // convex
+    poly.write_varint_field(3, 1); // closed = true
+    return poly;
+}
+
+static av::SceneComponent make_shape_polygon_rect_component(int id, float x, float y, float w, float h,
+                                                           const std::vector<boulder::PolygonPoint>& pts) {
+    av::SceneComponent comp;
+    comp.type_name = "UtilityShape";
+    comp.type_id = id;
+    comp.payload_field = 120;
+
+    proto::Writer shape;
+    shape.write_nested_field(1, make_water_rect(x, y, w, h));
+    if (pts.size() > 4) {
+        shape.write_nested_field(3, make_water_polygon(pts));
+    }
+
+    proto::Writer wrapper;
+    wrapper.write_string_field(1, "UtilityShape");
+    wrapper.write_varint_field(2, id);
+    wrapper.write_nested_field(120, shape);
+
+    comp.raw_data = wrapper.to_string();
+    return comp;
+}
+
+static av::SceneComponent make_texture_mapping_component(int id, const std::string& texture,
+                                                        float tile_size, float off_x, float off_y) {
+    av::SceneComponent comp;
+    comp.type_name = "TextureMapping";
+    comp.type_id = id;
+    comp.payload_field = 113;
+
+    proto::Writer tm;
+    tm.write_string_field(1, texture);
+    tm.write_float_field(2, tile_size > 0.0f ? tile_size : 64.0f);
+    tm.write_nested_field(3, make_water_v2(off_x, off_y));
+
+    proto::Writer wrapper;
+    wrapper.write_string_field(1, "TextureMapping");
+    wrapper.write_varint_field(2, id);
+    wrapper.write_nested_field(113, tm);
+
+    comp.raw_data = wrapper.to_string();
+    return comp;
+}
+
+bool RubyQuickViewport::isSelectedWater() const {
+    if (!m_hasScene || m_selectedObject < 0 || m_selectedObject >= int(m_scene.objects.size()))
+        return false;
+    for (const auto& w : m_scene.waters) {
+        if (w.object_index == m_selectedObject) return true;
+    }
+    const auto& obj = m_scene.objects[m_selectedObject];
+    const auto& comps = obj.resolved_components.empty() ? obj.components : obj.resolved_components;
+    for (const auto& c : comps) {
+        if (c.type_name == "WaterMesh" || c.payload_field == 114) return true;
+    }
+    return false;
+}
+
+QVariantMap RubyQuickViewport::getSelectedWaterProperties() const {
+    QVariantMap res;
+    res["valid"] = false;
+    if (!isSelectedWater()) return res;
+
+    const int objIdx = m_selectedObject;
+    const auto& obj = m_scene.objects[objIdx];
+    res["valid"] = true;
+    res["objectIndex"] = objIdx;
+    res["objectName"] = QString::fromStdString(obj.name);
+
+    for (const auto& w : m_scene.waters) {
+        if (w.object_index == objIdx) {
+            res["x"] = w.rect[0];
+            res["y"] = w.rect[1];
+            res["width"] = w.rect[2];
+            res["height"] = w.rect[3];
+            res["frontR"] = w.front_color[0];
+            res["frontG"] = w.front_color[1];
+            res["frontB"] = w.front_color[2];
+            res["frontA"] = w.front_color[3];
+            res["surfaceR"] = w.surface_color[0];
+            res["surfaceG"] = w.surface_color[1];
+            res["surfaceB"] = w.surface_color[2];
+            res["surfaceA"] = w.surface_color[3];
+            res["texture"] = QString::fromStdString(w.texture.empty() ? "water" : w.texture);
+            res["tileSize"] = w.tile_size > 0.0f ? w.tile_size : 64.0f;
+            res["offsetX"] = w.tex_offset[0];
+            res["offsetY"] = w.tex_offset[1];
+            return res;
+        }
+    }
+
+    res["x"] = 0.0f;
+    res["y"] = 0.0f;
+    res["width"] = 300.0f;
+    res["height"] = 80.0f;
+    res["frontR"] = 0.20f; res["frontG"] = 0.50f; res["frontB"] = 0.85f; res["frontA"] = 0.78f;
+    res["surfaceR"] = 0.40f; res["surfaceG"] = 0.75f; res["surfaceB"] = 1.00f; res["surfaceA"] = 0.82f;
+    res["texture"] = "water";
+    res["tileSize"] = 64.0f;
+    res["offsetX"] = 0.0f;
+    res["offsetY"] = 0.0f;
+    return res;
+}
+
+bool RubyQuickViewport::setSelectedWaterProperties(const QVariantMap& props) {
+    if (!m_hasScene || m_selectedObject < 0 || m_selectedObject >= int(m_scene.objects.size()))
+        return false;
+    if (!isSelectedWater()) return false;
+
+    pushUndoSnapshot();
+    auto& obj = m_scene.objects[m_selectedObject];
+
+    float rx = props.value("x", 0.0f).toFloat();
+    float ry = props.value("y", 0.0f).toFloat();
+    float rw = props.value("width", 300.0f).toFloat();
+    float rh = props.value("height", 80.0f).toFloat();
+    if (rw < 10.0f) rw = 10.0f;
+    if (rh < 10.0f) rh = 10.0f;
+
+    float front[4] = {
+        props.value("frontR", 0.20f).toFloat(),
+        props.value("frontG", 0.50f).toFloat(),
+        props.value("frontB", 0.85f).toFloat(),
+        props.value("frontA", 0.78f).toFloat()
+    };
+    float surface[4] = {
+        props.value("surfaceR", 0.40f).toFloat(),
+        props.value("surfaceG", 0.75f).toFloat(),
+        props.value("surfaceB", 1.00f).toFloat(),
+        props.value("surfaceA", 0.82f).toFloat()
+    };
+    std::string tex = props.value("texture", "water").toString().trimmed().toStdString();
+    if (tex.empty()) tex = "water";
+    float tile = props.value("tileSize", 64.0f).toFloat();
+    if (tile <= 0.0f) tile = 64.0f;
+    float off_x = props.value("offsetX", 0.0f).toFloat();
+    float off_y = props.value("offsetY", 0.0f).toFloat();
+
+    std::vector<av::SceneComponent> retained;
+    retained.reserve(obj.components.size());
+    for (const auto& c : obj.components) {
+        if (c.type_name == "WaterMesh" || c.payload_field == 114) continue;
+        if (c.type_id == 103 && (c.type_name.find("Shape") != std::string::npos || c.payload_field == 120)) continue;
+        if (c.type_id == 106 && (c.type_name.find("Texture") != std::string::npos || c.payload_field == 113)) continue;
+        retained.push_back(c);
+    }
+    retained.push_back(make_water_component(101, 103, 106, front, surface));
+    retained.push_back(make_shape_rect_component(103, rx, ry, rw, rh));
+    retained.push_back(make_texture_mapping_component(106, tex, tile, off_x, off_y));
+    obj.components = std::move(retained);
+
+    obj.local_aabb = av::scene_build_local_aabb(rx, ry, rx + rw, ry + rh);
+
+    validateAndRepairScene();
+    touch_scene(/*geometry_changed=*/true);
+    m_objectModel.updateFromScene(m_scene);
+
+    emit selectedWaterPropertiesChanged();
+    emit objectTransformChanged();
+    emit dirtyChanged();
+    update();
+    return true;
+}
+
+bool RubyQuickViewport::setWaterPreset(const QString& presetName) {
+    if (!isSelectedWater()) return false;
+    QVariantMap cur = getSelectedWaterProperties();
+    if (!cur.value("valid", false).toBool()) return false;
+
+    QString p = presetName.trimmed().toLower();
+    if (p == "toxic" || p == "acid") {
+        cur["frontR"] = 0.12f; cur["frontG"] = 0.65f; cur["frontB"] = 0.12f; cur["frontA"] = 0.85f;
+        cur["surfaceR"] = 0.35f; cur["surfaceG"] = 0.95f; cur["surfaceB"] = 0.18f; cur["surfaceA"] = 0.90f;
+    } else if (p == "lava" || p == "magma") {
+        cur["frontR"] = 0.85f; cur["frontG"] = 0.18f; cur["frontB"] = 0.05f; cur["frontA"] = 0.95f;
+        cur["surfaceR"] = 1.00f; cur["surfaceG"] = 0.58f; cur["surfaceB"] = 0.08f; cur["surfaceA"] = 0.98f;
+    } else if (p == "swamp" || p == "muck") {
+        cur["frontR"] = 0.22f; cur["frontG"] = 0.25f; cur["frontB"] = 0.15f; cur["frontA"] = 0.85f;
+        cur["surfaceR"] = 0.35f; cur["surfaceG"] = 0.40f; cur["surfaceB"] = 0.22f; cur["surfaceA"] = 0.88f;
+    } else if (p == "spirit" || p == "ethereal" || p == "void") {
+        cur["frontR"] = 0.45f; cur["frontG"] = 0.12f; cur["frontB"] = 0.75f; cur["frontA"] = 0.80f;
+        cur["surfaceR"] = 0.75f; cur["surfaceG"] = 0.35f; cur["surfaceB"] = 0.98f; cur["surfaceA"] = 0.85f;
+    } else { // "azure"
+        cur["frontR"] = 0.20f; cur["frontG"] = 0.50f; cur["frontB"] = 0.85f; cur["frontA"] = 0.78f;
+        cur["surfaceR"] = 0.40f; cur["surfaceG"] = 0.75f; cur["surfaceB"] = 1.00f; cur["surfaceA"] = 0.82f;
+    }
+    cur["texture"] = "water";
+    return setSelectedWaterProperties(cur);
+}
+
+int RubyQuickViewport::createWaterObject(float x, float y, float width, float height, const QString& preset) {
+    if (!m_hasScene) return -1;
+    pushUndoSnapshot();
+
+    av::SceneObject obj;
+    obj.name = av::scene_fresh_identifier(m_scene);
+    obj.pos_x = x;
+    obj.pos_y = y;
+    obj.pos_z = 0.0f;
+    obj.scale_x = obj.scale_y = obj.scale_z = 1.0f;
+
+    float front[4] = {0.20f, 0.50f, 0.85f, 0.78f};
+    float surface[4] = {0.40f, 0.75f, 1.00f, 0.82f};
+    std::string tex = "water";
+    float tile = 64.0f;
+
+    QString p = preset.trimmed().toLower();
+    if (p == "toxic" || p == "acid") {
+        front[0] = 0.12f; front[1] = 0.65f; front[2] = 0.12f; front[3] = 0.85f;
+        surface[0] = 0.35f; surface[1] = 0.95f; surface[2] = 0.18f; surface[3] = 0.90f;
+    } else if (p == "lava" || p == "magma") {
+        front[0] = 0.85f; front[1] = 0.18f; front[2] = 0.05f; front[3] = 0.95f;
+        surface[0] = 1.00f; surface[1] = 0.58f; surface[2] = 0.08f; surface[3] = 0.98f;
+    } else if (p == "swamp" || p == "muck") {
+        front[0] = 0.22f; front[1] = 0.25f; front[2] = 0.15f; front[3] = 0.85f;
+        surface[0] = 0.35f; surface[1] = 0.40f; surface[2] = 0.22f; surface[3] = 0.88f;
+    } else if (p == "spirit" || p == "ethereal" || p == "void") {
+        front[0] = 0.45f; front[1] = 0.12f; front[2] = 0.75f; front[3] = 0.80f;
+        surface[0] = 0.75f; surface[1] = 0.35f; surface[2] = 0.98f; surface[3] = 0.85f;
+    }
+
+    const float rx = -width * 0.5f;
+    const float ry = -height * 0.5f;
+    const float rw = width;
+    const float rh = height;
+
+    obj.local_aabb = av::scene_build_local_aabb(rx, ry, rx + rw, ry + rh);
+    obj.components.push_back(make_water_component(101, 103, 106, front, surface));
+    obj.components.push_back(make_shape_rect_component(103, rx, ry, rw, rh));
+    obj.components.push_back(make_texture_mapping_component(106, tex, tile, 0.0f, 0.0f));
+
+    m_scene.objects.push_back(std::move(obj));
+    const int new_idx = static_cast<int>(m_scene.objects.size() - 1);
+
+    validateAndRepairScene();
+    m_selectedObject = new_idx;
+    m_lastNudgeMs = 0;
+    touch_scene(/*geometry_changed=*/true);
+    m_objectModel.updateFromScene(m_scene);
+
+    emit objectListChanged();
+    emit selectedObjectChanged();
+    emit selectedWaterChanged();
+    emit selectedWaterPropertiesChanged();
+    emit objectTransformChanged();
+    emit dirtyChanged();
+    update();
+
+    return new_idx;
+}
+
+bool RubyQuickViewport::canWaterMeshEdit() const {
+    if (!m_hasScene || m_selectedObject < 0 || m_selectedObject >= int(m_scene.objects.size()))
+        return false;
+    return isSelectedWater();
+}
+
+bool RubyQuickViewport::beginWaterMeshEdit() {
+    if (!canWaterMeshEdit()) return false;
+    m_waterEditObject = m_selectedObject;
+
+    m_waterSceneSaved = m_scene;
+    m_waterSceneSavedValid = true;
+    m_waterDragPoint = -1;
+    m_waterDragging = false;
+    m_waterPanning = false;
+
+    // Save camera before aligning
+    m_waterSavedCamPitch = m_cameraPitch;
+    m_waterSavedCamYaw = m_cameraYaw;
+    m_waterSavedCamDistance = m_cameraDistance;
+    m_waterSavedCamTarget = m_cameraTarget;
+    m_waterSavedCamValid = true;
+
+    // Load existing water geometry
+    m_waterEditPoints.clear();
+    const auto& obj = m_scene.objects[m_waterEditObject];
+
+    float rx = 0.0f, ry = 0.0f, rw = 300.0f, rh = 80.0f;
+    bool foundWater = false;
+    for (const auto& w : m_scene.waters) {
+        if (w.object_index == m_waterEditObject) {
+            rx = w.rect[0]; ry = w.rect[1]; rw = w.rect[2]; rh = w.rect[3];
+            if (!w.polygon_points.empty() && w.polygon_points.size() >= 6) {
+                for (size_t pi = 0; pi + 1 < w.polygon_points.size(); pi += 2) {
+                    m_waterEditPoints.push_back({double(w.polygon_points[pi]), double(w.polygon_points[pi + 1])});
+                }
+            }
+            foundWater = true;
+            break;
+        }
+    }
+    if (m_waterEditPoints.empty()) {
+        if (!foundWater) {
+            QVariantMap props = getSelectedWaterProperties();
+            rx = props.value("x", 0.0f).toFloat();
+            ry = props.value("y", 0.0f).toFloat();
+            rw = props.value("width", 300.0f).toFloat();
+            rh = props.value("height", 80.0f).toFloat();
+        }
+        m_waterEditPoints = {
+            {double(rx), double(ry + rh)},       // Top-Left
+            {double(rx + rw), double(ry + rh)},  // Top-Right
+            {double(rx + rw), double(ry)},       // Bottom-Right
+            {double(rx), double(ry)}            // Bottom-Left
+        };
+    }
+
+    float obj_mat[16];
+    calc_object_world_matrix(obj, obj_mat);
+    double minx = 1e30, miny = 1e30, minz = 1e30;
+    double maxx = -1e30, maxy = -1e30, maxz = -1e30;
+    for (const auto& pt : m_waterEditPoints) {
+        const float lp[3] = {float(pt.x), float(pt.y), 0.0f};
+        const float wx = obj_mat[0]*lp[0] + obj_mat[4]*lp[1] + obj_mat[8]*lp[2] + obj_mat[12];
+        const float wy = obj_mat[1]*lp[0] + obj_mat[5]*lp[1] + obj_mat[9]*lp[2] + obj_mat[13];
+        const float wz = obj_mat[2]*lp[0] + obj_mat[6]*lp[1] + obj_mat[10]*lp[2] + obj_mat[14];
+        minx = std::min(minx, (double)wx); maxx = std::max(maxx, (double)wx);
+        miny = std::min(miny, (double)wy); maxy = std::max(maxy, (double)wy);
+        minz = std::min(minz, (double)wz); maxz = std::max(maxz, (double)wz);
+    }
+    m_cameraTarget = QVector3D(float((minx + maxx) * 0.5),
+                              float((miny + maxy) * 0.5),
+                              float((minz + maxz) * 0.5));
+    constexpr double kPi = 3.14159265358979323846;
+    const double rot_y_deg = obj.rot_y * 180.0 / kPi;
+    m_cameraYaw = float(-rot_y_deg);
+    m_cameraPitch = 0.0f;
+    const double fit = std::max({maxx - minx, maxy - miny, 100.0});
+    const double vfov = 45.0 * kPi / 180.0;
+    m_cameraDistance = float(std::clamp((fit * 0.5) / std::tan(vfov * 0.5) * 1.35, 180.0, 15000.0));
+
+    m_selectedWaterVertex = 0;
+    m_waterEditActive = true;
+    m_gizmoMode = 0;
+
+    emit gizmoModeChanged();
+    emit cameraChanged();
+    emit waterEditActiveChanged();
+    emit waterEditVerticesChanged();
+    emit selectedWaterVertexChanged();
+    updateWaterAnimationState();
+    update();
+    return true;
+}
+
+bool RubyQuickViewport::liveWaterMeshPreview() {
+    if (!m_waterEditActive || m_waterEditObject < 0 || m_waterEditObject >= int(m_scene.objects.size()))
+        return false;
+    if (m_waterEditPoints.size() < 3) return false;
+
+    double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;
+    for (const auto& pt : m_waterEditPoints) {
+        minx = std::min(minx, pt.x); maxx = std::max(maxx, pt.x);
+        miny = std::min(miny, pt.y); maxy = std::max(maxy, pt.y);
+    }
+    float rx = float(minx);
+    float ry = float(miny);
+    float rw = std::max(10.0f, float(maxx - minx));
+    float rh = std::max(10.0f, float(maxy - miny));
+
+    for (auto& w : m_scene.waters) {
+        if (w.object_index == m_waterEditObject) {
+            w.rect[0] = rx;
+            w.rect[1] = ry;
+            w.rect[2] = rw;
+            w.rect[3] = rh;
+            w.polygon_points.clear();
+            for (const auto& pt : m_waterEditPoints) {
+                w.polygon_points.push_back(float(pt.x));
+                w.polygon_points.push_back(float(pt.y));
+            }
+            break;
+        }
+    }
+
+    auto& obj = m_scene.objects[m_waterEditObject];
+    obj.local_aabb = av::scene_build_local_aabb(rx, ry, rx + rw, ry + rh);
+
+    touch_scene(/*geometry_changed=*/true);
+    emit selectedWaterPropertiesChanged();
+    emit waterEditVerticesChanged();
+    update();
+    return true;
+}
+
+bool RubyQuickViewport::applyWaterMeshEdit() {
+    if (!m_waterEditActive || m_waterEditObject < 0 || m_waterEditObject >= int(m_scene.objects.size()))
+        return false;
+    if (m_waterEditPoints.size() < 3) return false;
+
+    pushUndoSnapshot();
+
+    double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;
+    for (const auto& pt : m_waterEditPoints) {
+        minx = std::min(minx, pt.x); maxx = std::max(maxx, pt.x);
+        miny = std::min(miny, pt.y); maxy = std::max(maxy, pt.y);
+    }
+    float rx = float(minx);
+    float ry = float(miny);
+    float rw = std::max(10.0f, float(maxx - minx));
+    float rh = std::max(10.0f, float(maxy - miny));
+
+    auto& obj = m_scene.objects[m_waterEditObject];
+
+    float front[4] = {0.20f, 0.50f, 0.85f, 0.78f};
+    float surface[4] = {0.40f, 0.75f, 1.00f, 0.82f};
+    std::string tex = "water";
+    float tile = 64.0f;
+    float off_x = 0.0f, off_y = 0.0f;
+    for (const auto& w : m_scene.waters) {
+        if (w.object_index == m_waterEditObject) {
+            memcpy(front, w.front_color, sizeof(front));
+            memcpy(surface, w.surface_color, sizeof(surface));
+            tex = w.texture;
+            tile = w.tile_size;
+            off_x = w.tex_offset[0];
+            off_y = w.tex_offset[1];
+            break;
+        }
+    }
+
+    std::vector<av::SceneComponent> retained;
+    retained.reserve(obj.components.size());
+    for (const auto& c : obj.components) {
+        if (c.type_name == "WaterMesh" || c.payload_field == 114) continue;
+        if (c.type_id == 103 && (c.type_name.find("Shape") != std::string::npos || c.payload_field == 120)) continue;
+        if (c.type_id == 106 && (c.type_name.find("Texture") != std::string::npos || c.payload_field == 113)) continue;
+        retained.push_back(c);
+    }
+
+    retained.push_back(make_water_component(101, 103, 106, front, surface));
+    retained.push_back(make_shape_polygon_rect_component(103, rx, ry, rw, rh, m_waterEditPoints));
+    retained.push_back(make_texture_mapping_component(106, tex, tile, off_x, off_y));
+    obj.components = std::move(retained);
+
+    obj.local_aabb = av::scene_build_local_aabb(rx, ry, rx + rw, ry + rh);
+
+    validateAndRepairScene();
+    touch_scene(/*geometry_changed=*/true);
+    markDirty(true);
+    m_objectModel.updateFromScene(m_scene);
+
+    m_waterEditActive = false;
+    m_waterSceneSavedValid = false;
+
+    if (m_waterSavedCamValid) {
+        m_cameraPitch = m_waterSavedCamPitch;
+        m_cameraYaw = m_waterSavedCamYaw;
+        m_cameraDistance = m_waterSavedCamDistance;
+        m_cameraTarget = m_waterSavedCamTarget;
+        m_waterSavedCamValid = false;
+        emit cameraChanged();
+    }
+
+    emit waterEditActiveChanged();
+    emit selectedWaterPropertiesChanged();
+    emit objectTransformChanged();
+    emit waterEditVerticesChanged();
+    updateWaterAnimationState();
+    update();
+    return true;
+}
+
+void RubyQuickViewport::discardWaterMeshEdit() {
+    if (!m_waterEditActive) return;
+    if (m_waterSceneSavedValid) {
+        m_scene = m_waterSceneSaved;
+        av::scene_refresh(m_scene);
+        touch_scene(/*geometry_changed=*/true);
+        m_waterSceneSavedValid = false;
+    }
+
+    m_waterEditActive = false;
+    m_waterEditPoints.clear();
+    m_waterDragging = false;
+    m_waterDragPoint = -1;
+    m_waterPanning = false;
+
+    if (m_waterSavedCamValid) {
+        m_cameraPitch = m_waterSavedCamPitch;
+        m_cameraYaw = m_waterSavedCamYaw;
+        m_cameraDistance = m_waterSavedCamDistance;
+        m_cameraTarget = m_waterSavedCamTarget;
+        m_waterSavedCamValid = false;
+        emit cameraChanged();
+    }
+
+    emit waterEditActiveChanged();
+    emit waterEditVerticesChanged();
+    emit objectTransformChanged();
+    emit selectedWaterPropertiesChanged();
+    updateWaterAnimationState();
+    update();
+}
+
+void RubyQuickViewport::resetWaterEditToRect() {
+    if (!m_waterEditActive || m_waterEditPoints.size() < 3) return;
+    double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;
+    for (const auto& pt : m_waterEditPoints) {
+        minx = std::min(minx, pt.x); maxx = std::max(maxx, pt.x);
+        miny = std::min(miny, pt.y); maxy = std::max(maxy, pt.y);
+    }
+    m_waterEditPoints = {
+        {minx, maxy}, // TL
+        {maxx, maxy}, // TR
+        {maxx, miny}, // BR
+        {minx, miny}  // BL
+    };
+    m_selectedWaterVertex = 0;
+    liveWaterMeshPreview();
+    emit waterEditVerticesChanged();
+    emit selectedWaterVertexChanged();
+}
+
+QVariantList RubyQuickViewport::getWaterEditVertices() const {
+    QVariantList list;
+    if (!m_waterEditActive) return list;
+
+    for (size_t i = 0; i < m_waterEditPoints.size(); ++i) {
+        const auto& pt = m_waterEditPoints[i];
+        QPointF sp;
+        bool ok = waterLocalToScreen(pt.x, pt.y, sp);
+        QVariantMap map;
+        map["index"] = int(i);
+        map["x"] = pt.x;
+        map["y"] = pt.y;
+        map["screenX"] = ok ? sp.x() : -999.0;
+        map["screenY"] = ok ? sp.y() : -999.0;
+        map["visible"] = ok && (sp.x() >= -50.0 && sp.x() <= width() + 50.0 &&
+                               sp.y() >= -50.0 && sp.y() <= height() + 50.0);
+        list.append(map);
+    }
+    return list;
+}
+
+void RubyQuickViewport::moveWaterVertex(int index, float worldDx, float worldDy) {
+    if (!m_waterEditActive || index < 0 || index >= int(m_waterEditPoints.size())) return;
+    m_waterEditPoints[index].x += worldDx;
+    m_waterEditPoints[index].y += worldDy;
+    liveWaterMeshPreview();
+    emit waterEditVerticesChanged();
+}
+
+void RubyQuickViewport::insertWaterVertex(int edgeIndex, float worldX, float worldY) {
+    if (!m_waterEditActive || m_waterEditPoints.empty()) return;
+    int i0 = (edgeIndex >= 0 && edgeIndex < int(m_waterEditPoints.size())) ? edgeIndex : 0;
+    boulder::PolygonPoint pt;
+    if (worldX != 0.0f || worldY != 0.0f) {
+        pt.x = worldX;
+        pt.y = worldY;
+    } else {
+        int i1 = (i0 + 1) % int(m_waterEditPoints.size());
+        pt.x = (m_waterEditPoints[i0].x + m_waterEditPoints[i1].x) * 0.5;
+        pt.y = (m_waterEditPoints[i0].y + m_waterEditPoints[i1].y) * 0.5;
+    }
+    m_waterEditPoints.insert(m_waterEditPoints.begin() + i0 + 1, pt);
+    m_selectedWaterVertex = i0 + 1;
+    liveWaterMeshPreview();
+    emit waterEditVerticesChanged();
+    emit selectedWaterVertexChanged();
+}
+
+void RubyQuickViewport::deleteWaterVertex(int index) {
+    if (!m_waterEditActive || m_waterEditPoints.size() <= 3) return;
+    if (index < 0 || index >= int(m_waterEditPoints.size())) return;
+    m_waterEditPoints.erase(m_waterEditPoints.begin() + index);
+    if (m_selectedWaterVertex >= int(m_waterEditPoints.size())) {
+        m_selectedWaterVertex = int(m_waterEditPoints.size()) - 1;
+    }
+    liveWaterMeshPreview();
+    emit waterEditVerticesChanged();
+    emit selectedWaterVertexChanged();
+}
+
+void RubyQuickViewport::selectWaterVertex(int index) {
+    if (index >= 0 && index < int(m_waterEditPoints.size())) {
+        m_selectedWaterVertex = index;
+        emit selectedWaterVertexChanged();
+        update();
+    }
+}
+
+void RubyQuickViewport::selectNextWaterVertex() {
+    if (!m_waterEditActive || m_waterEditPoints.empty()) return;
+    m_selectedWaterVertex = (m_selectedWaterVertex + 1) % int(m_waterEditPoints.size());
+    emit selectedWaterVertexChanged();
+    update();
+}
+
+void RubyQuickViewport::selectPrevWaterVertex() {
+    if (!m_waterEditActive || m_waterEditPoints.empty()) return;
+    m_selectedWaterVertex = (m_selectedWaterVertex - 1 + int(m_waterEditPoints.size())) % int(m_waterEditPoints.size());
+    emit selectedWaterVertexChanged();
+    update();
+}
+
+void RubyQuickViewport::nudgeSelectedWaterVertex(float dx, float dy) {
+    if (!m_waterEditActive || m_selectedWaterVertex < 0 || m_selectedWaterVertex >= int(m_waterEditPoints.size())) return;
+    m_waterEditPoints[m_selectedWaterVertex].x += dx;
+    m_waterEditPoints[m_selectedWaterVertex].y += dy;
+    liveWaterMeshPreview();
+    emit waterEditVerticesChanged();
+}
+
+bool RubyQuickViewport::waterLocalToScreen(double lx, double ly, QPointF& out) const {
+    if (m_waterEditObject < 0 || m_waterEditObject >= int(m_scene.objects.size())) return false;
+    const auto& obj = m_scene.objects[m_waterEditObject];
+
+    float objMat[16];
+    calc_object_world_matrix(obj, objMat);
+
+    float wp[3] = {
+        objMat[0] * float(lx) + objMat[4] * float(ly) + objMat[12],
+        objMat[1] * float(lx) + objMat[5] * float(ly) + objMat[13],
+        objMat[2] * float(lx) + objMat[6] * float(ly) + objMat[14]
+    };
+
+    av::Camera cam;
+    cam.yaw = m_cameraYaw;
+    cam.pitch = m_cameraPitch;
+    cam.distance = m_cameraDistance;
+    cam.target[0] = m_cameraTarget.x();
+    cam.target[1] = m_cameraTarget.y();
+    cam.target[2] = m_cameraTarget.z();
+    cam.fov = 45.0f;
+    cam.near_plane = std::max(0.1f, m_cameraDistance * 0.001f);
+    cam.far_plane = std::max(10000.0f, m_cameraDistance * 24.0f);
+
+    ImVec2 s;
+    if (!swk::world_to_screen(cam, std::max(1, int(width())), std::max(1, int(height())),
+                              ImVec2(0, 0), wp, s))
+        return false;
+
+    out = QPointF(s.x, s.y);
+    return true;
+}
+
+bool RubyQuickViewport::waterScreenRay(const QPointF& px, float origin[3], float dir[3]) const {
+    av::Camera cam;
+    cam.yaw = m_cameraYaw;
+    cam.pitch = m_cameraPitch;
+    cam.distance = m_cameraDistance;
+    cam.target[0] = m_cameraTarget.x();
+    cam.target[1] = m_cameraTarget.y();
+    cam.target[2] = m_cameraTarget.z();
+    cam.fov = 45.0f;
+    cam.near_plane = std::max(0.1f, m_cameraDistance * 0.001f);
+    cam.far_plane = std::max(10000.0f, m_cameraDistance * 24.0f);
+
+    swk::screen_ray(cam, std::max(1, int(width())), std::max(1, int(height())),
+                    ImVec2(0, 0), ImVec2(float(px.x()), float(px.y())), origin, dir);
+    return true;
+}
+
+bool RubyQuickViewport::waterRayObjectPlane(const float origin[3], const float dir[3],
+                                          double& lx, double& ly) const {
+    if (m_waterEditObject < 0 || m_waterEditObject >= int(m_scene.objects.size())) return false;
+    const auto& obj = m_scene.objects[m_waterEditObject];
+
+    float mat[16];
+    calc_object_world_matrix(obj, mat);
+    const float px = mat[12], py = mat[13], pz = mat[14];
+    const float ax = mat[0], ay = mat[1], az = mat[2];
+    const float bx = mat[4], by = mat[5], bz = mat[6];
+    float nx = ay*bz - az*by, ny = az*bx - ax*bz, nz = ax*by - ay*bx;
+    const float nl = std::sqrt(nx*nx + ny*ny + nz*nz);
+    if (nl < 1e-6f) return false;
+    nx /= nl; ny /= nl; nz /= nl;
+    const float denom = nx*dir[0] + ny*dir[1] + nz*dir[2];
+    if (std::fabs(denom) < 1e-5f) return false;
+    const float t = (nx*(px - origin[0]) + ny*(py - origin[1]) + nz*(pz - origin[2])) / denom;
+    if (t < 0.0f) return false;
+    const float hx = origin[0] + dir[0]*t - px;
+    const float hy = origin[1] + dir[1]*t - py;
+    const float hz = origin[2] + dir[2]*t - pz;
+    const float al2 = ax*ax + ay*ay + az*az;
+    const float bl2 = bx*bx + by*by + bz*bz;
+    if (al2 < 1e-8f || bl2 < 1e-8f) return false;
+    lx = (hx*ax + hy*ay + hz*az) / al2;
+    ly = (hx*bx + hy*by + hz*bz) / bl2;
+    return true;
+}
+
+int RubyQuickViewport::waterHitTestVertex(const QPointF& px, float radiusPx) const {
+    if (m_waterEditObject < 0 || m_waterEditObject >= int(m_scene.objects.size())) return -1;
+    int bestIdx = -1;
+    double bestDist2 = double(radiusPx * radiusPx);
+
+    for (int i = 0; i < int(m_waterEditPoints.size()); ++i) {
+        QPointF s;
+        if (waterLocalToScreen(m_waterEditPoints[i].x, m_waterEditPoints[i].y, s)) {
+            double dx = px.x() - s.x();
+            double dy = px.y() - s.y();
+            double d2 = dx * dx + dy * dy;
+            if (d2 < bestDist2) {
+                bestDist2 = d2;
+                bestIdx = i;
+            }
+        }
+    }
+    return bestIdx;
+}
+
+int RubyQuickViewport::waterHitTestEdge(const QPointF& px, double& hitLx, double& hitLy, float radiusPx) const {
+    if (m_waterEditObject < 0 || m_waterEditObject >= int(m_scene.objects.size())) return -1;
+    if (m_waterEditPoints.size() < 3) return -1;
+
+    float origin[3], dir[3];
+    waterScreenRay(px, origin, dir);
+    double lx = 0, ly = 0;
+    if (!waterRayObjectPlane(origin, dir, lx, ly)) return -1;
+
+    int bestEdge = -1;
+    double bestDist2 = double(radiusPx * radiusPx);
+
+    for (size_t i = 0; i < m_waterEditPoints.size(); ++i) {
+        size_t j = (i + 1) % m_waterEditPoints.size();
+        QPointF s1, s2;
+        if (!waterLocalToScreen(m_waterEditPoints[i].x, m_waterEditPoints[i].y, s1) ||
+            !waterLocalToScreen(m_waterEditPoints[j].x, m_waterEditPoints[j].y, s2))
+            continue;
+
+        double ex = s2.x() - s1.x(), ey = s2.y() - s1.y();
+        double len2 = ex*ex + ey*ey;
+        double t = len2 > 1e-9 ? ((px.x() - s1.x())*ex + (px.y() - s1.y())*ey) / len2 : 0.0;
+        t = std::clamp(t, 0.0, 1.0);
+        double qx = s1.x() + ex * t, qy = s1.y() + ey * t;
+        double d2 = (px.x() - qx)*(px.x() - qx) + (px.y() - qy)*(px.y() - qy);
+        if (d2 < bestDist2) {
+            bestDist2 = d2;
+            bestEdge = int(i);
+        }
+    }
+
+    if (bestEdge >= 0) {
+        size_t j = (bestEdge + 1) % m_waterEditPoints.size();
+        const auto& p1 = m_waterEditPoints[bestEdge];
+        const auto& p2 = m_waterEditPoints[j];
+        double dx = p2.x - p1.x, dy = p2.y - p1.y;
+        double len2 = dx*dx + dy*dy;
+        double t = len2 > 1e-12 ? ((lx - p1.x)*dx + (ly - p1.y)*dy) / len2 : 0.0;
+        t = std::clamp(t, 0.0, 1.0);
+        hitLx = p1.x + dx * t;
+        hitLy = p1.y + dy * t;
+    }
+    return bestEdge;
+}
+
 int RubyQuickViewport::importPrimitiveObject(const QString& typeName) {
     if (!m_hasScene) return -1;
     pushUndoSnapshot();
@@ -3112,6 +4643,8 @@ int RubyQuickViewport::importPrimitiveObject(const QString& typeName) {
     } else if (kind == "Portal") {
         obj = av::scene_build_portal_object(av::scene_fresh_identifier(m_scene), x, y);
         obj.pos_z = z;
+    } else if (kind == "Water" || kind == "WaterMesh" || kind == "Fluid") {
+        return createWaterObject(x, y, 300.0f, 80.0f, QStringLiteral("azure"));
     } else {
         size_t idx = av::scene_create_object(m_scene, "SceneObject");
         if (idx < m_scene.objects.size()) {
@@ -3496,6 +5029,23 @@ bool RubyQuickViewport::beginMeshEdit() {
     meshImport(m_meshEditObject);
     if (m_meshEditPoints.size() < 3) return false;
 
+    // The Zypher look is app-wide state, not per-object: re-read the shared
+    // keys every session so styles set in the Ground Mesh Studio (which writes
+    // them through rubySettings) apply to this edit and vice versa.
+    {
+        QSettings zs;
+        m_zyphHatStyle = zs.value(QStringLiteral("ruby_mobile/zypher_hat"),
+                                  m_zyphHatStyle).toString();
+        m_zyphTopStyle = zs.value(QStringLiteral("ruby_mobile/zypher_top"),
+                                  m_zyphTopStyle).toString();
+        m_zyphFrequency = float(zs.value(QStringLiteral("ruby_mobile/zypher_freq"),
+                                         m_zyphFrequency).toDouble());
+        m_zyphDepth = float(zs.value(QStringLiteral("ruby_mobile/zypher_depth"),
+                                     m_zyphDepth).toDouble());
+        m_zyphMinCollision = float(zs.value(QStringLiteral("ruby_mobile/zypher_mincoll"),
+                                            m_zyphMinCollision).toDouble());
+    }
+
     m_meshSceneSaved = m_scene;
     m_meshSceneSavedValid = true;
     m_meshDirty = false;
@@ -3683,10 +5233,23 @@ bool RubyQuickViewport::regenerateGroundMesh() {
         params.cliff_tex = gm.bottom_texture.empty() ? "graveyard_ground" : gm.bottom_texture;
         params.surface_width = (gm.surface_width > 0 ? gm.surface_width : 100.0);
         params.hat_height = (gm.hat_height > 0 ? static_cast<float>(gm.hat_height) : 20.0f);
-        params.hat_width = (gm.hat_width_offset_1 > 0 ? static_cast<float>(gm.hat_width_offset_1) : 8.0f);
+        // Vanilla's round-hat lateral extent is HatWidthOffset1 + HatWidthOffset2
+        // (P31 + P32). Using offset1 alone generated half the declared shoulder,
+        // which is the "top mesh looks slimmer than vanilla" report.
+        {
+            const double hw_sum = gm.hat_width_offset_1 + gm.hat_width_offset_2;
+            params.hat_width = (hw_sum > 0.0 ? static_cast<float>(hw_sum) : 8.0f);
+        }
         params.texture_scale = m_meshEditTextureScale > 0 ? m_meshEditTextureScale : 250.0f;
         params.fbm_amplitude = 12.0f;
         params.rear_closure = true;
+        // Selectable Zypher look (side + top). Defaults are vanilla shoulder /
+        // plain deck, i.e. exactly the geometry before the pickers existed.
+        params.hat_style = zypher::hat_style_from_id(m_zyphHatStyle.toStdString());
+        params.top_style = zypher::top_style_from_id(m_zyphTopStyle.toStdString());
+        params.top_frequency = m_zyphFrequency;
+        params.top_depth = m_zyphDepth;
+        params.top_min_collision_radius = m_zyphMinCollision;
 
         zypher::ComponentIds ids{
             m_meshEditIds.polygon_id, m_meshEditIds.mesh_id,
@@ -3877,6 +5440,15 @@ bool RubyQuickViewport::liveMeshPreview() {
     if (!m_meshEditActive) return false;
     if (!regenerateGroundMesh()) return false;
     touch_scene(/*geometry_changed=*/true);
+    return true;
+}
+
+bool RubyQuickViewport::refreshMeshEditPreview() {
+    if (!m_meshEditActive) return false;
+    m_meshDirty = true;
+    if (!liveMeshPreview()) return false;
+    emit meshEditVerticesChanged();
+    update();
     return true;
 }
 
@@ -4258,6 +5830,49 @@ QString RubyQuickViewport::getGroundMeshFrontTexture() const {
     return QStringLiteral("maybegood");
 }
 
+bool RubyQuickViewport::zypherActive() const {
+    return boulderx::ground_generator() == boulderx::GroundGenerator::Zypher;
+}
+
+bool RubyQuickViewport::setZypherLook(const QString& hatStyle, const QString& topStyle,
+                                      float frequency, float depth, float minCollisionRadius) {
+    // The look is geometry, not wire data, so it only means something while a
+    // Zypher mesh edit is open: applying it regenerates the preview in place.
+    if (!zypherActive() || !m_meshEditActive) return false;
+    if (!hatStyle.trimmed().isEmpty()) m_zyphHatStyle = hatStyle.trimmed();
+    if (!topStyle.trimmed().isEmpty()) m_zyphTopStyle = topStyle.trimmed();
+    if (frequency > 0.0f)          m_zyphFrequency = frequency;
+    if (depth >= 0.0f)             m_zyphDepth = depth;
+    if (minCollisionRadius >= 0.0f) m_zyphMinCollision = minCollisionRadius;
+    // Persist into the SAME keys rubySettings.getZypherLook() reads, so the
+    // studio's style GUI opens on this editor's current look (and vice versa).
+    {
+        QSettings zs;
+        zs.setValue(QStringLiteral("ruby_mobile/zypher_hat"), m_zyphHatStyle);
+        zs.setValue(QStringLiteral("ruby_mobile/zypher_top"), m_zyphTopStyle);
+        zs.setValue(QStringLiteral("ruby_mobile/zypher_freq"), double(m_zyphFrequency));
+        zs.setValue(QStringLiteral("ruby_mobile/zypher_depth"), double(m_zyphDepth));
+        zs.setValue(QStringLiteral("ruby_mobile/zypher_mincoll"), double(m_zyphMinCollision));
+        zs.sync();
+    }
+    m_meshDirty = true;
+    liveMeshPreview();
+    emit meshEditVerticesChanged();
+    update();
+    return true;
+}
+
+QVariantMap RubyQuickViewport::getZypherLook() const {
+    QVariantMap out;
+    out["active"] = zypherActive();
+    out["hatStyle"] = m_zyphHatStyle;
+    out["topStyle"] = m_zyphTopStyle;
+    out["frequency"] = static_cast<double>(m_zyphFrequency);
+    out["depth"] = static_cast<double>(m_zyphDepth);
+    out["minCollisionRadius"] = static_cast<double>(m_zyphMinCollision);
+    return out;
+}
+
 float RubyQuickViewport::getGroundMeshTextureScale() const {
     if (!m_hasScene || m_selectedObject < 0 || m_selectedObject >= int(m_scene.objects.size())) return 250.0f;
     if (m_meshEditActive && m_meshEditObject == m_selectedObject) {
@@ -4580,7 +6195,7 @@ void RubyQuickViewport::nudgeSelectedMeshVertex(float dx, float dy) {
 }
 
 void RubyQuickViewport::dragSelected(float deltaX, float deltaY, float deltaZ) {
-    if (m_meshEditActive) return; // Completely disabled during mesh edit mode
+    if (m_meshEditActive || m_waterEditActive) return; // Completely disabled during mesh/water edit mode
     if (m_selectedObject < 0 || m_selectedObject >= int(m_scene.objects.size())) return;
     if (!m_isDragTranslating) {
         pushUndoSnapshot();
@@ -4616,7 +6231,7 @@ void RubyQuickViewport::finishDrag() {
 // active mode. A rapid series of taps shares one undo snapshot so a nudge
 // session does not blow away the 25-entry undo stack.
 bool RubyQuickViewport::nudgeSelected(int axis, float steps) {
-    if (m_meshEditActive || m_gizmoMode == 0) return false; // Completely disabled during mesh edit mode
+    if (m_meshEditActive || m_waterEditActive || m_gizmoMode == 0) return false; // Completely disabled during mesh/water edit mode
     if (axis < 0 || axis > 2) return false;
     if (qFuzzyIsNull(steps)) return false;
     if (m_selectedObject < 0 || m_selectedObject >= int(m_scene.objects.size())) return false;
@@ -4641,11 +6256,13 @@ bool RubyQuickViewport::nudgeSelected(int axis, float steps) {
         else                obj.pos_z += steps * kMoveStep;
         break;
 
-    case 2: // Rotate — the .scene format persists Rotation on Y (Tag 6) only;
-            // X/Z are live-preview values that scene_save does not round-trip.
+    case 2: // Rotate — Swordigo Euler coordinates:
+            // axis 0 (X) -> rot_x (pitch)
+            // axis 1 (Y) -> rot_z (yaw around vertical Y)
+            // axis 2 (Z) -> rot_y (roll in 2.5D plane, Tag 6)
         if (axis == 0)      obj.rot_x += steps * kRotateStep;
-        else if (axis == 1) obj.rot_y += steps * kRotateStep;
-        else                obj.rot_z += steps * kRotateStep;
+        else if (axis == 1) obj.rot_z += steps * kRotateStep;
+        else                obj.rot_y += steps * kRotateStep;
         break;
 
     case 3: { // Scale — Tag 7 stores ONE uniform Scaling float, so a nudge is
@@ -4803,11 +6420,78 @@ void RubyQuickViewport::setObjectTemplate(const QString& tmpl) {
     }
 }
 
+// ─── Camera glide (desktop release-velocity parity) ────────────────────────
+//
+// Viewport3DWidget::update_camera_dynamics() lets orbit/pan coast after the
+// drag ends: the gesture keeps the velocity it had at release and decays it
+// exponentially (exp(-8*dt)), so a flick glides to a stop instead of freezing
+// the instant the finger lifts. The touch path had none of that, which is a
+// large part of why it read as stiff next to the desktop edition.
+void RubyQuickViewport::ensureCameraDynamics() {
+    if (!m_camDynamicsTimer) {
+        m_camDynamicsTimer = new QTimer(this);
+        m_camDynamicsTimer->setTimerType(Qt::PreciseTimer);
+        m_camDynamicsTimer->setInterval(16); // ~60 Hz
+        connect(m_camDynamicsTimer, &QTimer::timeout,
+                this, &RubyQuickViewport::updateCameraDynamics);
+    }
+    if (!m_camDynamicsTimer->isActive()) {
+        m_lastCamDynMs = 0; // first tick has no measured dt
+        m_camDynamicsTimer->start();
+    }
+}
+
+void RubyQuickViewport::stopCameraDynamics() {
+    if (m_camDynamicsTimer && m_camDynamicsTimer->isActive())
+        m_camDynamicsTimer->stop();
+    m_lastCamDynMs = 0;
+}
+
+void RubyQuickViewport::updateCameraDynamics() {
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    float dt = 1.0f / 60.0f;
+    if (m_lastCamDynMs > 0 && now > m_lastCamDynMs)
+        dt = std::clamp(float(now - m_lastCamDynMs) / 1000.0f, 1.0f / 240.0f, 0.05f);
+    m_lastCamDynMs = now;
+
+    const float damp = std::exp(-8.0f * dt);
+    bool active = false;
+
+    if (std::abs(m_orbitVelYaw) > 0.01f || std::abs(m_orbitVelPitch) > 0.01f) {
+        m_cameraYaw += m_orbitVelYaw * dt;
+        m_cameraPitch = std::clamp(m_cameraPitch + m_orbitVelPitch * dt, -89.0f, 89.0f);
+        m_orbitVelYaw *= damp;
+        m_orbitVelPitch *= damp;
+        if (std::abs(m_orbitVelYaw) < 0.01f) m_orbitVelYaw = 0.0f;
+        if (std::abs(m_orbitVelPitch) < 0.01f) m_orbitVelPitch = 0.0f;
+        active = true;
+    }
+
+    if (std::abs(m_panVelX) > 1e-3f || std::abs(m_panVelY) > 1e-3f || std::abs(m_panVelZ) > 1e-3f) {
+        m_cameraTarget += QVector3D(m_panVelX * dt, m_panVelY * dt, m_panVelZ * dt);
+        m_panVelX *= damp; m_panVelY *= damp; m_panVelZ *= damp;
+        if (std::abs(m_panVelX) < 1e-3f) m_panVelX = 0.0f;
+        if (std::abs(m_panVelY) < 1e-3f) m_panVelY = 0.0f;
+        if (std::abs(m_panVelZ) < 1e-3f) m_panVelZ = 0.0f;
+        active = true;
+    }
+
+    if (active) {
+        emit cameraChanged();
+        if (m_meshEditActive) emit meshEditVerticesChanged();
+        update();
+    } else {
+        stopCameraDynamics();
+    }
+}
+
 // ─── Touch & Gesture Interaction ───────────────────────────────────────────
 
 void RubyQuickViewport::touchEvent(QTouchEvent* event) {
     const auto& points = event->points();
-    if (event->type() == QEvent::TouchCancel || event->type() == QEvent::TouchEnd || points.isEmpty()) {
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+    const auto settle_mesh_gesture = [this]() {
         if (m_meshEditActive) {
             if (m_meshDragging) {
                 m_meshDragging = false;
@@ -4818,10 +6502,83 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
             }
             m_meshPanning = false;
         }
+        if (m_waterEditActive) {
+            if (m_waterDragging) {
+                m_waterDragging = false;
+                m_waterDragPoint = -1;
+                liveWaterMeshPreview();
+                emit waterEditVerticesChanged();
+                update();
+            }
+            m_waterPanning = false;
+        }
+    };
+
+    const auto reset_touch_state = [this]() {
         m_touchActive = false;
         m_touchMoved = false;
+        m_touchStartedInExclusion = false;
+        m_holdSelectTriggered = false;
+        if (m_holdSelectTimer && m_holdSelectTimer->isActive()) {
+            m_holdSelectTimer->stop();
+        }
         m_lastTouchPointCount = 0;
+        m_gestureMaxPoints = 0;
         m_lastPinchDistance = 0.0;
+    };
+
+    if (event->type() == QEvent::TouchCancel) {
+        settle_mesh_gesture();
+        reset_touch_state();
+        event->accept();
+        return;
+    }
+
+    // A tap is resolved BEFORE the touch state is cleared, because the finger
+    // that just lifted is still in `points` and a tap is precisely the case
+    // where no drag ever started.
+    if (event->type() == QEvent::TouchEnd) {
+        if (m_touchActive && m_gestureMaxPoints <= 1 && !m_touchMoved &&
+            !m_meshEditActive && !m_waterEditActive && m_hasScene && !m_touchStartedInExclusion &&
+            !m_holdSelectTriggered) {
+            const QPointF up = !points.isEmpty() ? points.first().position() : m_lastTouchPos;
+            const float travel = float(std::hypot(up.x() - m_touchDownPos.x(),
+                                                  up.y() - m_touchDownPos.y()));
+            const qint64 dur = (m_touchDownMs > 0) ? (now - m_touchDownMs) : 0;
+            // When holdToSelect is enabled, simple taps do NOT select objects (prevents accidental clicks).
+            // When holdToSelect is disabled, classic tap-to-select operates.
+            if (!m_holdToSelect && dur <= 600 && travel <= 14.0f && !isPointInExclusion(up.x(), up.y())) {
+                const bool doubleTap =
+                    (m_lastTapMs > 0 && (now - m_lastTapMs) <= 300 &&
+                     std::hypot(up.x() - m_lastTapPos.x(), up.y() - m_lastTapPos.y()) <= 48.0f);
+                if (doubleTap) {
+                    const int hit = pickObjectAtInternal(up.x(), up.y(), /*allow_cycle=*/false);
+                    if (hit >= 0) frameObject(hit);
+                    emit objectTapped(hit, true);
+                } else {
+                    const int hit = pickObjectAtInternal(up.x(), up.y(), /*allow_cycle=*/true);
+                    if (hit < 0 && m_selectedObject >= 0) deselectObject();
+                    emit objectTapped(hit, false);
+                }
+                m_lastTapMs = now;
+                m_lastTapPos = up;
+                update();
+            }
+        }
+        settle_mesh_gesture();
+        reset_touch_state();
+        event->accept();
+        // Coast if the gesture was an orbit/pan flick.
+        if (std::abs(m_orbitVelYaw) > 1.0f || std::abs(m_orbitVelPitch) > 1.0f ||
+            std::abs(m_panVelX) > 0.5f || std::abs(m_panVelY) > 0.5f || std::abs(m_panVelZ) > 0.5f) {
+            ensureCameraDynamics();
+        }
+        return;
+    }
+
+    if (points.isEmpty()) {
+        settle_mesh_gesture();
+        reset_touch_state();
         event->accept();
         return;
     }
@@ -4881,17 +6638,101 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
             return;
         }
 
+        if (m_waterEditActive && points.size() == 1) {
+            QPointF pos = points.first().position();
+            int hitVert = waterHitTestVertex(pos, 44.0f);
+            if (hitVert >= 0) {
+                selectWaterVertex(hitVert);
+                m_waterDragging = true;
+                m_waterDragPoint = hitVert;
+
+                float origin[3], dir[3];
+                waterScreenRay(pos, origin, dir);
+                double lx = 0, ly = 0;
+                if (waterRayObjectPlane(origin, dir, lx, ly)) {
+                    m_waterDragOffX = m_waterEditPoints[hitVert].x - lx;
+                    m_waterDragOffY = m_waterEditPoints[hitVert].y - ly;
+                } else {
+                    m_waterDragOffX = 0.0;
+                    m_waterDragOffY = 0.0;
+                }
+                m_touchActive = true;
+                m_lastTouchPointCount = 1;
+                m_lastTouchPos = pos;
+                m_touchStartPos = pos;
+                event->accept();
+                update();
+                return;
+            }
+
+            double hitLx = 0, hitLy = 0;
+            int hitEdge = waterHitTestEdge(pos, hitLx, hitLy, 32.0f);
+            if (hitEdge >= 0) {
+                insertWaterVertex(hitEdge, float(hitLx), float(hitLy));
+                m_waterDragging = true;
+                m_waterDragPoint = hitEdge + 1;
+                m_waterDragOffX = 0.0;
+                m_waterDragOffY = 0.0;
+                m_touchActive = true;
+                m_lastTouchPointCount = 1;
+                m_lastTouchPos = pos;
+                m_touchStartPos = pos;
+                event->accept();
+                update();
+                return;
+            }
+
+            m_waterPanning = true;
+            m_meshPanStartPx = pos;
+            m_meshPanStartTarget = m_cameraTarget;
+            m_lastTouchPos = pos;
+            m_touchStartPos = pos;
+            m_touchActive = true;
+            event->accept();
+            return;
+        }
+
         m_touchActive = true;
         m_touchMoved = false;
         m_touchStartPos = points.first().position();
+        m_touchDownPos = m_touchStartPos;
+        m_touchDownMs = now;
         m_lastTouchPos = m_touchStartPos;
         m_lastTouchPointCount = int(points.size());
+        m_gestureMaxPoints = int(points.size());
         m_lastPinchDistance = (points.size() >= 2) ? QLineF(points[0].position(), points[1].position()).length() : 0.0;
+        m_touchStartedInExclusion = isPointInExclusion(m_touchStartPos.x(), m_touchStartPos.y());
+        m_holdSelectTriggered = false;
+
+        // If holdToSelect is active and not inside exclusion, arm the hold timer (500ms)
+        if (m_holdToSelect && !m_touchStartedInExclusion && !m_meshEditActive && !m_waterEditActive && m_hasScene && points.size() == 1) {
+            if (!m_holdSelectTimer) {
+                m_holdSelectTimer = new QTimer(this);
+                m_holdSelectTimer->setSingleShot(true);
+                connect(m_holdSelectTimer, &QTimer::timeout, this, [this]() {
+                    if (m_touchActive && !m_touchMoved && m_gestureMaxPoints <= 1 && !m_touchStartedInExclusion) {
+                        m_holdSelectTriggered = true;
+                        const int hit = pickObjectAtInternal(m_touchDownPos.x(), m_touchDownPos.y(), /*allow_cycle=*/true);
+                        if (hit < 0 && m_selectedObject >= 0) deselectObject();
+                        emit objectTapped(hit, false);
+                        update();
+                    }
+                });
+            }
+            m_holdSelectTimer->start(500);
+        }
+
+        // A fresh gesture owns the camera: kill any glide still in flight.
+        m_orbitVelYaw = m_orbitVelPitch = 0.0f;
+        m_panVelX = m_panVelY = m_panVelZ = 0.0f;
+        m_lastMoveMs = now;
+        stopCameraDynamics();
         event->accept();
         return;
     }
 
     // TouchUpdate: Detect pointer count transitions and re-anchor without jump
+    m_gestureMaxPoints = std::max(m_gestureMaxPoints, int(points.size()));
     if (int(points.size()) != m_lastTouchPointCount) {
         m_lastTouchPointCount = int(points.size());
         if (points.size() == 1) {
@@ -4943,25 +6784,88 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
             }
         }
 
+        if (m_waterEditActive) {
+            if (m_waterDragging && m_waterDragPoint >= 0 && m_waterDragPoint < int(m_waterEditPoints.size())) {
+                float origin[3], dir[3];
+                waterScreenRay(curPos, origin, dir);
+                double lx = 0, ly = 0;
+                if (waterRayObjectPlane(origin, dir, lx, ly)) {
+                    m_waterEditPoints[m_waterDragPoint].x = lx + m_waterDragOffX;
+                    m_waterEditPoints[m_waterDragPoint].y = ly + m_waterDragOffY;
+                    liveWaterMeshPreview();
+                }
+                event->accept();
+                return;
+            }
+
+            if (m_waterPanning) {
+                QPointF delta = curPos - m_meshPanStartPx;
+                float fovYRad = 45.0f * M_PI / 180.0f;
+                float visibleHeight = 2.0f * m_cameraDistance * std::tan(fovYRad * 0.5f);
+                float worldPerPixel = visibleHeight / std::max(1.0f, float(height()));
+
+                float radYaw = m_cameraYaw * M_PI / 180.0f;
+                QVector3D right(std::cos(radYaw), 0.0f, -std::sin(radYaw));
+                QVector3D up(0.0f, 1.0f, 0.0f);
+
+                m_cameraTarget = m_meshPanStartTarget - right * (delta.x() * worldPerPixel) + up * (delta.y() * worldPerPixel);
+                emit cameraChanged();
+                emit waterEditVerticesChanged();
+                update();
+                event->accept();
+                return;
+            }
+        }
+
         QPointF delta = curPos - m_lastTouchPos;
         float moveDist = std::hypot(delta.x(), delta.y());
 
         if (moveDist < 300.0f) { // reject erratic jump
-            if (std::hypot(curPos.x() - m_touchStartPos.x(), curPos.y() - m_touchStartPos.y()) > 10.0f) {
+            if (std::hypot(curPos.x() - m_touchStartPos.x(), curPos.y() - m_touchStartPos.y()) > 8.0f) {
                 m_touchMoved = true;
+                if (m_holdSelectTimer && m_holdSelectTimer->isActive()) {
+                    m_holdSelectTimer->stop();
+                }
             }
 
+            // If the finger was placed on a HUD button (Dpad, gizmo, Z+/-), reject moving the 3D scene camera!
+            if (m_touchStartedInExclusion) {
+                m_lastTouchPos = curPos;
+                event->accept();
+                return;
+            }
+
+            float dt = 1.0f / 60.0f;
+            if (m_lastMoveMs > 0 && now > m_lastMoveMs)
+                dt = std::clamp(float(now - m_lastMoveMs) / 1000.0f, 1.0f / 240.0f, 0.05f);
+            m_lastMoveMs = now;
+
             if (m_cameraMode == CameraModeGameView) {
-                // Game View 2.5D: 1-finger drag pans level along X and Y
+                // Game View 2.5D: 1-finger drag pans the level along X and Y.
                 float fovYRad = 45.0f * M_PI / 180.0f;
                 float visibleHeight = 2.0f * m_cameraDistance * std::tan(fovYRad * 0.5f);
                 float worldPerPixel = visibleHeight / std::max(1.0f, float(height()));
-                m_cameraTarget.setX(m_cameraTarget.x() - delta.x() * worldPerPixel);
-                m_cameraTarget.setY(m_cameraTarget.y() + delta.y() * worldPerPixel);
+                const float stepX = float(-delta.x() * worldPerPixel);
+                const float stepY = float( delta.y() * worldPerPixel);
+                m_cameraTarget.setX(m_cameraTarget.x() + stepX);
+                m_cameraTarget.setY(m_cameraTarget.y() + stepY);
+                m_panVelX = 0.6f * (stepX / dt) + 0.4f * m_panVelX;
+                m_panVelY = 0.6f * (stepY / dt) + 0.4f * m_panVelY;
+                m_panVelZ = 0.0f;
             } else {
-                // 3D Edit Mode: 1-finger drag orbits yaw and pitch
-                m_cameraYaw += delta.x() * 0.35f;
-                m_cameraPitch = std::clamp(m_cameraPitch - float(delta.y() * 0.35f), -85.0f, 85.0f);
+                // 3D Edit: 1-finger drag orbits. Desktop uses 0.5 deg/px; 0.45
+                // keeps a full-width swipe near a full turn on a phone while
+                // staying controllable. Pitch clamps at 89 like the desktop.
+                constexpr float kOrbitDegPerPx = 0.45f;
+                const float dyaw = float(delta.x()) * kOrbitDegPerPx;
+                const float dpitch = float(-delta.y()) * kOrbitDegPerPx;
+                m_cameraYaw += dyaw;
+                m_cameraPitch = std::clamp(m_cameraPitch + dpitch, -89.0f, 89.0f);
+                // Release velocity, exponentially smoothed like the desktop.
+                m_orbitVelYaw = std::clamp(0.6f * (dyaw / dt) + 0.4f * m_orbitVelYaw,
+                                           -720.0f, 720.0f);
+                m_orbitVelPitch = std::clamp(0.6f * (dpitch / dt) + 0.4f * m_orbitVelPitch,
+                                             -720.0f, 720.0f);
             }
             emit cameraChanged();
             update();
@@ -4972,6 +6876,17 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
         m_touchMoved = true;
         const auto& p1 = points[0];
         const auto& p2 = points[1];
+
+        // If either finger is touching a HUD control (D-pad, Z buttons, etc.), suppress camera pan/pinch!
+        if (m_touchStartedInExclusion ||
+            isPointInExclusion(p1.position().x(), p1.position().y()) ||
+            isPointInExclusion(p2.position().x(), p2.position().y())) {
+            m_lastTouchPos = (p1.position() + p2.position()) * 0.5;
+            m_lastPinchDistance = QLineF(p1.position(), p2.position()).length();
+            event->accept();
+            return;
+        }
+
         qreal dist = QLineF(p1.position(), p2.position()).length();
         QPointF center = (p1.position() + p2.position()) * 0.5;
 
@@ -4989,20 +6904,33 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
             float visibleHeight = 2.0f * m_cameraDistance * std::tan(fovYRad * 0.5f);
             float worldPerPixel = visibleHeight / std::max(1.0f, float(height()));
 
+            float dt = 1.0f / 60.0f;
+            if (m_lastMoveMs > 0 && now > m_lastMoveMs)
+                dt = std::clamp(float(now - m_lastMoveMs) / 1000.0f, 1.0f / 240.0f, 0.05f);
+            m_lastMoveMs = now;
+
+            QVector3D step;
             if (m_cameraMode == CameraMode3DEdit) {
-                float radYaw = m_cameraYaw * M_PI / 180.0f;
-                QVector3D right(std::cos(radYaw), 0.0f, -std::sin(radYaw));
-                QVector3D up(0.0f, 1.0f, 0.0f);
-                m_cameraTarget -= right * (delta.x() * worldPerPixel);
-                m_cameraTarget += up * (delta.y() * worldPerPixel);
+                // Screen-parallel pan in the camera's own Right/Up basis,
+                // including the pitch term (desktop parity). The old code used
+                // world-up, so a pan in a pitched view slid the scene diagonally.
+                float right[3], up[3];
+                camera_pan_basis(m_cameraYaw, m_cameraPitch, right, up);
+                step = QVector3D(right[0], right[1], right[2]) * float(-delta.x() * worldPerPixel)
+                     + QVector3D(up[0], up[1], up[2]) * float(delta.y() * worldPerPixel);
             } else {
-                m_cameraTarget.setX(m_cameraTarget.x() - delta.x() * worldPerPixel);
-                m_cameraTarget.setY(m_cameraTarget.y() + delta.y() * worldPerPixel);
+                step = QVector3D(float(-delta.x() * worldPerPixel),
+                                 float( delta.y() * worldPerPixel), 0.0f);
             }
+            m_cameraTarget += step;
+            m_panVelX = 0.6f * (step.x() / dt) + 0.4f * m_panVelX;
+            m_panVelY = 0.6f * (step.y() / dt) + 0.4f * m_panVelY;
+            m_panVelZ = 0.6f * (step.z() / dt) + 0.4f * m_panVelZ;
         }
         m_lastTouchPos = center;
         emit cameraChanged();
         if (m_meshEditActive) emit meshEditVerticesChanged();
+        if (m_waterEditActive) emit waterEditVerticesChanged();
         update();
         event->accept();
     }
@@ -5010,6 +6938,10 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
 
 void RubyQuickViewport::mousePressEvent(QMouseEvent* event) {
     if (m_touchActive) {
+        event->ignore();
+        return;
+    }
+    if (isPointInExclusion(event->position().x(), event->position().y())) {
         event->ignore();
         return;
     }
@@ -5051,6 +6983,49 @@ void RubyQuickViewport::mousePressEvent(QMouseEvent* event) {
         }
 
         m_meshPanning = true;
+        m_meshPanStartPx = pos;
+        m_meshPanStartTarget = m_cameraTarget;
+        event->accept();
+        return;
+    }
+
+    if (m_waterEditActive) {
+        QPointF pos = event->position();
+        int hitVert = waterHitTestVertex(pos, 44.0f);
+        if (hitVert >= 0) {
+            selectWaterVertex(hitVert);
+            m_waterDragging = true;
+            m_waterDragPoint = hitVert;
+
+            float origin[3], dir[3];
+            waterScreenRay(pos, origin, dir);
+            double lx = 0, ly = 0;
+            if (waterRayObjectPlane(origin, dir, lx, ly)) {
+                m_waterDragOffX = m_waterEditPoints[hitVert].x - lx;
+                m_waterDragOffY = m_waterEditPoints[hitVert].y - ly;
+            } else {
+                m_waterDragOffX = 0.0;
+                m_waterDragOffY = 0.0;
+            }
+            event->accept();
+            update();
+            return;
+        }
+
+        double hitLx = 0, hitLy = 0;
+        int hitEdge = waterHitTestEdge(pos, hitLx, hitLy, 32.0f);
+        if (hitEdge >= 0) {
+            insertWaterVertex(hitEdge, float(hitLx), float(hitLy));
+            m_waterDragging = true;
+            m_waterDragPoint = hitEdge + 1;
+            m_waterDragOffX = 0.0;
+            m_waterDragOffY = 0.0;
+            event->accept();
+            update();
+            return;
+        }
+
+        m_waterPanning = true;
         m_meshPanStartPx = pos;
         m_meshPanStartTarget = m_cameraTarget;
         event->accept();
@@ -5105,6 +7080,40 @@ void RubyQuickViewport::mouseMoveEvent(QMouseEvent* event) {
         }
     }
 
+    if (m_waterEditActive) {
+        QPointF pos = event->position();
+        if (m_waterDragging && m_waterDragPoint >= 0 && m_waterDragPoint < int(m_waterEditPoints.size())) {
+            float origin[3], dir[3];
+            waterScreenRay(pos, origin, dir);
+            double lx = 0, ly = 0;
+            if (waterRayObjectPlane(origin, dir, lx, ly)) {
+                m_waterEditPoints[m_waterDragPoint].x = lx + m_waterDragOffX;
+                m_waterEditPoints[m_waterDragPoint].y = ly + m_waterDragOffY;
+                liveWaterMeshPreview();
+            }
+            event->accept();
+            return;
+        }
+
+        if (m_waterPanning) {
+            QPointF delta = pos - m_meshPanStartPx;
+            float fovYRad = 45.0f * M_PI / 180.0f;
+            float visibleHeight = 2.0f * m_cameraDistance * std::tan(fovYRad * 0.5f);
+            float worldPerPixel = visibleHeight / std::max(1.0f, float(height()));
+
+            float radYaw = m_cameraYaw * M_PI / 180.0f;
+            QVector3D right(std::cos(radYaw), 0.0f, -std::sin(radYaw));
+            QVector3D up(0.0f, 1.0f, 0.0f);
+
+            m_cameraTarget = m_meshPanStartTarget - right * (delta.x() * worldPerPixel) + up * (delta.y() * worldPerPixel);
+            emit cameraChanged();
+            emit waterEditVerticesChanged();
+            update();
+            event->accept();
+            return;
+        }
+    }
+
     if (m_isDragging) {
         QPointF delta = event->position() - m_lastTouchPos;
         if (std::hypot(event->position().x() - m_touchStartPos.x(), event->position().y() - m_touchStartPos.y()) > 8.0f) {
@@ -5136,6 +7145,17 @@ void RubyQuickViewport::mouseReleaseEvent(QMouseEvent* event) {
             update();
         }
         m_meshPanning = false;
+        event->accept();
+        return;
+    }
+    if (m_waterEditActive) {
+        if (m_waterDragging) {
+            m_waterDragging = false;
+            m_waterDragPoint = -1;
+            liveWaterMeshPreview();
+            update();
+        }
+        m_waterPanning = false;
         event->accept();
         return;
     }

@@ -1,5 +1,14 @@
 # Caver GUI Core Framework Documentation
 
+> **Accuracy note (2026-10):** the class hierarchy below is correct (verified against
+> RTTI and the 1.4.13 decompilation), but the code snippets in `gui_stack/*.md` use
+> invented APIs (`setNinePatchMargins`, `GUIImageView`, `ctx->drawColoredQuad`,
+> `setFont("default",16)`). Use these instead:
+> - [`layout_reference.md`](layout_reference.md) — per-screen sprites + real geometry
+> - [`data_driven_gui_design.md`](data_driven_gui_design.md) — how to extend/author GUI
+> - [`docs/sre13/GUIView.md`](../../sre13/GUIView.md) & siblings — field offsets, vtable slots, addresses
+> - `Caver::GameInterfaceBuilder` — the actual styled-widget factory
+
 ## 1. System Overview & Purpose
 
 Swordigo implements a complete custom 2D object-oriented GUI framework. It handles UI hierarchy layout (`GUIWindow`, `GUIView`), touch event responder chain propagation (`GUIResponder`), interactive controls (`GUIButton`, `GUISlider`, `GUISwitch`), auto-layout margins (`GUIViewLayout`, `GUIMargins`), scrollable lists (`GUIScrollView`), and text bubble popups (`GUITextBubble`).

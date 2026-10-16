@@ -359,6 +359,19 @@ Item {
                     }
                 }
 
+                SettingRow {
+                    title: qsTr("Hold to Select Objects")
+                    description: qsTr("Require a deliberate 0.5s press-and-hold on entities to select them in the 3D scene, preventing accidental taps")
+                    leadingIcon: "hand"
+                    hasSwitch: true
+                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.holdToSelect : false
+                    onCheckedChanged: {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.holdToSelect = checked;
+                        }
+                    }
+                }
+
                 // Which generator rebuilds a ground mesh when a mesh edit is
                 // committed. Applies to the next regeneration, not the next
                 // launch. BoulderX is Caver-faithful (concave outlines, arcs,

@@ -5,6 +5,7 @@
 #include <QMatrix4x4>
 #include <QVector3D>
 #include <QPointF>
+#include <QRectF>
 #include <QVariantList>
 #include <QVariantMap>
 #include <vector>
@@ -21,6 +22,8 @@
 #include "tools/roller.h"     // zypher::generate_terrain_object() — Gen 3 modern generator
 #include "ruby/viewport/ruby_gizmo.h"
 #include "ruby/viewport/ruby_picking.h"
+
+class QTimer;
 
 namespace ruby::android {
 
@@ -174,8 +177,22 @@ public:
     Q_PROPERTY(QString groundGeneratorStatus READ groundGeneratorStatus
                    NOTIFY groundGeneratorStatusChanged)
 
+    Q_PROPERTY(bool holdToSelect READ holdToSelect WRITE setHoldToSelect NOTIFY holdToSelectChanged)
+    Q_PROPERTY(bool isSelectedWater READ isSelectedWater NOTIFY selectedWaterChanged)
+    Q_PROPERTY(bool waterEditActive READ waterEditActive NOTIFY waterEditActiveChanged)
+    Q_PROPERTY(bool canWaterMeshEdit READ canWaterMeshEdit NOTIFY selectedWaterChanged)
+    Q_PROPERTY(int selectedWaterVertex READ selectedWaterVertex NOTIFY selectedWaterVertexChanged)
+    Q_PROPERTY(int waterVertexCount READ waterVertexCount NOTIFY waterEditVerticesChanged)
+
     bool meshEditActive() const { return m_meshEditActive; }
     bool canMeshEdit() const;
+    bool holdToSelect() const { return m_holdToSelect; }
+    void setHoldToSelect(bool val);
+    bool isSelectedWater() const;
+    bool waterEditActive() const { return m_waterEditActive; }
+    bool canWaterMeshEdit() const;
+    int selectedWaterVertex() const { return m_selectedWaterVertex; }
+    int waterVertexCount() const { return int(m_waterEditPoints.size()); }
     int selectedMeshVertex() const { return m_selectedMeshVertex; }
     int meshVertexCount() const { return int(m_meshEditPoints.size()); }
     QString groundGeneratorStatus() const { return m_groundGeneratorStatus; }
@@ -184,6 +201,10 @@ public:
     Q_INVOKABLE bool beginMeshEdit();
     Q_INVOKABLE bool applyMeshEdit();
     Q_INVOKABLE void discardMeshEdit();
+    /// Re-runs the open mesh edit's generation path with the CURRENT generator
+    /// choice and look. Called by the Boulder/Zenith/Zypher mode pill so a
+    /// switch shows new geometry immediately instead of at the next commit.
+    Q_INVOKABLE bool refreshMeshEditPreview();
     Q_INVOKABLE QVariantList getMeshEditVertices() const;
     Q_INVOKABLE void moveMeshVertex(int index, float worldDx, float worldDy);
     Q_INVOKABLE void insertMeshVertex(int edgeIndex, float worldX, float worldY);
@@ -233,6 +254,16 @@ public:
     Q_INVOKABLE QString getGroundMeshFrontTexture() const;
     Q_INVOKABLE float getGroundMeshTextureScale() const;
 
+    // ── Zypher look (side + top style) ──────────────────────────────────────
+    // Zypher is a non-vanilla MeshType, so unlike the engine's one hardcoded
+    // ground look it can offer selectable ones: a shoulder profile ("hat") and a
+    // deck relief ("top"). These apply while a mesh edit is open on a Zypher
+    // ground object — the pickers live in the mesh-edit side panel.
+    Q_INVOKABLE bool zypherActive() const;
+    Q_INVOKABLE bool setZypherLook(const QString& hatStyle, const QString& topStyle,
+                                   float frequency, float depth, float minCollisionRadius);
+    Q_INVOKABLE QVariantMap getZypherLook() const;
+
     // Continuous hybrid joystick / touch drag for selected object
     Q_INVOKABLE void dragSelected(float deltaX, float deltaY, float deltaZ);
     Q_INVOKABLE void finishDrag();
@@ -264,10 +295,13 @@ public:
     Q_INVOKABLE void deleteCurrentObject();
     Q_INVOKABLE void frameScene();
     Q_INVOKABLE int pickObjectAt(float x, float y);
+    /// Frame the object in the camera and select it.
+    Q_INVOKABLE void frameObject(int idx);
     Q_INVOKABLE QVariantMap getCameraState() const;
     Q_INVOKABLE void setCameraState(const QVariantMap& state);
-
-    // ── Asset & Archetype Library Discovery ─────────────────────────────────
+    Q_INVOKABLE void clearTouchExclusionRects();
+    Q_INVOKABLE void addTouchExclusionRect(float x, float y, float width, float height);
+    bool isPointInExclusion(float x, float y) const;
     Q_INVOKABLE QVariantList getAvailableLibraries();
     Q_INVOKABLE QVariantList getTemplatesInLibrary(const QString& sclPathOrName);
     Q_INVOKABLE QVariantList getAvailableModels();
@@ -276,6 +310,23 @@ public:
     Q_INVOKABLE int importModelObject(const QString& podPathOrStem);
     Q_INVOKABLE int importTemplateObject(const QString& sclPathOrName, const QString& templateName);
     Q_INVOKABLE int importPrimitiveObject(const QString& typeName);
+    Q_INVOKABLE QVariantMap getSelectedWaterProperties() const;
+    Q_INVOKABLE bool setSelectedWaterProperties(const QVariantMap& props);
+    Q_INVOKABLE bool setWaterPreset(const QString& presetName);
+    Q_INVOKABLE int createWaterObject(float x = 0.0f, float y = 0.0f, float width = 300.0f, float height = 80.0f, const QString& preset = QStringLiteral("azure"));
+    Q_INVOKABLE bool beginWaterMeshEdit();
+    Q_INVOKABLE bool applyWaterMeshEdit();
+    Q_INVOKABLE void discardWaterMeshEdit();
+    Q_INVOKABLE QVariantList getWaterEditVertices() const;
+    Q_INVOKABLE void moveWaterVertex(int index, float worldDx, float worldDy);
+    Q_INVOKABLE void insertWaterVertex(int edgeIndex, float worldX = 0, float worldY = 0);
+    Q_INVOKABLE void deleteWaterVertex(int index);
+    Q_INVOKABLE void selectWaterVertex(int index);
+    Q_INVOKABLE void selectNextWaterVertex();
+    Q_INVOKABLE void selectPrevWaterVertex();
+    Q_INVOKABLE void nudgeSelectedWaterVertex(float dx, float dy);
+    Q_INVOKABLE void resetWaterEditToRect();
+    Q_INVOKABLE bool liveWaterMeshPreview();
 
     int cameraMode() const { return m_cameraMode; }
     bool isGameView() const { return m_cameraMode == CameraModeGameView; }
@@ -304,7 +355,14 @@ signals:
     void cameraChanged();
     void navStepChanged();
     void gizmoModeChanged();
+    void holdToSelectChanged();
     void selectedObjectChanged();
+    void selectedWaterChanged();
+    void selectedWaterPropertiesChanged();
+    /// A touch tap picked (index >= 0) or cleared (index < 0) the selection.
+    /// `doubleTap` is true for the second tap, which additionally framed the
+    /// object. QML uses this purely for haptics/toast.
+    void objectTapped(int index, bool doubleTap);
     void sceneLoaded();
     void modelLoaded();
     void undoStateChanged();
@@ -322,6 +380,9 @@ signals:
     void meshEditActiveChanged();
     void meshEditVerticesChanged();
     void selectedMeshVertexChanged();
+    void waterEditActiveChanged();
+    void waterEditVerticesChanged();
+    void selectedWaterVertexChanged();
     void groundGeneratorStatusChanged();
     void groundReliefChanged();
     void isSceneLoadingChanged();
@@ -339,6 +400,16 @@ private:
 
     void pushUndoSnapshot();
     void markDirty(bool dirty);
+
+    // Camera glide after a touch release (desktop parity). `update` applies the
+    // stored velocities with exponential damping; `ensure` lazily creates and
+    // starts the 60 Hz timer, `stop` parks it. See the .cpp for the policy.
+    void ensureCameraDynamics();
+    void updateCameraDynamics();
+    void stopCameraDynamics();
+    // Picking entry point. `allow_cycle` is what keeps a double-tap from
+    // rotating through overlapping candidates on its second tap.
+    int pickObjectAtInternal(float x, float y, bool allow_cycle);
     void validateAndRepairScene();
     void meshImport(int idx);
 
@@ -415,6 +486,19 @@ private:
     // a flatten.
     std::vector<double> m_meshEditVanillaFrontZ;
     std::vector<double> m_meshEditVanillaBackZ;
+
+    // Zypher look choice, applied whenever a Zypher terrain object is
+    // regenerated. The defaults (Vanilla / Flat) reproduce the old geometry
+    // exactly, so an untouched editor emits byte-identical meshes. Loaded from
+    // the shared ruby_mobile/zypher_* QSettings keys at mesh-edit start and
+    // written back by setZypherLook(), so the studio's style GUI and this
+    // editor stay in step (see ruby_settings_bridge.h, zypher_look).
+    QString m_zyphHatStyle = QStringLiteral("vanilla");
+    // Flat ("plain") is the shipped default top look.
+    QString m_zyphTopStyle = QStringLiteral("plain");
+    float   m_zyphFrequency = 6.0f;
+    float   m_zyphDepth = 14.0f;
+    float   m_zyphMinCollision = 8.0f;
     uint32_t m_meshEditReliefSeed = 0;
     // Advances on each "randomise" so repeated taps give different terrain while
     // an explicit seed stays reproducible.
@@ -444,6 +528,30 @@ private:
     QPointF m_meshPanStartPx;
     QVector3D m_meshPanStartTarget{0.0f, 0.0f, 0.0f};
     qint64 m_lastMeshPreviewMs = 0;
+
+    // Water mesh edit session state and touch tracking
+    bool m_waterEditActive = false;
+    int m_waterEditObject = -1;
+    int m_selectedWaterVertex = -1;
+    std::vector<boulder::PolygonPoint> m_waterEditPoints;
+    bool m_waterDragging = false;
+    int m_waterDragPoint = -1;
+    double m_waterDragOffX = 0.0;
+    double m_waterDragOffY = 0.0;
+    bool m_waterPanning = false;
+    av::SceneData m_waterSceneSaved;
+    bool m_waterSceneSavedValid = false;
+    float m_waterSavedCamPitch = 0.0f;
+    float m_waterSavedCamYaw = 0.0f;
+    float m_waterSavedCamDistance = 800.0f;
+    QVector3D m_waterSavedCamTarget{0.0f, 0.0f, 0.0f};
+    bool m_waterSavedCamValid = false;
+
+    bool waterLocalToScreen(double lx, double ly, QPointF& out) const;
+    bool waterScreenRay(const QPointF& px, float origin[3], float dir[3]) const;
+    bool waterRayObjectPlane(const float origin[3], const float dir[3], double& lx, double& ly) const;
+    int waterHitTestVertex(const QPointF& px, float radiusPx = 48.0f) const;
+    int waterHitTestEdge(const QPointF& px, double& hitLx, double& hitLy, float radiusPx = 28.0f) const;
 
     int m_gizmoMode = 0; // 0=Off/View, 1=Move, 2=Rotate, 3=Scale
     int m_selectedObject = -1;
@@ -506,7 +614,42 @@ private:
     bool m_touchMoved = false;
     bool m_touchActive = false;
     int m_lastTouchPointCount = 0;
+    int m_gestureMaxPoints = 0;
     qreal m_lastPinchDistance = 0.0;
+
+    // ── Tap / double-tap selection (desktop single-click parity) ────────────
+    // A touch that neither travels nor lingers is a tap: it picks the object
+    // under the finger exactly like a desktop left click. A second tap within
+    // the double-tap window frames that object instead of re-picking — picking
+    // already cycles overlapping candidates, so re-picking would select
+    // something the user never aimed at.
+    QPointF m_touchDownPos;
+    qint64 m_touchDownMs = 0;
+    qint64 m_lastTapMs = 0;
+    QPointF m_lastTapPos;
+    // ── Touch Exclusion Regions & Hold-to-select ───────────────────────────
+    std::vector<QRectF> m_touchExclusionRects;
+    bool m_holdToSelect = false;
+    bool m_touchStartedInExclusion = false;
+    QTimer* m_holdSelectTimer = nullptr;
+    bool m_holdSelectTriggered = false;
+    QTimer* m_waterAnimTimer = nullptr;
+
+    bool wireframeMode() const;
+    void updateWaterAnimationState();
+
+    // ── Camera inertia (desktop release-velocity glide) ─────────────────────
+    // Orbit/pan keep the velocity measured at release and coast with
+    // exponential damping, so a flick keeps gliding instead of stopping dead
+    // the instant the finger lifts.
+    float m_orbitVelYaw = 0.0f;   // deg/s
+    float m_orbitVelPitch = 0.0f; // deg/s
+    float m_panVelX = 0.0f;       // world units/s
+    float m_panVelY = 0.0f;
+    float m_panVelZ = 0.0f;
+    QTimer* m_camDynamicsTimer = nullptr;
+    qint64 m_lastCamDynMs = 0;
+    qint64 m_lastMoveMs = 0;
 
     // Timestamp of the last gizmo-pad nudge, used to coalesce a rapid series
     // of taps into a single undo snapshot.

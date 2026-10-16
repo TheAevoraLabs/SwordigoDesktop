@@ -81,6 +81,37 @@ struct TerrainNode {
     double noise_scale = 1.0;  ///< Local fBm amplitude multiplier (1 = default)
 };
 
+// ── Selectable ground-mesh looks ─────────────────────────────────────────
+//
+// Zypher is a non-vanilla MeshType, so the engine's single hardcoded look is
+// not a contract it has to honour. The Caver generator splits the same job
+// three ways — GeneratePlainSurfaceWithHatGaps (the walkable deck),
+// GenerateSurfaceMeshWithRoundHat + InsertRoundHatVertices (the rounded lip)
+// and GenerateFrontMesh (the visible face) — and these two axes mirror that
+// split so a modder can pick the silhouette and the surface separately.
+//
+// HatStyle = the "side": the cross-section swept over the deck rim.
+// TopStyle = the "top": the relief applied across the walkable deck itself.
+enum class HatStyle {
+    Vanilla,  ///< The engine's round hat: two insets then a drop (default)
+    Curvy,    ///< Smooth quarter-circle fillet
+    Plain,    ///< Straight chamfer
+    ZigZag,   ///< Saw-toothed lip
+    None,     ///< No lip at all — a bare deck edge
+};
+
+enum class TopStyle {
+    Plain,   ///< Flat deck (one quad per walkable edge)
+    Spikey,  ///< Conical spikes; collision covers half their height
+    Porous,  ///< Recessed pits; never adds collision
+    Bubbly,  ///< Rounded domes; small pentagonal collision bumps (default)
+};
+
+const char* hat_style_id(HatStyle s);
+HatStyle    hat_style_from_id(const std::string& id);
+const char* top_style_id(TopStyle s);
+TopStyle    top_style_from_id(const std::string& id);
+
 // ── Terrain subsystem parameters ─────────────────────────────────────────
 struct TerrainParams {
     BevelProfile bevel      = BevelProfile::SmoothFillet;
@@ -96,6 +127,16 @@ struct TerrainParams {
     float  worley_blend     = 0.20f;  ///< Worley noise blend ratio
     float  alpha_for_hull   = 0.0f;   ///< 0 = convex hull for collision; >0 = alpha-shape
     float  texture_scale    = 250.0f; ///< UV scale for texture tiling
+
+    // ── Selectable looks (see HatStyle / TopStyle above) ──────────────────
+    HatStyle hat_style = HatStyle::Vanilla;  ///< Rim/shoulder silhouette
+    // Bubbly, not Plain: a Plain deck is a single flat quad, so an object made
+    // with the stock parameters reads as "no mesh" because there is nothing on
+    // the top to see. The default look should actually be a mesh.
+    TopStyle top_style = TopStyle::Plain;    ///< Deck relief (default: Flat)
+    float  top_frequency = 6.0f;   ///< Features per 100 world units (spacing = 100/freq)
+    float  top_depth     = 14.0f;  ///< Feature height (Spikey/Bubbly) or pit depth (Porous)
+    float  top_min_collision_radius = 8.0f; ///< Below this a feature casts no collision
     std::string surface_tex = "fire_grass";       ///< Top/walkable surface
     std::string cliff_tex   = "graveyard_ground"; ///< Cliff/front face
     uint32_t seed           = 0xDEADBEEFu;

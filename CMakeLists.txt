@@ -611,6 +611,7 @@ if (BUILD_TESTING)
         tests/ground_mesh_studio_test.cpp
         ${SRC_DIR}/ruby/tools/ground_mesh_studio.cpp
         ${SRC_DIR}/tools/boulderx.cpp
+        ${SRC_DIR}/tools/roller.cpp
         ${SRC_DIR}/ruby/core/project_context.cpp)
     set_target_properties(ground_mesh_studio_test PROPERTIES AUTOMOC ON)
     target_include_directories(ground_mesh_studio_test PRIVATE ${SRC_DIR})

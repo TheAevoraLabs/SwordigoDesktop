@@ -57,5 +57,8 @@
         <file>qml/views/CodeEditorView.qml</file>
         <file>qml/views/ToolsView.qml</file>
         <file>qml/views/SettingsView.qml</file>
+        <file>qml/components/MeshStyleBar.qml</file>
+        <file>qml/components/BubbleStepper.qml</file>
+        <file>qml/components/WaterMeshStudioPanel.qml</file>
     </qresource>
 </RCC>

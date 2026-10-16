@@ -10,6 +10,7 @@
 
 #include "tools/zypher_math.h"
 #include "tools/roller.h"
+#include "platform/protobuf_reader.h"
 
 #include <cassert>
 #include <cmath>
@@ -217,6 +218,220 @@ static void test_terrain() {
     CHECK(area > 0.0);
 }
 
+// A regenerated object must not grow when it is read back.
+//
+// The GroundMeshGenerator used to be emitted from the mesh AABB, so mesh_import
+// read that back as SurfaceWidth, derived a per-node depth of half the whole
+// plate, and extruded a slab that size — and every edit grew it again (measured
+// on thecave_part15 risingGround: XY span 1126 -> 3434, Z span 180 -> 2369 after
+// three re-imports). Emitting the generator's own inputs fixes it; this pins
+// that, because a regression here is invisible until a user edits an object
+// twice and is exactly the "sometimes the mesh is absurdly oversized" report.
+// Pull GroundMeshGenerator field 8 (SurfaceWidth) out of an emitted scene blob:
+// scene{field1=object}, object{repeated field3=component},
+// component{field1="GroundMeshGenerator", field112=generator}, generator{field8}.
+static bool emitted_generator_surface_width(const std::string& blob, double& out) {
+    proto::Reader scene(blob);
+    proto::Field f;
+    while (scene.read_field(f)) {
+        if (f.field_number != 1 || f.wire_type != proto::WIRE_LEN) continue;
+        proto::Reader obj(f.bytes_val);
+        proto::Field of;
+        while (obj.read_field(of)) {
+            if (of.field_number != 3 || of.wire_type != proto::WIRE_LEN) continue;
+            proto::Reader comp(of.bytes_val);
+            proto::Field cf;
+            bool is_gen = false;
+            std::string gen_bytes;
+            while (comp.read_field(cf)) {
+                if (cf.field_number == 1 && cf.wire_type == proto::WIRE_LEN &&
+                    cf.bytes_val == "GroundMeshGenerator")
+                    is_gen = true;
+                else if (cf.field_number == 112 && cf.wire_type == proto::WIRE_LEN)
+                    gen_bytes = cf.bytes_val;
+            }
+            if (!is_gen || gen_bytes.empty()) continue;
+            proto::Reader gen(gen_bytes);
+            proto::Field gf;
+            while (gen.read_field(gf))
+                if (gf.field_number == 8 && gf.wire_type == proto::WIRE_I32) {
+                    out = gf.float_val;
+                    return true;
+                }
+        }
+    }
+    return false;
+}
+
+static void test_terrain_roundtrip_stability() {
+    std::vector<zypher::TerrainNode> nodes = {
+        {-300, -100, 0, 45, -45},
+        { 300, -100, 0, 45, -45},
+        { 300,  100, 0, 45, -45},
+        {-300,  100, 0, 45, -45},
+    };
+    zypher::TerrainParams p;
+    p.surface_width = 90.0;
+    p.hat_height = 25.0f;
+    p.hat_width = 5.0f;
+    p.texture_scale = 250.0f;
+
+    // Mirror mesh_import: the per-node planes come from the generator law, so a
+    // SurfaceWidth that is really the AABB is what poisons the next generate.
+    auto set_depths = [&](double sw) {
+        for (auto& n : nodes) { n.front_depth = sw * 0.5; n.back_depth = -sw * 0.5; }
+    };
+    set_depths(p.surface_width);
+    auto a = zypher::generate_terrain(nodes, p);
+    CHECK(a.ok);
+    // The emitted parameter IS the input, not the mesh bounds.
+    CHECK(std::fabs(a.gen_surface_width - 90.0) < 1e-6);
+    CHECK(std::fabs(a.gen_hat_height - 25.0) < 1e-6);
+    CHECK(std::fabs((double)a.tex_scale - 250.0) < 1e-6);
+
+    // And the EMITTED object actually carries it: parse the bytes back out so a
+    // regression in emit_scene_object (which writes the field) is caught too.
+    {
+        const std::string blob = zypher::generate_terrain_object(nodes, p, "stability", nullptr);
+        CHECK(!blob.empty());
+        double sw = 0;
+        CHECK(emitted_generator_surface_width(blob, sw));
+        CHECK(std::fabs(sw - 90.0) < 1e-4);
+    }
+
+    zypher::TerrainParams p2 = p;
+    p2.surface_width = a.gen_surface_width;
+    p2.hat_height = static_cast<float>(a.gen_hat_height);
+    set_depths(p2.surface_width);
+    auto b = zypher::generate_terrain(nodes, p2);
+    CHECK(b.ok);
+    CHECK(std::fabs(b.aabb_w - a.aabb_w) < 1e-3);
+    CHECK(std::fabs(b.aabb_h - a.aabb_h) < 1e-3);
+    CHECK(std::fabs(b.gen_surface_width - 90.0) < 1e-6);
+}
+
+// ── §3b. Selectable looks (HatStyle / TopStyle) ───────────────────────────────
+
+static void test_top_styles() {
+    std::vector<zypher::TerrainNode> nodes = {
+        {-300, -100, 0, 45, -45},
+        { 300, -100, 0, 45, -45},
+        { 300,  100, 0, 45, -45},
+        {-300,  100, 0, 45, -45},
+    };
+
+    // Every hat style produces a valid mesh; None simply emits no shoulder
+    // rather than failing.
+    for (auto hs : {zypher::HatStyle::Vanilla, zypher::HatStyle::Curvy,
+                    zypher::HatStyle::Plain,   zypher::HatStyle::ZigZag,
+                    zypher::HatStyle::None}) {
+        zypher::TerrainParams p;
+        p.hat_style = hs;
+        auto m = zypher::generate_terrain(nodes, p);
+        CHECK(m.ok);
+        CHECK(m.vertex_count() > 0);
+    }
+
+    // A Plain deck is one quad per walkable edge; a patterned one subdivides.
+    zypher::TerrainParams base;
+    base.top_style = zypher::TopStyle::Plain;
+    auto plain = zypher::generate_terrain(nodes, base);
+
+    // REGRESSION: a Plain deck must actually emit its top quads. The row loop
+    // ran `ri < rows - 1` with rows starting at 1 when spacing <= 1, so a Plain
+    // deck emitted ZERO top geometry and the walkable surface was simply
+    // missing — only the shoulder lip remained. With HatStyle::None the top
+    // SurfaceMesh is the deck alone, so its vertex count is the cleanest
+    // witness of the bug.
+    {
+        zypher::TerrainParams flat;
+        flat.top_style = zypher::TopStyle::Plain;
+        flat.hat_style = zypher::HatStyle::None;
+        auto m = zypher::generate_terrain(nodes, flat);
+        size_t top_verts = 0;
+        for (const auto& sm : m.surfaces)
+            if (sm.texture == flat.surface_tex) top_verts += sm.vertices.size();
+        CHECK(top_verts >= 12);   // >= one quad per walkable edge (3 on this ring)
+    }
+
+    // REGRESSION: the shoulder must close onto the front plane. Every profile
+    // used to stop at the OUTER bottom of the drop, leaving the lip's underside
+    // open so the side never met the top/cliff face. The closing point returns
+    // to lat == 0, i.e. z == the deck's front depth, at the full drop height.
+    {
+        zypher::TerrainParams closed;
+        closed.top_style = zypher::TopStyle::Plain;
+        closed.hat_style = zypher::HatStyle::Vanilla;
+        closed.fbm_amplitude = 0.0f;
+        auto m = zypher::generate_terrain(nodes, closed);
+        const double fz = 45.0;   // node front_depth
+        const double drop_y = 100.0 - double(closed.hat_height);  // ring top edge
+        bool closes = false;
+        for (const auto& sm : m.surfaces) {
+            if (sm.texture != closed.surface_tex) continue;
+            for (const auto& v : sm.vertices)
+                if (std::fabs(double(v.z) - fz) < 0.5 && std::fabs(double(v.y) - drop_y) < 0.5)
+                    closes = true;
+        }
+        CHECK(closes);
+    }
+
+    zypher::TerrainParams spikey = base;
+    spikey.top_style = zypher::TopStyle::Spikey;
+    spikey.top_frequency = 8.0f;
+    spikey.top_depth = 16.0f;
+    spikey.top_min_collision_radius = 8.0f;
+    auto sp = zypher::generate_terrain(nodes, spikey);
+    CHECK(sp.ok);
+    CHECK(sp.vertex_count() > plain.vertex_count());
+    // Deterministic: same inputs, same geometry.
+    auto sp2 = zypher::generate_terrain(nodes, spikey);
+    CHECK(sp2.vertex_count() == sp.vertex_count());
+    CHECK(sp2.collision_outline.size() == sp.collision_outline.size());
+    // Spikey contributes collision above the min radius...
+    CHECK(sp.collision_outline.size() > plain.collision_outline.size());
+
+    // ...but nothing when every feature is below top_min_collision_radius.
+    zypher::TerrainParams tiny = spikey;
+    tiny.top_min_collision_radius = 64.0f;
+    auto tn = zypher::generate_terrain(nodes, tiny);
+    CHECK(tn.collision_outline.size() == plain.collision_outline.size());
+
+    // Porous never collides, even with a deep pit.
+    zypher::TerrainParams porous = base;
+    porous.top_style = zypher::TopStyle::Porous;
+    porous.top_frequency = 8.0f;
+    porous.top_depth = 40.0f;
+    porous.top_min_collision_radius = 0.0f;
+    auto po = zypher::generate_terrain(nodes, porous);
+    CHECK(po.ok);
+    CHECK(po.vertex_count() > plain.vertex_count());
+    CHECK(po.collision_outline.size() == plain.collision_outline.size());
+
+    // Bubbly adds a small pentagonal arch per feature (more points than a spike).
+    zypher::TerrainParams bubbly = base;
+    bubbly.top_style = zypher::TopStyle::Bubbly;
+    bubbly.top_frequency = 8.0f;
+    bubbly.top_depth = 20.0f;
+    bubbly.top_min_collision_radius = 8.0f;
+    auto bu = zypher::generate_terrain(nodes, bubbly);
+    CHECK(bu.ok);
+    CHECK(bu.collision_outline.size() > sp.collision_outline.size());
+
+    // Every style id round-trips; an unknown id is total (falls back).
+    for (auto hs : {zypher::HatStyle::Vanilla, zypher::HatStyle::Curvy,
+                    zypher::HatStyle::Plain,   zypher::HatStyle::ZigZag,
+                    zypher::HatStyle::None}) {
+        CHECK(zypher::hat_style_from_id(zypher::hat_style_id(hs)) == hs);
+    }
+    for (auto ts : {zypher::TopStyle::Plain, zypher::TopStyle::Spikey,
+                    zypher::TopStyle::Porous, zypher::TopStyle::Bubbly}) {
+        CHECK(zypher::top_style_from_id(zypher::top_style_id(ts)) == ts);
+    }
+    CHECK(zypher::hat_style_from_id("nonsense") == zypher::HatStyle::Vanilla);
+    CHECK(zypher::top_style_from_id("nonsense") == zypher::TopStyle::Plain);
+}
+
 // ── §4. Protobuf emission ──────────────────────────────────────────────────────
 
 static void test_sphere_emission() {
@@ -278,6 +493,8 @@ int main() {
 
     std::printf("[§3] Terrain generator\n");
     test_terrain();
+    test_terrain_roundtrip_stability();
+    test_top_styles();
 
     std::printf("[§4] Protobuf emission\n");
     test_sphere_emission();

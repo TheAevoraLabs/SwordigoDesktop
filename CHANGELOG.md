@@ -2,6 +2,70 @@
 
 All notable changes to Swordigo Desktop.
 
+## [1.4.3] — Mobile performance overhaul, 120Hz VSync pacing, and native WaterMesh Studio
+
+### Added
+- **WaterMesh Studio Revamp (`WaterMeshStudioPanel.qml`)**:
+  - Native, responsive controls with dedicated `[ Enter Visual W-Mesh Editor ]` action bar.
+  - Themed `IconButton` steppers (`-16` / `+16`) for tile size, body color picker, and dimensional steppers (Width, Depth, X, Y).
+  - Clean foundation for arbitrary vertex polygon input and visual wireframe editing.
+
+### Optimized & Fixed
+- **Mobile Render & Engine Performance Overhaul**:
+  - Removed artificial `Thread.sleep` from `GameRenderer.java` on the GLSurfaceView thread, restoring native VSync pacing and eliminating physics/frame stutter.
+  - Dynamic 120Hz display refresh mode selection in `GameRenderer.java`.
+  - Disabled 4x MSAA on mobile full-screen FBO (`ruby_quick_viewport.cpp`), eliminating tile resolve and memory bandwidth starvation on mobile GPUs.
+  - Throttled continuous 30 FPS water animation timer when idle, running strictly during interactive W-Mesh edit sessions.
+  - Batched non-visual scene markers into a single unlit shader pass, cutting hundreds of GPU state rebinding cycles per frame.
+- **Orientation & Scene Loading Stability**:
+  - Resolved screen orientation lock-out and removed `onWidthChanged` recursive loading overlay triggers in `SceneViewportView.qml`.
+
+## [1.4.2] — Ruby Touch: selectable Zypher ground looks, and the UV / width fixes
+
+> Zypher is a non-vanilla MeshType, so unlike the engine's single hardcoded
+> ground look it can offer selectable ones. Everything below was read off the
+> Caver source in `OpenSwordigo/arm64_13/functions/Caver/GroundMeshGenerator/`,
+> which splits the job exactly the way the pickers do: the **shoulder** swept
+> over the rim (`GenerateSurfaceMeshWithRoundHat` / `InsertRoundHatVertices`)
+> and the walkable **deck** (`GeneratePlainSurfaceWithHatGaps`), over the
+> visible **front** face (`GenerateFrontMesh`).
+
+### Added
+- **Selectable ground looks (`zypher::HatStyle` / `zypher::TopStyle`).**
+  Sides: `vanilla` (the engine's two-inset-then-drop round hat), `curvy`,
+  `plain`, `zigzag`, `none`. Tops: `plain` (the engine's flat surface),
+  `spikey`, `porous`, `bubbly`. Every look is real geometry, driven by
+  `top_frequency` (features per 100 world units) and `top_depth` (feature height
+  / pit depth). Defaults are Vanilla/Plain, so an untouched editor emits exactly
+  the geometry it did before.
+- **Intelligent pattern collision.** Spikey covers half the spike height, so a
+  cone is damageable but still standable; Bubbly gets a small pentagonal arch;
+  Porous never collides; anything under `top_min_collision_radius` casts no
+  collision at all. Bumps are spliced into the CCW outline in traversal order,
+  so the polygon stays simple.
+- **Ruby Touch mesh-edit side panel** (`ZypherLookPanel.qml`) — appears only for
+  a Zypher ground object, with a line drawing of every side and top style so the
+  choice is legible before regenerating. Backed by
+  `RubyQuickViewport::setZypherLook()` / `getZypherLook()` / `zypherActive()`.
+- `RUBY_ZYPHER_HAT_STYLE`, `RUBY_ZYPHER_TOP_STYLE`, `RUBY_ZYPHER_TOP_FREQ`,
+  `RUBY_ZYPHER_TOP_DEPTH` for A/B-ing a look without a rebuild.
+
+### Fixed
+- **Weird top texturing.** Vanilla textures through
+  `TextureMapping::TexCoordForPosition` = `(p - offset) / scale + 0.5`, fed
+  `(arc-length, depth)` — never world XY. Zypher was hard-coding the deck's V to
+  `0.0`/`0.5` and the shoulder's to `0.5 + t*0.5`, so the grass sampled a fixed
+  half of the atlas and smeared across the whole plate regardless of its size;
+  the side walls froze one V across the entire front-to-back span; and the rear
+  cap mirrored U against the front. All four now use the engine's depth/scale
+  law, and the rear cap matches the front.
+- **The top mesh reading slimmer than vanilla.** Vanilla's round hat spans
+  `HatWidthOffset1 + HatWidthOffset2` (`P31 + P32` in `InsertRoundHatVertices`);
+  Zypher used `offset_1` alone, generating half the declared shoulder. Both the
+  desktop and mobile callers now sum the two insets, and the emitter writes the
+  whole width into `offset_1` with `offset_2 = 0` so a re-import recovers it
+  instead of doubling it.
+
 ## [Unreleased] — Converter: the POD block grammar now matches the reference writer
 
 > Report §8f. The two earlier fixes (§8d tags, §8e bone batches) put the right

@@ -213,6 +213,7 @@ int main(int argc, char** argv) {
     std::map<std::string, Family> gen;
     auto tally = [&](const std::string& fam, const boulderx::Submesh& sm, size_t n) {
         Family& F = gen[fam];
+        (void)n;
         F.nv += static_cast<int>(sm.vertices.size());
         F.nf += sm.indexed ? static_cast<int>(sm.indices.size() / 3)
                            : static_cast<int>(sm.vertices.size() / 3);
@@ -272,8 +273,33 @@ int main(int argc, char** argv) {
     // index any more. Classify by texture with the SAME rule the bake side uses
     // above (rim runs through the surface mapping, the plain ribbon through the
     // front mapping), so both sides bucket identically.
+    // Bucket the generated surface submeshes the SAME way the bake side is
+    // bucketed above. Keying on texture alone is wrong when the object's surface
+    // and front mappings name the same texture (a shipped crypt object does),
+    // because then every submesh tests as "rim" and the ribbon bucket reads 0 —
+    // a classification artifact that looks exactly like "the generator dropped
+    // the ribbon". Fall back to the geometry test the bake uses: the rim's bevel
+    // sits off the node's own XY, the plain ribbon sits on it.
+    const bool same_tex = !d.surface_tex.empty() && d.surface_tex == d.front_tex;
     for (const auto& sm : mesh.surfaces) {
-        const bool is_rim = !d.surface_tex.empty() && sm.texture == d.surface_tex;
+        bool is_rim;
+        if (!same_tex && !d.surface_tex.empty()) {
+            is_rim = (sm.texture == d.surface_tex);
+        } else {
+            double far = 0;
+            for (const auto& v : sm.vertices) {
+                size_t best = 0;
+                double bd = 1e30;
+                for (size_t k = 0; k < d.nodes.size(); ++k) {
+                    const double dx = v.x - d.nodes[k].x, dy = v.y - d.nodes[k].y;
+                    const double dd = dx * dx + dy * dy;
+                    if (dd < bd) { bd = dd; best = k; }
+                }
+                (void)best;
+                far = std::max(far, std::sqrt(bd));
+            }
+            is_rim = far > 0.01;
+        }
         tally(is_rim ? "rim" : "ribbon", sm, d.nodes.size());
     }
     for (const auto& sm : mesh.fronts) tally("cap", sm, d.nodes.size());

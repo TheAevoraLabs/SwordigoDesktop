@@ -156,29 +156,37 @@ bool SceneOrientation::applyPolicy(int androidOrientation, const QString& name)
 
 bool SceneOrientation::lockLandscape()
 {
-    const bool ok = applyPolicy(kOrientationLandscape, QStringLiteral("landscape"));
     m_landscapeLocked = true;
+    const bool ok = applyPolicy(kOrientationLandscape, QStringLiteral("landscape"));
+    emit orientationPolicyChanged();
+    emit insetsChanged();
     return ok;
 }
 
 bool SceneOrientation::lockSensorLandscape()
 {
-    const bool ok = applyPolicy(kOrientationSensorLandscape, QStringLiteral("sensor-landscape"));
     m_landscapeLocked = true;
+    const bool ok = applyPolicy(kOrientationSensorLandscape, QStringLiteral("sensor-landscape"));
+    emit orientationPolicyChanged();
+    emit insetsChanged();
     return ok;
 }
 
 bool SceneOrientation::lockPortrait()
 {
-    const bool ok = applyPolicy(kOrientationPortrait, QStringLiteral("portrait"));
     m_landscapeLocked = false;
+    const bool ok = applyPolicy(kOrientationPortrait, QStringLiteral("portrait"));
+    emit orientationPolicyChanged();
+    emit insetsChanged();
     return ok;
 }
 
 bool SceneOrientation::unlock()
 {
-    const bool ok = applyPolicy(kOrientationUnspecified, QStringLiteral("unspecified"));
     m_landscapeLocked = false;
+    const bool ok = applyPolicy(kOrientationUnspecified, QStringLiteral("unspecified"));
+    emit orientationPolicyChanged();
+    emit insetsChanged();
     return ok;
 }
 

@@ -21,6 +21,7 @@
 #include "ruby/render/post_pass.h"
 class QImage;
 class QOpenGLShaderProgram;
+class QShowEvent;
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -39,6 +40,9 @@ namespace fs = std::filesystem;
 #include "ruby/viewport/camera_bounds_gizmo.h"
 #include "ruby/render/glb_model.h"
 
+class QComboBox;
+class QDoubleSpinBox;
+class QLabel;
 class QToolButton;
 
 namespace ruby::viewport {
@@ -276,6 +280,7 @@ protected:
     void resizeGL(int w, int h) override;
     void resizeEvent(QResizeEvent* event) override;
     void paintGL() override;
+    void showEvent(QShowEvent* event) override;
 
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
@@ -477,6 +482,40 @@ private:
     float  m_mesh_pan_start_target[3] = {0.0f, 0.0f, 0.0f};
     QElapsedTimer m_mesh_live_timer;               // throttles live re-apply during drags
     QToolButton* m_mesh_btn = nullptr;             // gizmo-bar toggle (state sync)
+
+    // ── Mesh-edit bar: the 3-generator picker + the shared Zypher look ──────
+    // The in-scene half of the desktop generator UI: which of Boulder / Zenith /
+    // Zypher regenerates the open mesh, and the Zypher styles GUI (top/side
+    // silhouettes + tuning). The look lives in ruby/tools/zypher_look.h, so this
+    // bar and the Ground Mesh Studio write the same setting. Shown only while a
+    // mesh edit is active.
+    QWidget*        m_mesh_bar = nullptr;
+    QComboBox*      m_mesh_gen_combo = nullptr;
+    QWidget*        m_mesh_look_widget = nullptr;   // the Zypher style cluster
+    QComboBox*      m_mesh_hat_combo = nullptr;
+    QComboBox*      m_mesh_top_combo = nullptr;
+    QDoubleSpinBox* m_mesh_freq_spin = nullptr;
+    QDoubleSpinBox* m_mesh_depth_spin = nullptr;
+    QDoubleSpinBox* m_mesh_mincoll_spin = nullptr;
+
+    void mesh_bar_sync_look();        // controls <- the shared look
+    void mesh_bar_persist_look();     // the shared look <- controls
+    void mesh_bar_update_enabled();   // style cluster is live only on Zypher
+    void mesh_bar_regenerate();       // re-run the open edit with new settings
+
+    // ── Deferred load (a document opened before the GL surface exists) ─────
+    // A document can be activated from the tab bar BEFORE the viewport's first
+    // paint (the app's initial CLI open, or a fast click at startup). At that
+    // moment ensure_gl_ready() has no context, and the old code silently DROPPED
+    // the load — which is the "the model only appears on the second click" bug,
+    // and why a scene could open blank. The request is queued here and replayed
+    // by flush_pending_load() once the context lands (showEvent/initializeGL).
+    enum class PendingLoad { None, Model, Texture, Scene };
+    PendingLoad m_pending_load = PendingLoad::None;
+    std::string m_pending_model_path;
+    std::string m_pending_texture_path;
+    std::string m_pending_scene_path;
+    void flush_pending_load();        // replay a load that raced first paint
 
     void begin_mesh_edit();
     void end_mesh_edit(bool apply);

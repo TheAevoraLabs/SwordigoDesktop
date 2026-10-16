@@ -57,29 +57,14 @@ public class GameRenderer implements GLSurfaceView.Renderer {
     @Override
     public void onDrawFrame(GL10 gl) {
         try {
-            int targetFps = 60;
-            double targetFrameTime = 1.0 / targetFps;
-
             double now = System.nanoTime() / 1_000_000_000.0;
-            if (prevTime != 0) {
-                double elapsed = now - prevTime;
-                if (elapsed < targetFrameTime) {
-                    long sleepMs = (long) ((targetFrameTime - elapsed) * 1000.0);
-                    if (sleepMs > 0) {
-                        Thread.sleep(sleepMs);
-                        now = System.nanoTime() / 1_000_000_000.0;
-                    }
-                }
-            }
-
             float dt;
             if (prevTime == 0) {
-                dt = 1f / targetFps;
+                dt = 1f / 60f;
             } else {
                 dt = (float) (now - prevTime);
-                if (dt > 0.0667f) {
-                    dt = 0.0667f;
-                }
+                if (dt < 0.001f) dt = 0.001f;
+                else if (dt > 0.050f) dt = 0.050f;
             }
             prevTime = now;
             Native.updateApplication(dt);
@@ -93,8 +78,6 @@ public class GameRenderer implements GLSurfaceView.Renderer {
         Activity activity = (Activity) Native.mainActivity;
         if (activity == null || activity.getWindow() == null) return;
 
-        int targetFps = 60;
-
         try {
             Window window = activity.getWindow();
             Display display = window.getWindowManager().getDefaultDisplay();
@@ -107,14 +90,13 @@ public class GameRenderer implements GLSurfaceView.Renderer {
             int curHeight = currentMode.getPhysicalHeight();
 
             Display.Mode best = null;
-            float minDiff = Float.MAX_VALUE;
+            float maxHz = 0.0f;
 
             for (Display.Mode m : modes) {
                 if (m.getPhysicalWidth() == curWidth && m.getPhysicalHeight() == curHeight) {
-                    float diff = Math.abs(m.getRefreshRate() - targetFps);
-                    if (diff < minDiff) {
+                    if (m.getRefreshRate() > maxHz) {
                         best = m;
-                        minDiff = diff;
+                        maxHz = m.getRefreshRate();
                     }
                 }
             }

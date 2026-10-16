@@ -13,12 +13,18 @@
 // Requires Qt (widgets) for the canvas; runs headless via QT_QPA_PLATFORM.
 
 #include "ruby/tools/ground_mesh_studio.h"
+#include "ruby/tools/zypher_look.h"   // the shared Zypher look store
 #include "tools/boulder.h"
+#include "tools/boulderx.h"           // ground_generator() / set_ground_generator()
+#include "tools/roller.h"             // zypher::TerrainParams / enums
 #include "tools/scene_loader.h"
 
 #include <QApplication>
+#include <QComboBox>
+#include <QGroupBox>
 #include <QPointF>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -179,6 +185,74 @@ int main(int argc, char** argv) {
           "reference platform (~550x300) fits comfortably in viewport without over-zooming");
     CHECK(std::abs(c_scale.center_world().x()) < 20.0f,
           "reference platform is centered horizontally");
+
+    // ── 5) the ported generator selector + shared Zypher look ───────────────
+    //
+    // The "3 mesh editor modes" port: the studio must offer all three engine
+    // lineages (Boulder / Zenith / Zypher) and the Zypher look GUI must be live
+    // exactly on the Zypher mode. The app-level default (Zypher) is applied in
+    // main.cpp, so a bare studio starts on whatever the global currently is;
+    // here we drive the global directly to keep the check deterministic.
+    {
+        const auto saved_gen = boulderx::ground_generator();
+        const auto saved_look = zypher_look::load();   // restored at the end
+
+        boulderx::set_ground_generator(boulderx::GroundGenerator::Boulder);
+        GroundMeshStudio s_boulder;
+        auto* gen = s_boulder.findChild<QComboBox*>(QStringLiteral("generatorCombo"));
+        CHECK(gen && gen->count() == 3, "studio generator combo offers 3 modes");
+        CHECK(gen &&
+              gen->itemData(0).toInt() == int(boulderx::GroundGenerator::Boulder) &&
+              gen->itemData(1).toInt() == int(boulderx::GroundGenerator::BoulderX) &&
+              gen->itemData(2).toInt() == int(boulderx::GroundGenerator::Zypher),
+              "combo order is Boulder / Zenith / Zypher");
+        CHECK(gen && gen->currentIndex() == 0,
+              "Boulder global selects the Boulder combo entry");
+        auto* zbox_off = s_boulder.findChild<QGroupBox*>(QStringLiteral("zypherLookBox"));
+        CHECK(zbox_off && !zbox_off->isEnabled(),
+              "Zypher look GUI is disabled on the non-Zypher modes");
+
+        boulderx::set_ground_generator(boulderx::GroundGenerator::Zypher);
+        GroundMeshStudio s_zypher;
+        auto* gen_z = s_zypher.findChild<QComboBox*>(QStringLiteral("generatorCombo"));
+        CHECK(gen_z && gen_z->currentIndex() == 2,
+              "Zypher global selects the Zypher combo entry");
+        auto* zbox_on = s_zypher.findChild<QGroupBox*>(QStringLiteral("zypherLookBox"));
+        CHECK(zbox_on && zbox_on->isEnabled(),
+              "Zypher look GUI is live on the Zypher mode");
+
+        // The look store round-trips, and pours into the generator params —
+        // this sharing between the studio and the in-scene editor is why the
+        // helper exists at all.
+        zypher_look::Look l;
+        l.hat = zypher::HatStyle::ZigZag;
+        l.top = zypher::TopStyle::Bubbly;
+        l.frequency = 9.5f;
+        l.depth = 21.0f;
+        l.min_collision_radius = 4.0f;
+        zypher_look::save(l);
+        const zypher_look::Look back = zypher_look::load();
+        CHECK(back.hat == zypher::HatStyle::ZigZag &&
+              back.top == zypher::TopStyle::Bubbly &&
+              std::abs(back.frequency - 9.5f) < 1e-3f &&
+              std::abs(back.depth - 21.0f) < 1e-3f &&
+              std::abs(back.min_collision_radius - 4.0f) < 1e-3f,
+              "the shared Zypher look round-trips through QSettings");
+
+        zypher::TerrainParams p;
+        zypher_look::apply(p, back);
+        CHECK(p.hat_style == zypher::HatStyle::ZigZag &&
+              p.top_style == zypher::TopStyle::Bubbly &&
+              std::abs(p.top_frequency - 9.5f) < 1e-3f &&
+              std::abs(p.top_depth - 21.0f) < 1e-3f &&
+              std::abs(p.top_min_collision_radius - 4.0f) < 1e-3f,
+              "the shared look pours into zypher::TerrainParams");
+
+        // Restore whatever the developer had, so running tests never rewrites
+        // a real Zypher look.
+        zypher_look::save(saved_look);
+        boulderx::set_ground_generator(saved_gen);
+    }
 
     std::printf(g_failures == 0 ? "[ground_mesh_studio_test] ALL PASS\n"
                                 : "[ground_mesh_studio_test] %d FAILURES\n", g_failures);

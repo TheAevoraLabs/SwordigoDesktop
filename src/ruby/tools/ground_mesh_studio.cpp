@@ -6,7 +6,9 @@
 
 #include "tools/boulder.h"
 #include "tools/boulderx.h"   // sheet dialect + the shared relief randomiser
+#include "tools/roller.h"      // zypher::generate_terrain_object — Gen 3 generator
 #include "ruby/core/project_context.h"
+#include "ruby/tools/zypher_look.h"   // the shared Zypher look (styles + tuning)
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -51,6 +53,22 @@ bool seg_cross(const QPointF& a, const QPointF& b, const QPointF& c, const QPoin
     const int d3 = orient(a, b, c), d4 = orient(a, b, d);
     return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
            ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+
+// Generator combo <-> boulderx::GroundGenerator, in one place so the combo's
+// item order and the mapping cannot drift apart. 0=Boulder 1=Zenith 2=Zypher.
+int combo_index_for_generator(boulderx::GroundGenerator g) {
+    switch (g) {
+        case boulderx::GroundGenerator::Zypher:   return 2;
+        case boulderx::GroundGenerator::BoulderX: return 1;
+        default:                                  return 0;
+    }
+}
+
+boulderx::GroundGenerator generator_for_combo_index(int i) {
+    if (i == 2) return boulderx::GroundGenerator::Zypher;
+    if (i == 1) return boulderx::GroundGenerator::BoulderX;
+    return boulderx::GroundGenerator::Boulder;
 }
 } // namespace
 
@@ -801,15 +819,21 @@ GroundMeshStudio::GroundMeshStudio(QWidget* parent) : QWidget(parent) {
     m_depth_max = new QDoubleSpinBox(mesh_box);
     m_depth_max->setRange(-100000.0, 100000.0); m_depth_max->setValue(45.0); m_depth_max->setDecimals(1);
 
-    // Which generator rebuilds this sheet's mesh (and, when BoulderX, which
-    // dialect a save writes). Same two-value choice as the mobile settings row;
-    // both go through boulderx::set_ground_generator(), so this is the desktop
-    // half of one setting rather than a second, divergent one.
+    // Which generator rebuilds this sheet's mesh (and which dialect a save
+    // writes). The three engine lineages: Boulder (Gen 1, v1 sheet), Zenith
+    // (Gen 2, engine-faithful, v2 sheet) and Zypher (Gen 3, styled, v2 sheet).
+    // All go through boulderx::set_ground_generator(), so this is the desktop
+    // half of one setting rather than a second, divergent one. The app default
+    // is Zypher (see main.cpp); the saved pick wins on the next launch.
     m_generator = new QComboBox(mesh_box);
-    m_generator->addItem("Boulder (v1 sheet)", "boulder");
-    m_generator->addItem("Zenith (engine-faithful, v2 sheet)", "boulderx");
+    m_generator->setObjectName(QStringLiteral("generatorCombo"));
+    // Item data is the enum itself (same as the in-scene mesh bar), so the two
+    // selectors speak one language and neither can drift from the other.
+    m_generator->addItem("Boulder (Gen 1, v1 sheet)", int(boulderx::GroundGenerator::Boulder));
+    m_generator->addItem("Zenith (Gen 2, engine-faithful)", int(boulderx::GroundGenerator::BoulderX));
+    m_generator->addItem("Zypher (Gen 3, styled)", int(boulderx::GroundGenerator::Zypher));
     m_generator->setCurrentIndex(
-        boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX ? 1 : 0);
+        combo_index_for_generator(boulderx::ground_generator()));
 
     // Terrain relief. The canvas is 2D, so Z cannot be drawn: these two fields
     // are the range the randomiser shapes per-node depth inside.
@@ -862,6 +886,78 @@ GroundMeshStudio::GroundMeshStudio(QWidget* parent) : QWidget(parent) {
     mesh_form->addRow(relief_row);
     mesh_form->addRow(m_relief_status);
     form->addWidget(mesh_box);
+
+    // ── Zypher look (Gen 3) ──────────────────────────────────────────────────
+    // The desktop half of the Zypher styles GUI: the SIDE (hat) and TOP (deck)
+    // silhouettes plus the three tuning dials. This is the SAME setting the
+    // in-scene mesh editor edits — both go through ruby/tools/zypher_look.h —
+    // so a look dialled in here is the look the viewport generates with. Only
+    // the Zypher generator consumes it, so the group disables for the others.
+    m_zypher_box = new QGroupBox("Zypher Look (Gen 3)", panel);
+    m_zypher_box->setObjectName(QStringLiteral("zypherLookBox"));
+    auto* zy_form = new QFormLayout(m_zypher_box);
+    m_hat_style = new QComboBox(m_zypher_box);
+    m_hat_style->setObjectName(QStringLiteral("zypherHatCombo"));
+    m_hat_style->addItem("Vanilla (engine round hat)", int(zypher::HatStyle::Vanilla));
+    m_hat_style->addItem("Curvy (quarter-circle fillet)", int(zypher::HatStyle::Curvy));
+    m_hat_style->addItem("Chamfer (straight lip)", int(zypher::HatStyle::Plain));
+    m_hat_style->addItem("ZigZag (saw-toothed lip)", int(zypher::HatStyle::ZigZag));
+    m_hat_style->addItem("Bare (no lip)", int(zypher::HatStyle::None));
+    m_top_style = new QComboBox(m_zypher_box);
+    m_top_style->setObjectName(QStringLiteral("zypherTopCombo"));
+    m_top_style->addItem("Flat (engine deck)", int(zypher::TopStyle::Plain));
+    m_top_style->addItem("Spikey (conical spikes)", int(zypher::TopStyle::Spikey));
+    m_top_style->addItem("Porous (recessed pits)", int(zypher::TopStyle::Porous));
+    m_top_style->addItem("Bubbly (rounded domes)", int(zypher::TopStyle::Bubbly));
+    m_zyp_freq = new QDoubleSpinBox(m_zypher_box);
+    m_zyp_freq->setRange(0.5, 30.0); m_zyp_freq->setSingleStep(0.5);
+    m_zyp_freq->setDecimals(1); m_zyp_freq->setValue(6.0);
+    m_zyp_freq->setToolTip(QStringLiteral(
+        "Deck features per 100 world units (spacing = 100 / frequency)."));
+    m_zyp_depth = new QDoubleSpinBox(m_zypher_box);
+    m_zyp_depth->setRange(0.0, 120.0); m_zyp_depth->setSingleStep(1.0);
+    m_zyp_depth->setDecimals(0); m_zyp_depth->setValue(14.0);
+    m_zyp_depth->setToolTip(QStringLiteral(
+        "Feature height (Spikey/Bubbly) or pit depth (Porous)."));
+    m_zyp_mincoll = new QDoubleSpinBox(m_zypher_box);
+    m_zyp_mincoll->setRange(0.0, 120.0); m_zyp_mincoll->setSingleStep(1.0);
+    m_zyp_mincoll->setDecimals(0); m_zyp_mincoll->setValue(8.0);
+    m_zyp_mincoll->setToolTip(QStringLiteral(
+        "Below this radius a deck feature casts no collision."));
+    zy_form->addRow("SIDE style", m_hat_style);
+    zy_form->addRow("TOP style", m_top_style);
+    zy_form->addRow("Feature frequency", m_zyp_freq);
+    zy_form->addRow("Feature depth", m_zyp_depth);
+    zy_form->addRow("Min collision R", m_zyp_mincoll);
+    form->addWidget(m_zypher_box);
+
+    // Load the persisted look once; every edit is written straight back through
+    // the shared store so the in-scene editor sees it without a reopen.
+    {
+        const zypher_look::Look look = zypher_look::load();
+        m_hat_style->setCurrentIndex(m_hat_style->findData(int(look.hat)));
+        m_top_style->setCurrentIndex(m_top_style->findData(int(look.top)));
+        m_zyp_freq->setValue(double(look.frequency));
+        m_zyp_depth->setValue(double(look.depth));
+        m_zyp_mincoll->setValue(double(look.min_collision_radius));
+    }
+    auto persist_look = [this]() {
+        zypher_look::Look look;
+        look.hat = zypher::HatStyle(m_hat_style->currentData().toInt());
+        look.top = zypher::TopStyle(m_top_style->currentData().toInt());
+        look.frequency = float(m_zyp_freq->value());
+        look.depth = float(m_zyp_depth->value());
+        look.min_collision_radius = float(m_zyp_mincoll->value());
+        zypher_look::save(look);
+    };
+    connect(m_hat_style, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [persist_look](int) { persist_look(); });
+    connect(m_top_style, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [persist_look](int) { persist_look(); });
+    for (QDoubleSpinBox* box : {m_zyp_freq, m_zyp_depth, m_zyp_mincoll})
+        connect(box, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                this, [persist_look](double) { persist_look(); });
+    sync_zypher_controls();
 
     auto* edit_box = new QGroupBox("Polygon", panel);
     auto* edit_form = new QFormLayout(edit_box);
@@ -936,8 +1032,12 @@ GroundMeshStudio::GroundMeshStudio(QWidget* parent) : QWidget(parent) {
     connect(relief_btn, &QPushButton::clicked, this, &GroundMeshStudio::randomise_relief);
     connect(relief_clear, &QPushButton::clicked, this, &GroundMeshStudio::clear_relief);
     connect(m_generator, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        boulderx::set_ground_generator(index == 1 ? boulderx::GroundGenerator::BoulderX
-                                                  : boulderx::GroundGenerator::Boulder);
+        const auto gen = generator_for_combo_index(index);
+        boulderx::set_ground_generator(gen);
+        // Persist so the in-scene editor and the next launch agree with this
+        // combo; the shared global is what the viewport actually generates with.
+        zypher_look::save_generator_id(boulderx::ground_generator_id(gen));
+        sync_zypher_controls();
         sync_relief_to_polygon();
     });
     // A ring edit invalidates per-node depths that no longer describe a vertex,
@@ -1006,6 +1106,32 @@ void GroundMeshStudio::load_from_text() {
 // converse is not a problem: v1 sheets load in both, so an untouched slab stays
 // readable by every tool.
 namespace {
+
+// The studio drafts a 2D polygon; Zypher needs it as terrain nodes. A node
+// without its own sculpted depth uses the slab's flat plane (SurfaceWidth/2),
+// never |MaxDepth| — the uniform pair is a fallback for one node, not a
+// substitute for the outline.
+std::vector<zypher::TerrainNode> zypher_nodes_from_sheet(
+        const std::vector<std::pair<float, float>>& points,
+        const QVector<double>& front_z, const QVector<double>& back_z,
+        double max_depth, double surface_width) {
+    const double plane = surface_width > 0.0 ? surface_width * 0.5
+                                             : std::fabs(max_depth);
+    const bool have = front_z.size() == int(points.size()) &&
+                      back_z.size() == int(points.size());
+    std::vector<zypher::TerrainNode> nodes;
+    nodes.reserve(points.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+        zypher::TerrainNode n;
+        n.x = double(points[i].first);
+        n.y = double(points[i].second);
+        n.front_depth = have ? front_z[int(i)] : plane;
+        n.back_depth  = have ? back_z[int(i)] : -plane;
+        n.height = std::fabs(n.front_depth - n.back_depth);
+        nodes.push_back(n);
+    }
+    return nodes;
+}
 
 bool sheet_has_relief(const QVector<double>& front_z, const QVector<double>& back_z) {
     if (front_z.isEmpty() || front_z.size() != back_z.size()) return false;
@@ -1149,6 +1275,16 @@ void GroundMeshStudio::clear_relief() {
     refresh_summary();
 }
 
+void GroundMeshStudio::sync_zypher_controls() {
+    if (!m_zypher_box) return;
+    const bool zypher =
+        boulderx::ground_generator() == boulderx::GroundGenerator::Zypher;
+    m_zypher_box->setEnabled(zypher);
+    m_zypher_box->setTitle(zypher
+        ? QStringLiteral("Zypher Look (Gen 3)")
+        : QStringLiteral("Zypher Look (Gen 3) — select Zypher to edit"));
+}
+
 void GroundMeshStudio::clear_canvas() { m_canvas->clear(); }
 
 void GroundMeshStudio::undo_canvas() { m_canvas->undo(); }
@@ -1169,8 +1305,11 @@ void GroundMeshStudio::add_to_scene() {
     QString name = m_name->text().trimmed();
     if (name.isEmpty()) name = "ground_mesh";
 
-    const bool want_boulderx =
-        boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX;
+    const auto gen = boulderx::ground_generator();
+    // A v2 sheet (per-node depth) is what the two non-Boulder generators can
+    // express; Boulder carries only the single slab depth pair, so a v2 sheet in
+    // Boulder mode is refused below with the reason rather than flattened.
+    const bool want_v2 = gen != boulderx::GroundGenerator::Boulder;
     bool wrote_v2 = false;
     // MeshType 1 and the editor's default seed are what this panel has always
     // built with (it exposes neither field); the point of routing through
@@ -1179,23 +1318,40 @@ void GroundMeshStudio::add_to_scene() {
         points, m_front_z, m_back_z, m_depth_min->value(), m_depth_max->value(), 80.0, 1,
         1291618994u,
         m_top_texture->text().toStdString(), m_front_texture->text().toStdString(),
-        m_world_z->value(), name.toStdString(), want_boulderx, &wrote_v2);
+        m_world_z->value(), name.toStdString(), want_v2, &wrote_v2);
 
-    // The generator the user picked rebuilds the object; the sheet's dialect is
-    // what it must be able to express. BoulderX reads both, so a v1 sheet in
-    // BoulderX mode is fine — and a v2 sheet in Boulder mode is refused below
-    // with the reason, rather than flattened.
+    // The generator the user picked rebuilds the object. Zypher is a different
+    // engine, not a sheet reader: it consumes terrain nodes plus the shared
+    // "look", so it is driven from the polygon directly rather than from swdm.
     std::string bin;
-    if (want_boulderx) {
+    if (gen == boulderx::GroundGenerator::Zypher) {
+        zypher::TerrainParams params;
+        zypher_look::apply(params, zypher_look::load());
+        const QString top_tex = m_top_texture->text().trimmed();
+        const QString front_tex = m_front_texture->text().trimmed();
+        params.surface_tex = top_tex.isEmpty() ? "fire_grass" : top_tex.toStdString();
+        params.cliff_tex = front_tex.isEmpty() ? "graveyard_ground" : front_tex.toStdString();
+        params.surface_width = 80.0;
+        params.rear_closure = true;
+        const auto nodes = zypher_nodes_from_sheet(
+            points, m_front_z, m_back_z, m_depth_max->value(), 80.0);
+        zypher::ComponentIds ids;   // defaults 980..985 — a fresh object's ids
+        bin = zypher::generate_terrain_object(nodes, params, name.toStdString(), &ids);
+    } else if (gen == boulderx::GroundGenerator::BoulderX) {
         bin = boulderx::generate_ground_mesh_object_swdm(swdm, name.toStdString());
     } else {
         bin = boulder::generate_ground_mesh_object(swdm, name.toStdString(), m_world_z->value());
     }
     if (bin.empty()) {
-        const std::string reason = want_boulderx ? boulderx::last_decline_reason()
-                                                 : boulder::last_parse_error();
+        const std::string reason =
+            gen == boulderx::GroundGenerator::Zypher   ? zypher::last_decline_reason()
+          : gen == boulderx::GroundGenerator::BoulderX ? boulderx::last_decline_reason()
+                                                       : boulder::last_parse_error();
+        const char* who = gen == boulderx::GroundGenerator::Zypher   ? "Zypher"
+                        : gen == boulderx::GroundGenerator::BoulderX ? "Zenith"
+                                                                     : "Boulder";
         m_summary->setText(QString("Ground mesh generator rejected the polygon (%1): %2")
-            .arg(want_boulderx ? "Zenith" : "Boulder")
+            .arg(QString::fromLatin1(who))
             .arg(QString::fromStdString(reason)));
         return;
     }
@@ -1223,7 +1379,7 @@ void GroundMeshStudio::save_mesh() {
         1291618994u, m_top_texture->text().toStdString(),
         m_front_texture->text().toStdString(), m_world_z->value(),
         mesh_name.toStdString(),
-        boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX, &wrote_v2);
+        boulderx::ground_generator() != boulderx::GroundGenerator::Boulder, &wrote_v2);
     if (blob.empty()) {
         m_summary->setText("Ground mesh validation failed (the sheet could not be serialized).");
         return;
@@ -1251,7 +1407,7 @@ void GroundMeshStudio::save_mesh() {
     m_summary->setText(QString("Saved %1 (%2 bytes, %3). Wire it into a scene object to place it.")
         .arg(QFileInfo(path).fileName())
         .arg(int(blob.size()))
-        .arg(wrote_v2 ? QStringLiteral("Zenith sheet, per-node Z")
+        .arg(wrote_v2 ? QStringLiteral("format v2 sheet, per-node Z")
                       : QStringLiteral("sheet readable by both generators")));
     emit groundMeshSaved(path);
 }

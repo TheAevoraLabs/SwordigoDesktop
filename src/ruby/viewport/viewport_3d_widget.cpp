@@ -22,14 +22,19 @@
 #include <QApplication>
 #include <QToolButton>
 #include <QHBoxLayout>
+#include <QComboBox>
+#include <QDoubleSpinBox>
+#include <QLabel>
 #include <QCursor>
 #include <QPainter>
 #include <QPolygonF>
 #include <QPainterPath>
 #include "ruby/core/project_context.h"
+#include "ruby/tools/zypher_look.h"   // the shared Zypher look (styles + tuning)
 #include "platform/pvr_loader.h"
 #include "tools/gltf_glb.h"
 #include "tools/image_decode.h"   // WebP fallback for EXT_texture_webp (Qt may lack the plugin)
+#include "tools/parallel_for.h"    // BOUNDED scene-load fan-out (shared base)
 #include "tools/obj_loader.h"
 #include "tools/fbx_import.h"
 #include "tools/scene_asset_resolver.h"
@@ -384,6 +389,13 @@ static av::Camera gizmo_av_camera(const GizmoCamera& c) {
 
 namespace ruby::viewport {
 
+// The shared Zypher look lives in ruby::tools (authored next to the Ground Mesh
+// Studio that also writes it); alias it so the mesh-edit bar reads as
+// zypher_look:: here too.
+namespace zypher_look = ruby::tools::zypher_look;
+using ruby::tools::parallel_for;
+using ruby::tools::kSceneLoadThreads;
+
 Viewport3DWidget::Viewport3DWidget(QWidget* parent) : QOpenGLWidget(parent) {
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
@@ -462,6 +474,114 @@ Viewport3DWidget::Viewport3DWidget(QWidget* parent) : QOpenGLWidget(parent) {
     m_gizmo_bar->adjustSize();
     m_gizmo_bar->move(174, 12);
     m_gizmo_bar->setVisible(false);
+
+    // ── Mesh-edit bar (below the gizmo bar) ─────────────────────────────────
+    // The in-scene half of the desktop generator UI: pick which of Boulder /
+    // Zenith / Zypher regenerates the open mesh, and edit the shared Zypher
+    // look without leaving the scene. Shown only during a mesh edit (paintGL).
+    m_mesh_bar = new QWidget(this);
+    m_mesh_bar->setObjectName(QStringLiteral("SceneMeshBar"));
+    m_mesh_bar->setStyleSheet(QStringLiteral(
+        "QWidget#SceneMeshBar { background: rgba(22,24,30,225);"
+        "  border: 1px solid #2c3140; border-radius: 7px; }"
+        "QLabel { color: #9aa4b6; font-size: 10px; }"
+        "QComboBox, QDoubleSpinBox { color: #d7dbe3; background: #232733;"
+        "  border: 1px solid #333a49; border-radius: 4px; padding: 1px 4px;"
+        "  font-size: 11px; min-height: 18px; }"
+        "QComboBox:disabled, QDoubleSpinBox:disabled { color: #5c6373; }"));
+    auto* mesh_bar_layout = new QHBoxLayout(m_mesh_bar);
+    mesh_bar_layout->setContentsMargins(6, 3, 6, 3);
+    mesh_bar_layout->setSpacing(5);
+
+    auto* gen_label = new QLabel(QStringLiteral("Generator"), m_mesh_bar);
+    m_mesh_gen_combo = new QComboBox(m_mesh_bar);
+    m_mesh_gen_combo->addItem(QStringLiteral("Boulder (Gen 1)"),
+                              int(boulderx::GroundGenerator::Boulder));
+    m_mesh_gen_combo->addItem(QStringLiteral("Zenith (Gen 2)"),
+                              int(boulderx::GroundGenerator::BoulderX));
+    m_mesh_gen_combo->addItem(QStringLiteral("Zypher (Gen 3, styled)"),
+                              int(boulderx::GroundGenerator::Zypher));
+    m_mesh_gen_combo->setToolTip(QStringLiteral(
+        "Which engine regenerates this ground mesh. Switching re-generates the "
+        "open edit immediately."));
+    mesh_bar_layout->addWidget(gen_label);
+    mesh_bar_layout->addWidget(m_mesh_gen_combo);
+
+    // The Zypher style cluster. One child widget so it can be shown/hidden as a
+    // unit: on Boulder/Zenith these looks are ignored, and dead-looking controls
+    // are worse than absent ones.
+    m_mesh_look_widget = new QWidget(m_mesh_bar);
+    auto* look_layout = new QHBoxLayout(m_mesh_look_widget);
+    look_layout->setContentsMargins(0, 0, 0, 0);
+    look_layout->setSpacing(5);
+    auto* side_label = new QLabel(QStringLiteral("SIDE"), m_mesh_look_widget);
+    m_mesh_hat_combo = new QComboBox(m_mesh_look_widget);
+    m_mesh_hat_combo->addItem(QStringLiteral("Vanilla"), int(zypher::HatStyle::Vanilla));
+    m_mesh_hat_combo->addItem(QStringLiteral("Curvy"), int(zypher::HatStyle::Curvy));
+    m_mesh_hat_combo->addItem(QStringLiteral("Chamfer"), int(zypher::HatStyle::Plain));
+    m_mesh_hat_combo->addItem(QStringLiteral("ZigZag"), int(zypher::HatStyle::ZigZag));
+    m_mesh_hat_combo->addItem(QStringLiteral("Bare"), int(zypher::HatStyle::None));
+    auto* top_label = new QLabel(QStringLiteral("TOP"), m_mesh_look_widget);
+    m_mesh_top_combo = new QComboBox(m_mesh_look_widget);
+    m_mesh_top_combo->addItem(QStringLiteral("Flat"), int(zypher::TopStyle::Plain));
+    m_mesh_top_combo->addItem(QStringLiteral("Spikey"), int(zypher::TopStyle::Spikey));
+    m_mesh_top_combo->addItem(QStringLiteral("Porous"), int(zypher::TopStyle::Porous));
+    m_mesh_top_combo->addItem(QStringLiteral("Bubbly"), int(zypher::TopStyle::Bubbly));
+    auto* freq_label = new QLabel(QStringLiteral("FREQ"), m_mesh_look_widget);
+    m_mesh_freq_spin = new QDoubleSpinBox(m_mesh_look_widget);
+    m_mesh_freq_spin->setRange(0.5, 30.0); m_mesh_freq_spin->setSingleStep(0.5);
+    m_mesh_freq_spin->setDecimals(1);
+    m_mesh_freq_spin->setToolTip(QStringLiteral(
+        "Deck features per 100 world units (spacing = 100 / frequency)."));
+    auto* depth_label = new QLabel(QStringLiteral("DEPTH"), m_mesh_look_widget);
+    m_mesh_depth_spin = new QDoubleSpinBox(m_mesh_look_widget);
+    m_mesh_depth_spin->setRange(0.0, 120.0); m_mesh_depth_spin->setSingleStep(1.0);
+    m_mesh_depth_spin->setDecimals(0);
+    m_mesh_depth_spin->setToolTip(QStringLiteral(
+        "Feature height (Spikey/Bubbly) or pit depth (Porous)."));
+    auto* mincoll_label = new QLabel(QStringLiteral("MIN R"), m_mesh_look_widget);
+    m_mesh_mincoll_spin = new QDoubleSpinBox(m_mesh_look_widget);
+    m_mesh_mincoll_spin->setRange(0.0, 120.0); m_mesh_mincoll_spin->setSingleStep(1.0);
+    m_mesh_mincoll_spin->setDecimals(0);
+    m_mesh_mincoll_spin->setToolTip(QStringLiteral(
+        "Below this radius a deck feature casts no collision."));
+    look_layout->addWidget(side_label);
+    look_layout->addWidget(m_mesh_hat_combo);
+    look_layout->addWidget(top_label);
+    look_layout->addWidget(m_mesh_top_combo);
+    look_layout->addWidget(freq_label);
+    look_layout->addWidget(m_mesh_freq_spin);
+    look_layout->addWidget(depth_label);
+    look_layout->addWidget(m_mesh_depth_spin);
+    look_layout->addWidget(mincoll_label);
+    look_layout->addWidget(m_mesh_mincoll_spin);
+    mesh_bar_layout->addWidget(m_mesh_look_widget);
+
+    // Seed from the shared state and push every edit straight back, so the
+    // studio and this bar can never disagree about the look or the generator.
+    m_mesh_gen_combo->setCurrentIndex(
+        int(m_mesh_gen_combo->findData(int(boulderx::ground_generator()))));
+    mesh_bar_sync_look();
+    connect(m_mesh_gen_combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int) {
+        const auto gen = boulderx::GroundGenerator(m_mesh_gen_combo->currentData().toInt());
+        boulderx::set_ground_generator(gen);
+        zypher_look::save_generator_id(boulderx::ground_generator_id(gen));
+        mesh_bar_update_enabled();
+        mesh_bar_regenerate();
+    });
+    connect(m_mesh_hat_combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int) { mesh_bar_persist_look(); mesh_bar_regenerate(); });
+    connect(m_mesh_top_combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int) { mesh_bar_persist_look(); mesh_bar_regenerate(); });
+    for (QDoubleSpinBox* spin : {m_mesh_freq_spin, m_mesh_depth_spin, m_mesh_mincoll_spin})
+        connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                this, [this](double) { mesh_bar_persist_look(); mesh_bar_regenerate(); });
+    mesh_bar_update_enabled();
+
+    m_mesh_bar->adjustSize();
+    m_mesh_bar->move(174, 44);
+    m_mesh_bar->setVisible(false);
 }
 
 Viewport3DWidget::~Viewport3DWidget() {
@@ -997,6 +1117,48 @@ void Viewport3DWidget::initializeGL() {
     m_portal_renderer.init();
     m_particle_engine.init();
     m_effects_clock.start();
+
+    // GL is live now: replay anything that was activated before the first paint.
+    flush_pending_load();
+}
+
+void Viewport3DWidget::showEvent(QShowEvent* event) {
+    QOpenGLWidget::showEvent(event);
+    // The widget just became visible; the context may exist now even if no paint
+    // has run yet. Replay any load that raced the first paint.
+    flush_pending_load();
+}
+
+// Replay a load that arrived before the GL surface existed. Each branch clears
+// the pending state before dispatching, so a load that re-queues itself cannot
+// loop (it only re-queues if GL is still unavailable, which it is not once we
+// are here).
+void Viewport3DWidget::flush_pending_load() {
+    const PendingLoad pending = m_pending_load;
+    m_pending_load = PendingLoad::None;
+    switch (pending) {
+        case PendingLoad::Model: {
+            const std::string path = m_pending_model_path;
+            m_pending_model_path.clear();
+            if (!path.empty() && ensure_gl_ready()) load_model(path);
+            break;
+        }
+        case PendingLoad::Texture: {
+            const std::string path = m_pending_texture_path;
+            m_pending_texture_path.clear();
+            if (!path.empty() && ensure_gl_ready()) load_texture_preview(path);
+            break;
+        }
+        case PendingLoad::Scene: {
+            const std::string path = m_pending_scene_path;
+            m_pending_scene_path.clear();
+            if (!path.empty() && ensure_gl_ready()) load_scene_async(path);
+            break;
+        }
+        case PendingLoad::None:
+        default:
+            break;
+    }
 }
 
 void Viewport3DWidget::resizeGL(int w, int h) {
@@ -1018,6 +1180,10 @@ void Viewport3DWidget::resizeEvent(QResizeEvent* event) {
     if (m_gizmo_bar) {
         m_gizmo_bar->adjustSize();
         m_gizmo_bar->move(174, 12);
+    }
+    if (m_mesh_bar) {
+        m_mesh_bar->adjustSize();
+        m_mesh_bar->move(174, 44);
     }
     update();                            // repaint at the new size immediately
 }
@@ -1294,6 +1460,7 @@ void Viewport3DWidget::paintGL() {
     }
 
     if (m_gizmo_bar) m_gizmo_bar->setVisible(m_has_scene);
+    if (m_mesh_bar) m_mesh_bar->setVisible(m_has_scene && m_mesh_edit);
 
     if (m_render_effects_enabled && m_has_scene && m_scene_ready) {
         update(); // Continuous 60fps fluid & particle animation loop
@@ -2855,9 +3022,17 @@ void Viewport3DWidget::draw_skeleton() {
 
 bool Viewport3DWidget::load_model(const std::string& model_path) {
     if (model_path.empty()) return false;
-    // GL must be usable before any upload (see ensure_gl_ready — this load can
-    // run synchronously from QTabBar::currentChanged before the first paint).
-    if (!ensure_gl_ready()) return false;
+    // GL may not exist yet: a document can be opened from the tab bar BEFORE the
+    // viewport's first paint (the app's initial CLI open, or a fast click at
+    // startup). Returning false here is exactly the "first click on a model does
+    // nothing, the second one works" bug — the model was silently dropped.
+    // Queue it and replay once the context lands (flush_pending_load), and
+    // report success so the caller's status message stays truthful.
+    if (!ensure_gl_ready()) {
+        m_pending_load = PendingLoad::Model;
+        m_pending_model_path = model_path;
+        return true;
+    }
     // A model view must own the viewport: cancel any in-flight async scene
     // load so its completion can never land later and silently replace the
     // model with a scene (the "pod opens but I see no model" clobber). The
@@ -3629,31 +3804,26 @@ void Viewport3DWidget::load_scene_async(const std::string& scene_path,
             }
         }
 
-        std::vector<std::future<std::pair<std::string, av::PODModel>>> model_futures;
-        for (const auto& task : model_tasks) {
-            model_futures.push_back(std::async(std::launch::async, [task]() {
-                av::PODModel m = load_pod_to_ram(task.pod_path.string(), task.template_name);
-                return std::make_pair(task.mesh_name, std::move(m));
-            }));
-        }
+        // Parse every referenced POD on a BOUNDED pool. These used to be one
+        // std::async(std::launch::async, ...) per model — and launch::async is
+        // NOT pooled, it creates an OS thread each call — so a big level could
+        // spawn hundreds of threads at once. See tools/parallel_for.h for why
+        // that reads as "the world sometimes takes so long to load". Results
+        // land in a pre-sized vector, so no worker touches another's slot.
+        std::vector<std::pair<std::string, av::PODModel>> model_results(model_tasks.size());
+        parallel_for(model_tasks.size(), kSceneLoadThreads, [&](size_t i) {
+            av::PODModel m = load_pod_to_ram(model_tasks[i].pod_path.string(),
+                                             model_tasks[i].template_name);
+            model_results[i] = std::make_pair(model_tasks[i].mesh_name, std::move(m));
+        });
 
-        const size_t num_obj = loaded.objects.size();
-        const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
-        std::vector<std::future<void>> normal_futures;
-        size_t chunk_size = (num_obj + hw_threads - 1) / hw_threads;
-        for (unsigned int t = 0; t < hw_threads; ++t) {
-            size_t start = t * chunk_size;
-            size_t end = std::min(start + chunk_size, num_obj);
-            if (start < end) {
-                normal_futures.push_back(std::async(std::launch::async, [this, &loaded, start, end]() {
-                    for (size_t oi = start; oi < end; ++oi) {
-                        for (auto& gmesh : loaded.objects[oi].ground_meshes) {
-                            compute_missing_normals(gmesh);
-                        }
-                    }
-                }));
+        // Fill in any normals the mesh arrived without, one object per task on
+        // the same bounded pool (instead of a thread per hardware-core chunk).
+        parallel_for(loaded.objects.size(), kSceneLoadThreads, [&](size_t oi) {
+            for (auto& gmesh : loaded.objects[oi].ground_meshes) {
+                compute_missing_normals(gmesh);
             }
-        }
+        });
 
         // 1C. Collect and pre-decode unique ground mesh textures and background textures in parallel
         std::unordered_set<std::string> unique_ground_names;
@@ -3730,40 +3900,51 @@ void Viewport3DWidget::load_scene_async(const std::string& scene_path,
             }
         }
 
-        std::vector<std::future<void>> tex_futures;
-        for (const auto& tex_path : textures_to_decode) {
-            tex_futures.push_back(std::async(std::launch::async, [tex_path]() {
-                decode_image_file_to_ram(tex_path);
-            }));
+        // Pre-decode every ground/background texture the level references on
+        // the SAME bounded pool (the unbounded per-texture fan-out is the
+        // "slow on some PCs" regression; see tools/parallel_for.h).
+        // decode_image_file_to_ram caches in RAM, so the main-thread uploads
+        // below are pure GPU work.
+        {
+            const std::vector<std::string> tex_vec(textures_to_decode.begin(),
+                                                   textures_to_decode.end());
+            parallel_for(tex_vec.size(), kSceneLoadThreads, [&](size_t i) {
+                decode_image_file_to_ram(tex_vec[i]);
+            });
         }
 
         std::map<std::string, av::PODModel> pre_models;
-        for (auto& f : model_futures) {
-            auto pair = f.get();
-            if (!pair.second.meshes.empty()) {
-                pre_models.emplace(pair.first, std::move(pair.second));
+        for (auto& [mesh_name, model] : model_results) {
+            if (!model.meshes.empty()) {
+                pre_models.emplace(mesh_name, std::move(model));
             }
         }
 
-        std::vector<std::future<void>> model_tex_futures;
-        for (const auto& [mesh_name, model] : pre_models) {
-            const fs::path pod_path = av::assets::resolve_pod(fs::path(scene_path), mesh_name, scene_roots);
-            for (const auto& tex_name : model.texture_filenames) {
-                for (const auto& cand : av::assets::texture_candidates(pod_path, tex_name, scene_roots)) {
-                    std::error_code ec;
-                    if (fs::is_regular_file(cand, ec)) {
-                        model_tex_futures.push_back(std::async(std::launch::async, [cand]() {
-                            decode_image_file_to_ram(cand.string());
-                        }));
-                        break;
+        // A POD's texture list is only knowable once it has parsed, so model
+        // textures are a second, deduped wave on the same pool.
+        {
+            std::unordered_set<std::string> model_tex_seen;
+            std::vector<std::string> model_tex_paths;
+            for (const auto& [mesh_name, model] : pre_models) {
+                const fs::path pod_path =
+                    av::assets::resolve_pod(fs::path(scene_path), mesh_name, scene_roots);
+                for (const auto& tex_name : model.texture_filenames) {
+                    for (const auto& cand : av::assets::texture_candidates(pod_path, tex_name, scene_roots)) {
+                        std::error_code ec;
+                        if (fs::is_regular_file(cand, ec)) {
+                            const std::string cs = cand.string();
+                            // Skip anything the ground/background wave already decoded.
+                            if (!textures_to_decode.count(cs) && model_tex_seen.insert(cs).second)
+                                model_tex_paths.push_back(cs);
+                            break;
+                        }
                     }
                 }
             }
+            parallel_for(model_tex_paths.size(), kSceneLoadThreads, [&](size_t i) {
+                decode_image_file_to_ram(model_tex_paths[i]);
+            });
         }
-
-        for (auto& f : normal_futures) f.get();
-        for (auto& f : tex_futures) f.get();
-        for (auto& f : model_tex_futures) f.get();
 
         QMetaObject::invokeMethod(this, [this, seq, scene_path, roots, scene_roots,
                                          prev_scene_path, prev_had_scene,
@@ -3783,9 +3964,15 @@ void Viewport3DWidget::load_scene_async(const std::string& scene_path,
             m_scene_model_gpu.clear();
 
             // This completion can land before the first paint — initialize the
-            // GL function table here too (see ensure_gl_ready), and refuse the
-            // GPU section when no surface can be created at all.
-            if (!ensure_gl_ready()) return;
+            // GL function table here too (see ensure_gl_ready). When no surface
+            // can be created yet, do NOT drop the parse: re-queue the scene so
+            // it loads the moment the context exists (this was the "scene opens
+            // blank until I click it again" failure).
+            if (!ensure_gl_ready()) {
+                m_pending_load = PendingLoad::Scene;
+                m_pending_scene_path = scene_path;
+                return;
+            }
             makeCurrent();
             clear_mesh_gpu();
 
@@ -3922,7 +4109,12 @@ void Viewport3DWidget::load_scene_async(const std::string& scene_path,
 
 bool Viewport3DWidget::load_texture_preview(const std::string& image_path) {
     if (image_path.empty()) return false;
-    if (!ensure_gl_ready()) return false;
+    // Same first-paint race as load_model: queue instead of dropping.
+    if (!ensure_gl_ready()) {
+        m_pending_load = PendingLoad::Texture;
+        m_pending_texture_path = image_path;
+        return true;
+    }
     // Texture preview owns the viewport: cancel any in-flight async scene load
     // (same clobber guard as load_model).
     ++m_scene_load_seq;
@@ -6087,6 +6279,16 @@ void Viewport3DWidget::begin_mesh_edit() {
 
     m_mesh_edit = true;
     set_gizmo_mode(GizmoOff);
+    // Adopt whatever the studio (or the last session) left as the generator and
+    // the look, without re-triggering a regenerate through the change signals.
+    if (m_mesh_gen_combo) {
+        m_mesh_gen_combo->blockSignals(true);
+        m_mesh_gen_combo->setCurrentIndex(
+            int(m_mesh_gen_combo->findData(int(boulderx::ground_generator()))));
+        m_mesh_gen_combo->blockSignals(false);
+    }
+    mesh_bar_sync_look();
+    mesh_bar_update_enabled();
     m_mesh_live_timer.start();
     update();
 }
@@ -6209,11 +6411,21 @@ bool Viewport3DWidget::mesh_apply() {
         }
         zypher::TerrainParams params;
         params.bevel = zypher::ProfileKind::SmoothFillet;
+        // The shared Zypher look (styles + tuning) — the same setting the Ground
+        // Mesh Studio edits. Applied before the texture/width lines below so
+        // those still own the fields they set.
+        zypher_look::apply(params, zypher_look::load());
         params.surface_tex = gm.top_texture.empty() ? "fire_grass" : gm.top_texture;
         params.cliff_tex = gm.bottom_texture.empty() ? "graveyard_ground" : gm.bottom_texture;
         params.surface_width = (gm.surface_width > 0 ? gm.surface_width : 100.0);
         params.hat_height = (gm.hat_height > 0 ? static_cast<float>(gm.hat_height) : 20.0f);
-        params.hat_width = (gm.hat_width_offset_1 > 0 ? static_cast<float>(gm.hat_width_offset_1) : 8.0f);
+        // Vanilla's round-hat lateral extent is HatWidthOffset1 + HatWidthOffset2
+        // (P31 + P32). Using offset1 alone generated half the declared shoulder,
+        // which is the "top mesh looks slimmer than vanilla" report.
+        {
+            const double hw_sum = gm.hat_width_offset_1 + gm.hat_width_offset_2;
+            params.hat_width = (hw_sum > 0.0 ? static_cast<float>(hw_sum) : 8.0f);
+        }
         params.texture_scale = m_mesh_params.texture_scale > 0 ? m_mesh_params.texture_scale : 250.0f;
         params.fbm_amplitude = 12.0f;
         params.rear_closure = true;
@@ -6420,6 +6632,50 @@ bool Viewport3DWidget::mesh_apply() {
         doneCurrent();
     }
     return true;
+}
+
+// ── Mesh-edit bar helpers ───────────────────────────────────────────────
+// The bar and the Ground Mesh Studio share ONE look store (zypher_look), so
+// these four are just the editor half of that contract: read it in, write it
+// back, gate the style cluster on the Zypher generator, and re-run the edit.
+void Viewport3DWidget::mesh_bar_sync_look() {
+    const zypher_look::Look look = zypher_look::load();
+    if (m_mesh_hat_combo)
+        m_mesh_hat_combo->setCurrentIndex(m_mesh_hat_combo->findData(int(look.hat)));
+    if (m_mesh_top_combo)
+        m_mesh_top_combo->setCurrentIndex(m_mesh_top_combo->findData(int(look.top)));
+    if (m_mesh_freq_spin) m_mesh_freq_spin->setValue(double(look.frequency));
+    if (m_mesh_depth_spin) m_mesh_depth_spin->setValue(double(look.depth));
+    if (m_mesh_mincoll_spin)
+        m_mesh_mincoll_spin->setValue(double(look.min_collision_radius));
+}
+
+void Viewport3DWidget::mesh_bar_persist_look() {
+    if (!m_mesh_hat_combo || !m_mesh_top_combo ||
+        !m_mesh_freq_spin || !m_mesh_depth_spin || !m_mesh_mincoll_spin)
+        return;
+    zypher_look::Look look;
+    look.hat = zypher::HatStyle(m_mesh_hat_combo->currentData().toInt());
+    look.top = zypher::TopStyle(m_mesh_top_combo->currentData().toInt());
+    look.frequency = float(m_mesh_freq_spin->value());
+    look.depth = float(m_mesh_depth_spin->value());
+    look.min_collision_radius = float(m_mesh_mincoll_spin->value());
+    zypher_look::save(look);
+}
+
+void Viewport3DWidget::mesh_bar_update_enabled() {
+    const bool zypher =
+        boulderx::ground_generator() == boulderx::GroundGenerator::Zypher;
+    if (m_mesh_look_widget) m_mesh_look_widget->setVisible(zypher);
+}
+
+void Viewport3DWidget::mesh_bar_regenerate() {
+    if (!m_mesh_edit) return;
+    // mesh_apply() re-reads the generator global and the shared look, swaps the
+    // ground components, and re-uploads the GPU buffers — so a change here is
+    // live, not deferred to commit. The host is nudged so panels refresh too.
+    if (mesh_apply()) emit sceneObjectRenderStateChanged(m_mesh_edit_object);
+    update();
 }
 
 void Viewport3DWidget::end_mesh_edit(bool apply) {

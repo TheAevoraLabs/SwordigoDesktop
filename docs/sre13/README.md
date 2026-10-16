@@ -49,6 +49,11 @@ Every field/function in these docs carries one of:
 | [ModelLibrary.md](ModelLibrary.md) | Model asset cache (singleton) | 0x48-byte object, three tree headers at +0x00/+0x18/+0x30, `ModelForName` POD-load path |
 | [TextureLibrary.md](TextureLibrary.md) | Texture asset cache (singleton) | textures map at +0x08, memory budget `1e9` at +0x24, unused-textures vector at +0x30 |
 | [SceneObject.md](SceneObject.md) | Base scene entity | 10-slot vtable + IBindable vtable at +0x10, `scene` at +0x20, `position` Vector3 at +0x80, `rotation` at +0x90, `scale` at +0x9C, `localAABB` at +0xA4, components vector at +0xD0, flags at +0x103/+0x104 |
+| [GUIView.md](GUIView.md) | GUI base node: frame/bounds/subviews/layout | frame +0x84, bounds +0x94, touchBounds +0xA4, superview +0x60, hidden +0xF4, clips +0xF8, subview list +0x20, `safeBounds` inset +0x38 |
+| [GUIButton.md](GUIButton.md) | `GUIControl` events + button states/textures/sound | flags +0x118 (bit0 pressed, bit1 brighten), normal/highlight/bg rects +0x120/+0x128/+0x130, tint +0x1B4, press sound `std::string` +0x1B8, touch id +0x1D0, events `1`/`64`/`0x200000` |
+| [GUISlider.md](GUISlider.md) | `GUISlider` + `GUISwitch` (both 0x168) | slider value +0x11C, min/max +0x12C/+0x130 (default 0..100), frame/bar/peg textures +0x138/+0x140/+0x148, dirty +0x158, round flag +0x164 |
+| [GUILabel.md](GUILabel.md) | Bitmap text + `FontText` | owns `FontText` (0xF0) at +0x140, interaction off by default (+0xF5), `TextSize` used by every layout pass |
+| [GUIFrameView.md](GUIFrameView.md) | Drawing primitives: frame/textured/rounded | `Texture` size +0x74/+0x78, nine-patch `GUIRoundedRect` (0xA8) with 18-vert sprite at +0x50, `GUIFrameView` textured +0x100 / rounded +0x108 |
 
 ## Cross-cutting facts worth remembering
 
@@ -73,6 +78,15 @@ Every field/function in these docs carries one of:
 - **Vtable dumps** were produced by applying `.rela.dyn` (R_AARCH64_RELATIVE +
   R_AARCH64_ABS64) over the file image of segment 02; the same technique is
   reusable for any class with a ctor that stores `off_XXXXXX`.
+- **GUI is not data-driven today, but could be.** The HUD (`GameOverlayView`) drives
+  its children through a runtime-built `GUIViewLayout` tree at `this+624` (identifier
+  index + margins + per-node scale), and `Caver.Proto.GUIViewLayout` serialisation
+  exists with **no callers**. Menus are built in code via `GameInterfaceBuilder`.
+  See `docs/game/caver/gui/layout_reference.md` and
+  `docs/game/caver/gui/data_driven_gui_design.md`.
+- **sre12 already replaces the GUI render path** (`sre_gui.c` / `sre_gui_native.c`,
+  full `DrawRect` hook table) — **libsre13.so has no GUI subsystem at all**; that port
+  is the enabling step for any moddable-GUI work.
 
 ## Workflow for adding a new subsystem doc
 

@@ -40,6 +40,9 @@ Rectangle {
     property real dockWidth: Theme.dp(320)
     property bool maximized: false
     property bool isGroundMesh: false
+    property bool isWater: false
+
+    signal openWaterStudioRequested()
 
     /// Key of the transform field the keypad is currently editing, or "".
     property string routedKey: ""
@@ -141,6 +144,7 @@ Rectangle {
         scaleZField.text = Number(obj.scaleZ).toFixed(2)
 
         root.isGroundMesh = !!obj.isGroundMesh
+        root.isWater = (root.host && root.host.isSelectedWater)
         if (root.isGroundMesh && typeof topTexField !== "undefined" && topTexField) {
             topTexField.text = obj.topTexture || "grass_subtle"
             groundTexField.text = obj.groundTexture || "maybegood"
@@ -576,6 +580,34 @@ Rectangle {
                     text: qsTr("Apply Textures")
                     iconName: "check"
                     onClicked: root.applyGroundMeshTextures()
+                }
+            }
+
+            SectionCard {
+                width: parent.width
+                label: qsTr("Fluid & WaterMesh")
+                accentIcon: "water"
+                visible: root.isWater
+
+                FieldLabel { text: qsTr("Interactive Fluid Volume") }
+
+                Text {
+                    width: parent.width
+                    text: qsTr("Authentic fluid mechanics with wave simulation, dual surface-crest tinting, and customizable presets.")
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    color: Theme.textSecondary
+                    wrapMode: Text.WordWrap
+                }
+
+                PrimaryButton {
+                    width: parent.width
+                    text: qsTr("Open Fluid Studio")
+                    iconName: "water"
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation)
+                            screenOrientation.vibrateTouch(20)
+                        root.openWaterStudioRequested()
+                    }
                 }
             }
 

@@ -4401,6 +4401,10 @@ static void bridge_fopen(void* emu_ptr) {
         g_file_handles[handle] = f;
         RedstellGC::instance().track_file_open(handle, resolved_path.c_str());
         rgc_note_asset_open(resolved_path.c_str());   /* storm-window re-arm (rec 4) */
+        /* Level's LightComponent payloads (Type/Intensity/Radius) for the
+         * dynamic-light collector; no-op when the path repeats. */
+        if (resolved_path.find(".scene") != std::string::npos)
+            light_manager_on_scene_open(resolved_path.c_str());
         
         // PPD: Kick off asynchronous pre-decompression if it's a PVR texture
         if (resolved_path.find(".pvr") != std::string::npos) {
@@ -5463,6 +5467,8 @@ static void bridge_open(void* emu_ptr) {
 
     if (fd >= 0) {
         rgc_note_asset_open(resolved_path.c_str());
+        if (resolved_path.find(".scene") != std::string::npos)
+            light_manager_on_scene_open(resolved_path.c_str());
     }
 
     emu->set_reg(0, (uint64_t)(int64_t)fd);
@@ -6185,9 +6191,22 @@ static void bridge_glLightfv(void* emu_ptr) {
                 // the modelview the fixed-function pipeline lights with. 
                 const float* Lp = g_frame_lights[li].position;
                 const float* Ld = g_frame_lights[li].diffuse;
+                // Type (LightComponent payload f1) recovered from the
+                // transformed w: LightComponent::Enable writes w=1 when it
+                // places a point light and Scene::Draw writes w=0 for a
+                // directional one, so glGetLightfv's w IS the component's
+                // Type. Directionals get their own tag range so a GL slot
+                // that holds both a point and a directional light cannot
+                // cross-update the two entries.
+                const int glType = (std::fabs(Lp[3]) < 1e-6f)
+                                       ? kLightTypeDirectional
+                                       : kLightTypePoint;
+                const int lightTag = (glType == kLightTypeDirectional)
+                                         ? (101 + li)
+                                         : (li + 1);
                 LightManager::Instance().InterceptNativeLight(
-                    Lp[0], Lp[1], Lp[2], Ld[0], Ld[1], Ld[2], reach, li + 1,
-                    kc, kl, kq);
+                    Lp[0], Lp[1], Lp[2], Ld[0], Ld[1], Ld[2], reach, lightTag,
+                    kc, kl, kq, glType);
             }
             break;
         }
@@ -6241,8 +6260,15 @@ static void bridge_glLightModelfv(void* emu_ptr) {
         if (g_display_active) glLightModelfv(pname, params);
 
         // ── Handshake: capture global ambient for FBO shaders ─────────────
-        if (pname == GL_LIGHT_MODEL_AMBIENT)
+        if (pname == GL_LIGHT_MODEL_AMBIENT) {
             memcpy(g_frame_light_model_ambient, params, 16);
+            // Scene::Draw publishes the scene's Type-1 (ambient)
+            // LightComponents through this call and zeroes it again at the
+            // end of the frame — carry it into the collector tagged as
+            // ambient, so consumers can separate it from the point lights
+            // instead of it never appearing at all.
+            LightManager::Instance().InterceptNativeAmbient(params);
+        }
         ffp::note_light_model_fv(pname, params);
     }
 }

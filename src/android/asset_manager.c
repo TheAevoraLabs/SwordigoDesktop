@@ -316,7 +316,8 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
     g_last_opened_asset[sizeof(g_last_opened_asset) - 1] = '\0';
 
     /* Scene transition hook — reset void fill color when any scene asset opens */
-    if (strstr(filename, ".scene") != NULL) {
+    int is_scene = (strstr(filename, ".scene") != NULL);
+    if (is_scene) {
         extern void reset_void_fill_color(void);
         reset_void_fill_color();
         extern void texture_aware_mapper_on_scene_open(const char* sceneName);
@@ -325,8 +326,10 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
 
     char resolved[512];
     FILE* fp = NULL;
+    int scene_resolved = 0;
     extern int resolve_vfs_path(const char* original_path, char* out_resolved_path, int max_len);
     if (resolve_vfs_path(filename, resolved, sizeof(resolved))) {
+        scene_resolved = 1;
         /* try_open (not bare fopen) so a resolved path ending in a bare ".tex"
          * or "_2x" still resolves to the real on-disk ".tex.png" / ".pvr" /
          * 1x variant. Without this the guest's ".tex" requests (e.g.
@@ -372,6 +375,15 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
             fp = try_open(basepath);
             if (fp) printf("[AssetMgr] FOUND(base-APK fallback): %s\n", basepath);
         }
+    }
+
+    /* Level's LightComponent payloads (Type/Intensity/Radius) for the
+     * dynamic-light collector. A scene we could not resolve to a host path
+     * clears the table instead, so a new level never correlates its lights
+     * against the previous level's metadata. */
+    if (is_scene) {
+        extern void light_manager_on_scene_open(const char* host_path);
+        light_manager_on_scene_open(scene_resolved ? resolved : NULL);
     }
 
     /* NEVER return NULL — use /dev/null dummy to prevent gzdopen(0) crash.

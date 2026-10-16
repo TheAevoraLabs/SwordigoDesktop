@@ -997,6 +997,73 @@ static void test_depth_law() {
           "Engine is the shipped default");
 }
 
+// ── The flat-Z ship contract (doc 13 §9) ─────────────────────────────────
+// One constant plane per object, |front| == |back| for every node, no PRNG draw
+// reaching it, and the declared depth resolving back to that same plane so an
+// edit cannot walk the declaration outwards.
+static void test_flat_z_ship_contract() {
+    std::printf("[16] the flat-Z ship contract (#will be unlocked after)\n");
+    check(!boulderx::kPerNodeReliefUnlocked,
+          "per-node relief ships staged off (#will be unlocked after)");
+
+    boulderx::Params params;
+    params.mesh_type = 1;
+    params.surface_width = 180.0;
+    params.horiz_noise = 60.0;
+    params.random_seed = 0u;            // seed 0 is what the caves carry
+    params.hat_width_offset_1 = 5.0;
+    params.hat_height = 25.0;
+
+    std::vector<double> front, back;
+    boulderx::flat_node_depths(params, 24, front, back);
+    bool flat = front.size() == 24 && back.size() == 24;
+    for (size_t i = 0; flat && i < front.size(); ++i)
+        flat = front[i] == 90.0 && back[i] == -90.0;
+    check(flat, "every node lands on SurfaceWidth/2, both sides, no jitter");
+
+    // Neither seed nor HorizNoise may reach the plane: a second draw with a
+    // different seed and no noise is the identical array.
+    boulderx::Params other = params;
+    other.random_seed = 123456u;
+    other.horiz_noise = 0.0;
+    std::vector<double> f2, b2;
+    boulderx::flat_node_depths(other, 24, f2, b2);
+    check(f2 == front && b2 == back, "the plane does not depend on seed or noise");
+
+    // MeshType 1 declares plane + W1; the declared rule reads that back to the
+    // same plane, so regenerating cannot grow the object.
+    check_near(boulderx::flat_plane_declared(95.0, 1, 5.0), 90.0, 1e-9,
+               "a MeshType 1 declaration resolves back to its plane");
+    check_near(boulderx::flat_plane_declared(90.0, 0, 5.0), 90.0, 1e-9,
+               "a MeshType 0 declaration is the plane already");
+    check(boulderx::flat_plane_declared(3.0, 1, 5.0) == 0.0,
+          "a declaration with no room for the rim does not invert the slab");
+
+    // Generated from flat planes, the cap is PLANAR: the ear order we have not
+    // recovered (doc 13 §1.3.1) then cannot show up as a corrupt cap.
+    std::vector<boulderx::Node> outline;
+    for (int i = 0; i < 24; ++i) {
+        const double a = 2.0 * 3.14159265358979 * i / 24.0;
+        outline.push_back({200.0 * std::cos(a), 200.0 * std::sin(a),
+                           front[size_t(i)], back[size_t(i)]});
+    }
+    params.depth_source = boulderx::Params::DepthSource::Outline;
+    params.horiz_noise = 0.0;
+    boulderx::Mesh mesh;
+    check(boulderx::generate(outline, params, mesh), "a flat outline generates");
+    bool cap_flat = !mesh.fronts.empty();
+    for (const auto& sm : mesh.fronts)
+        for (const auto& v : sm.vertices) cap_flat = cap_flat && v.z == 90.0f;
+    check(cap_flat, "the cap sits planar on the plane");
+    // The engine's rim profile peaks at plane + W1 + W2 (the bevel vertex of
+    // emit_ring): 90 + 5 + 5 = 100 here, symmetrically -100. One more W1 —
+    // 105 — would mean the DECLARED depth was fed in as the plane, which is
+    // the "it over-increases the Z" report this path exists to make impossible.
+    const double rim_peak = 90.0 + params.hat_width_offset_1 + params.hat_width_offset_2;
+    check_near(mesh.max_abs_z(), rim_peak, 1e-6,
+               "MeshType 1's rim peaks at plane + W1 + W2 exactly, not a fourth W1 deep");
+}
+
 int main() {
     std::printf("========================================\n");
     std::printf("  boulderx — Caver-faithful ground generator\n");
@@ -1016,6 +1083,7 @@ int main() {
     test_depth_recovery();
     test_dome_hats();
     test_depth_law();
+    test_flat_z_ship_contract();
     if (g_failures) {
         std::printf("FAIL: %d check(s) failed\n", g_failures);
         return 1;

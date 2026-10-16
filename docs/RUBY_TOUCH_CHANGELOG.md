@@ -5,6 +5,24 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 > **Repository move (2026-09-26):** development moved from GitHub (`TheAevoraLabs`, terminated by automated moderation) to GitLab — [AevoralabsIN/RubyTouch](https://gitlab.com/AevoralabsIN/RubyTouch) — with a mirror at [quantumcreeper/RubyTouch](https://codeberg.org/quantumcreeper/RubyTouch). `github.com` links in older entries below are historical.
 
+## [1.4.3] - 2026-10-17
+
+### Added
+- **WaterMesh Studio Revamp (`WaterMeshStudioPanel.qml`)**:
+  - Native, responsive controls with dedicated `[ Enter Visual W-Mesh Editor ]` action bar.
+  - Themed `IconButton` steppers (`-16` / `+16`) for tile size, body color picker, and dimensional steppers (Width, Depth, X, Y).
+  - Foundation for arbitrary vertex polygon input and visual wireframe editing.
+
+### Optimized & Fixed
+- **Mobile Render & Engine Performance Overhaul**:
+  - Removed artificial `Thread.sleep` from `GameRenderer.java` on the GLSurfaceView thread, restoring native VSync pacing and eliminating physics/frame stutter.
+  - Dynamic 120Hz display refresh mode selection in `GameRenderer.java`.
+  - Disabled 4x MSAA on mobile full-screen FBO (`ruby_quick_viewport.cpp`), eliminating tile resolve and memory bandwidth starvation on mobile GPUs.
+  - Throttled continuous 30 FPS water animation timer when idle, running strictly during interactive W-Mesh edit sessions.
+  - Batched non-visual scene markers into a single unlit shader pass, cutting hundreds of GPU state rebinding cycles per frame.
+- **Orientation & Scene Loading Stability**:
+  - Resolved screen orientation lock-out and removed `onWidthChanged` recursive loading overlay triggers in `SceneViewportView.qml`.
+
 ---
 
 ## [1.4.1] - 2026-09-26

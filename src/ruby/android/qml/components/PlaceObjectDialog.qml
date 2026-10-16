@@ -597,6 +597,7 @@ Popup {
                 cellWidth: Math.floor(width / 2)
                 cellHeight: Theme.dp(64)
                 model: [
+                    { name: "Water / Fluid Pool", kind: "Water", icon: "water", desc: "Interactive fluid volume with wave simulation & presets", color: "#06b6d4" },
                     { name: "Spawn Point", kind: "SpawnPoint", icon: "star", desc: "Player entrance & checkpoint spawn marker", color: "#eab308" },
                     { name: "Portal Gate", kind: "Portal", icon: "external", desc: "Level transition door / portal zone", color: "#3b82f6" },
                     { name: "Empty Object", kind: "Empty", icon: "cube", desc: "Empty SceneObject ready for components", color: "#a855f7" }

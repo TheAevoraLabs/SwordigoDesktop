@@ -81,6 +81,28 @@ static double mesh_area(const boulderx::Submesh& s) {
     return a;
 }
 
+// The generator emits every family in the engine's <=20-front chunks, so a
+// fixture with more than 20 faces in one family arrives as SEVERAL submeshes.
+// These aggregate over a family the way the engine's own per-family totals do.
+static size_t total_verts(const std::vector<boulderx::Submesh>& subs) {
+    size_t n = 0;
+    for (const auto& s : subs) n += s.vertices.size();
+    return n;
+}
+
+static size_t total_fronts(const std::vector<boulderx::Submesh>& subs) {
+    size_t n = 0;
+    for (const auto& s : subs)
+        n += s.indexed ? s.indices.size() / 3 : s.vertices.size() / 3;
+    return n;
+}
+
+static double total_area(const std::vector<boulderx::Submesh>& subs) {
+    double a = 0.0;
+    for (const auto& s : subs) a += mesh_area(s);
+    return a;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fixture A — beyond_graveyard.scene, obj12
 //
@@ -286,8 +308,12 @@ static void fixture_fire_part5_obj2() {
 
     boulderx::Mesh mesh;
     check(boulderx::generate(doc.outline, doc.params, mesh), "generates");
-    check(mesh.surfaces.size() == 1 && mesh.fronts.size() == 1,
-          "MT0: one ribbon + one cap (engine also wrote a 2nd FrontMesh patch for its own hole)");
+    check(!mesh.surfaces.empty() && !mesh.fronts.empty(),
+          "MT0: a ribbon and a cap (engine also wrote a 2nd FrontMesh patch for its own hole)");
+    // 24 nodes: the ribbon's 48 faces and the cap's 22 arrive in <=20-face
+    // chunks, i.e. several submeshes per family.
+    check(mesh.surfaces.size() > 1 && mesh.fronts.size() > 1,
+          "both families are split into the engine's <=20-face chunks");
 
     double lo = 0, hi = 0;
     z_range(mesh.surfaces[0], lo, hi);
@@ -296,8 +322,13 @@ static void fixture_fire_part5_obj2() {
     z_range(mesh.fronts[0], lo, hi);
     check_near(lo, 15.0, 1e-3, "cap flat on the front plane (engine z [15,15])");
 
-    check(mesh.fronts[0].vertices.size() / 3 == 22,
+    check(total_fronts(mesh.fronts) == 22,
           "cap emits n-2 = 22 triangles (engine emitted only 20 — two ears left unclipped)");
+    // 2n FACES, not 2n vertices: chunking re-emits the vertices on a chunk seam
+    // so the two sides can be drawn independently (the bake does the same), so
+    // the vertex total is >= 2n and the face total is exactly 2n.
+    check(total_fronts(mesh.surfaces) == 2 * (int)doc.outline.size(),
+          "ribbon emits 2n faces across its chunks");
     // Area closure is the property the engine's 20-triangle cap does not have.
     double outline_a = 0.0;
     for (size_t i = 0; i < doc.outline.size(); ++i) {
@@ -306,7 +337,7 @@ static void fixture_fire_part5_obj2() {
         outline_a += p.x * q.y - q.x * p.y;
     }
     outline_a = std::fabs(0.5 * outline_a);
-    check_near(mesh_area(mesh.fronts[0]), outline_a, outline_a * 1e-3 + 1e-6,
+    check_near(total_area(mesh.fronts), outline_a, outline_a * 1e-3 + 1e-6,
                "cap tiles the whole outline (no hole left by collinear runs)");
 }
 
@@ -346,7 +377,7 @@ static void fixture_concave_vanilla() {
 
     boulderx::Mesh mesh;
     check(boulderx::generate(doc.outline, doc.params, mesh), "concave outline generates");
-    check(mesh.fronts[0].vertices.size() / 3 == 18, "cap has n-2 = 18 triangles");
+    check(total_fronts(mesh.fronts) == 18, "cap has n-2 = 18 triangles");
     double outline_a = 0.0;
     for (size_t i = 0; i < doc.outline.size(); ++i) {
         const auto& p = doc.outline[i];
@@ -354,9 +385,12 @@ static void fixture_concave_vanilla() {
         outline_a += p.x * q.y - q.x * p.y;
     }
     outline_a = std::fabs(0.5 * outline_a);
-    check_near(mesh_area(mesh.fronts[0]), outline_a, outline_a * 1e-3 + 1e-6,
+    check_near(total_area(mesh.fronts), outline_a, outline_a * 1e-3 + 1e-6,
                "cap tiles the concave outline");
-    check(mesh.surfaces[0].vertices.size() == 40, "ribbon has 2n = 40 vertices");
+    // 40 ribbon faces exceed one chunk, so aggregate over the family.
+    check(total_fronts(mesh.surfaces) == 40, "ribbon has 2n = 40 faces");
+    check(total_verts(mesh.surfaces) >= 40,
+          "ribbon has at least 2n vertices (a chunk seam duplicates its boundary)");
 }
 
 int main() {

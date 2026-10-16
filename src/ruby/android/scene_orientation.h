@@ -38,7 +38,7 @@ class SceneOrientation : public QObject {
     Q_PROPERTY(qreal safeInsetRight READ safeInsetRight NOTIFY insetsChanged)
     Q_PROPERTY(qreal statusBarHeight READ statusBarHeight NOTIFY insetsChanged)
     Q_PROPERTY(qreal navBarHeight READ navBarHeight NOTIFY insetsChanged)
-    Q_PROPERTY(bool isLandscape READ isLandscape NOTIFY insetsChanged)
+    Q_PROPERTY(bool isLandscape READ isLandscape NOTIFY orientationPolicyChanged)
 
 public:
     explicit SceneOrientation(QObject* parent = nullptr);

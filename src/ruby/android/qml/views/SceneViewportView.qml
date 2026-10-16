@@ -56,6 +56,8 @@ Item {
     property bool consoleCollapsed: true
     /// Master controls visibility toggle (hide/show all floating HUD and buttons)
     property bool controlsVisible: true
+    /// WaterMesh Fluid Studio open state
+    property bool waterStudioOpen: false
 
     signal backRequested()
     signal openScriptRequested(string path)
@@ -69,8 +71,12 @@ Item {
     readonly property real padSize: Theme.dp(68)
     readonly property real consoleHeight: Theme.dp(98)
 
+    property bool forceBypassOrientation: true
+
     /// Landscape (or at least wide enough) to host the four-surface deck.
-    readonly property bool studioFits: root.width >= Theme.dp(560) && root.width > root.height
+    readonly property bool studioFits: forceBypassOrientation
+                                       || root.width > root.height
+                                       || (typeof screenOrientation !== "undefined" && screenOrientation && screenOrientation.isLandscape)
 
     readonly property var gizmoModes: [
         { name: qsTr("View"),   mode: 0, icon: "eye"    },
@@ -81,6 +87,10 @@ Item {
 
     property var savedCameraState: null
     property bool viewportLoading: true
+    property string lastLoadedPath: ""
+    readonly property bool inAnyMeshEdit: (typeof viewportItem !== "undefined" && viewportItem)
+                                          ? (viewportItem.meshEditActive || viewportItem.waterEditActive)
+                                          : false
 
     Timer {
         id: loadingDismissTimer
@@ -95,6 +105,10 @@ Item {
     }
 
     function requestExit() {
+        if (viewportItem.waterEditActive) {
+            viewportItem.discardWaterMeshEdit()
+            return true
+        }
         if (viewportItem.meshEditActive) {
             viewportItem.discardMeshEdit()
             return true
@@ -128,7 +142,8 @@ Item {
     }
 
     function loadCurrentPath() {
-        if (scenePath.length > 0) {
+        if (scenePath.length > 0 && scenePath !== lastLoadedPath) {
+            lastLoadedPath = scenePath
             root.startLoading(qsTr("Loading 3D Geometry..."))
             var parts = scenePath.split("/")
             root.sceneName = parts[parts.length - 1]
@@ -143,13 +158,6 @@ Item {
             if (root.savedCameraState) {
                 viewportItem.setCameraState(root.savedCameraState)
             }
-        }
-    }
-
-    onWidthChanged: {
-        if (root.studioFits) {
-            root.viewportLoading = true
-            loadingDismissTimer.restart()
         }
     }
 
@@ -202,37 +210,32 @@ Item {
     RubyQuickViewport {
         id: viewportItem
         anchors.fill: parent
+        holdToSelect: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.holdToSelect : false
 
         onSceneLoaded: loadingDismissTimer.restart()
         onModelLoaded: loadingDismissTimer.restart()
 
-        // Single tap selects, exactly like a desktop click
-        // (Viewport3DWidget picks on click). Long press still selects and
-        // additionally names what was picked, which is useful for the small
-        // logic markers that carry no geometry of their own.
-        TapHandler {
-            id: viewportTap
-            enabled: !viewportItem.meshEditActive
-            gesturePolicy: TapHandler.WithinBounds
-            longPressThreshold: 0.4
-            onTapped: {
-                var pt = viewportTap.point.position
-                var hit = viewportItem.pickObjectAt(pt.x, pt.y)
-                if (hit >= 0 && typeof screenOrientation !== "undefined" && screenOrientation)
-                    screenOrientation.vibrateTouch(18)
-            }
-            onLongPressed: {
-                var pt = viewportTap.point.position
-                var hit = viewportItem.pickObjectAt(pt.x, pt.y)
-                console.log("[Ruby] Viewport long-pressed at (" + pt.x + "," + pt.y + ") -> hit: " + hit)
-                if (hit >= 0) {
-                    if (typeof screenOrientation !== "undefined" && screenOrientation) {
-                        screenOrientation.vibrateTouch(35)
-                    }
-                    var objData = viewportItem.getSelectedObjectData()
-                    var name = objData.name || objData.template || (qsTr("Object #%1").arg(hit))
-                    root.showToast(qsTr("Selected: %1").arg(name), false)
-                }
+        // ── Touch selection (desktop single-click parity) ───────────────────
+        // Selection and framing are resolved in C++ straight from the raw touch
+        // stream (RubyQuickViewport::touchEvent): a tap picks the object under
+        // the finger exactly like a desktop left click, a tap on empty space
+        // deselects, and a second tap within the double-tap window frames the
+        // object. There is deliberately no QML TapHandler here any more — it
+        // used to swallow the tap and force selection onto a 0.45 s long-press,
+        // which is most of why selecting anything felt unreliable.
+        onObjectTapped: (index, doubleTap) => {
+            if (index >= 0) {
+                var objData = viewportItem.getSelectedObjectData()
+                var name = objData.name || objData.template || qsTr("Object #%1").arg(index)
+                if (typeof screenOrientation !== "undefined" && screenOrientation)
+                    screenOrientation.vibrateTouch(doubleTap ? 30 : 20)
+                root.showToast(doubleTap
+                               ? qsTr("Framed %1").arg(name)
+                               : qsTr("Selected: %1").arg(name), false)
+            } else if (!doubleTap) {
+                if (typeof screenOrientation !== "undefined" && screenOrientation)
+                    screenOrientation.vibrateTouch(12)
+                root.showToast(qsTr("Deselected"), false)
             }
         }
 
@@ -240,6 +243,21 @@ Item {
             if (viewportItem.meshEditActive) {
                 root.outlinerOpen = false
                 root.inspectorOpen = false
+                root.waterStudioOpen = false
+                // A new edit starts with the style bar closed and pulls the
+                // tuning back from the viewport, so the steppers never show a
+                // value carried over from the previous object.
+                root.styleBarOpen = false
+                root.refreshZypherTuning()
+            }
+        }
+
+        onWaterEditActiveChanged: {
+            if (viewportItem.waterEditActive) {
+                root.outlinerOpen = false
+                root.inspectorOpen = false
+                root.waterStudioOpen = false
+                root.styleBarOpen = false
             }
         }
 
@@ -248,6 +266,96 @@ Item {
             if (viewportItem.lastError.length > 0)
                 root.showToast(viewportItem.lastError, true)
         }
+
+        function updateExclusionRects() {
+            viewportItem.clearTouchExclusionRects()
+            var padMargin = Theme.dp(16) // Generous finger boundary around controls
+
+            // Bottom control deck (MovePad, Center mode pill, FlyPad)
+            if (controlDeck.visible) {
+                var pMove = controlDeck.mapToItem(viewportItem, movePad.x, movePad.y)
+                viewportItem.addTouchExclusionRect(pMove.x - padMargin, pMove.y - padMargin,
+                                                  movePad.width + padMargin * 2, movePad.height + padMargin * 2)
+
+                var pFly = controlDeck.mapToItem(viewportItem, flyPad.x, flyPad.y)
+                viewportItem.addTouchExclusionRect(pFly.x - padMargin, pFly.y - padMargin,
+                                                  flyPad.width + padMargin * 2, flyPad.height + padMargin * 2)
+
+                if (centerGizmoBar.visible) {
+                    var pGizmoBar = controlDeck.mapToItem(viewportItem, centerGizmoBar.x, centerGizmoBar.y)
+                    viewportItem.addTouchExclusionRect(pGizmoBar.x - padMargin, pGizmoBar.y - padMargin,
+                                                      centerGizmoBar.width + padMargin * 2, centerGizmoBar.height + padMargin * 2)
+                }
+            }
+
+            // Floating GizmoPad (when armed)
+            if (gizmoPad.visible) {
+                var pGizmo = gizmoPad.mapToItem(viewportItem, 0, 0)
+                viewportItem.addTouchExclusionRect(pGizmo.x - padMargin, pGizmo.y - padMargin,
+                                                  gizmoPad.width + padMargin * 2, gizmoPad.height + padMargin * 2)
+            }
+
+            // Right-edge precision controls (D-Pad, Rotate buttons, Z-depth nudge buttons)
+            if (rightEdgeControls.visible) {
+                var pRight = rightEdgeControls.mapToItem(viewportItem, 0, 0)
+                viewportItem.addTouchExclusionRect(pRight.x - padMargin, pRight.y - padMargin,
+                                                  rightEdgeControls.width + padMargin * 2, rightEdgeControls.height + padMargin * 2)
+            }
+
+            // Left-edge controls (Place, Delete, Back)
+            if (leftEdgeControls.visible) {
+                var pLeft = leftEdgeControls.mapToItem(viewportItem, 0, 0)
+                viewportItem.addTouchExclusionRect(pLeft.x - padMargin, pLeft.y - padMargin,
+                                                  leftEdgeControls.width + padMargin * 2, leftEdgeControls.height + padMargin * 2)
+            }
+
+            // Top HUD identity & menu pills
+            if (leftHud.visible) {
+                var pLeftHud = leftHud.mapToItem(viewportItem, 0, 0)
+                viewportItem.addTouchExclusionRect(pLeftHud.x - padMargin, pLeftHud.y - padMargin,
+                                                  leftHud.width + padMargin * 2, leftHud.height + padMargin * 2)
+            }
+            if (rightHud.visible) {
+                var pRightHud = rightHud.mapToItem(viewportItem, 0, 0)
+                viewportItem.addTouchExclusionRect(pRightHud.x - padMargin, pRightHud.y - padMargin,
+                                                  rightHud.width + padMargin * 2, rightHud.height + padMargin * 2)
+            }
+            if (hudTogglePill.visible) {
+                var pHudToggle = hudTogglePill.mapToItem(viewportItem, 0, 0)
+                viewportItem.addTouchExclusionRect(pHudToggle.x - padMargin, pHudToggle.y - padMargin,
+                                                  hudTogglePill.width + padMargin * 2, hudTogglePill.height + padMargin * 2)
+            }
+            if (meshEditToolbar.visible) {
+                var pMeshBar = meshEditToolbar.mapToItem(viewportItem, 0, 0)
+                viewportItem.addTouchExclusionRect(pMeshBar.x - padMargin, pMeshBar.y - padMargin,
+                                                  meshEditToolbar.width + padMargin * 2, meshEditToolbar.height + padMargin * 2)
+            }
+            if (waterEditToolbar.visible) {
+                var pWaterBar = waterEditToolbar.mapToItem(viewportItem, 0, 0)
+                viewportItem.addTouchExclusionRect(pWaterBar.x - padMargin, pWaterBar.y - padMargin,
+                                                  waterEditToolbar.width + padMargin * 2, waterEditToolbar.height + padMargin * 2)
+            }
+            if (animBar.visible) {
+                var pAnimBar = animBar.mapToItem(viewportItem, 0, 0)
+                viewportItem.addTouchExclusionRect(pAnimBar.x - padMargin, pAnimBar.y - padMargin,
+                                                  animBar.width + padMargin * 2, animBar.height + padMargin * 2)
+            }
+            if (waterStudioPanel.open && waterStudioPanel.visible) {
+                var pWaterPanel = waterStudioPanel.mapToItem(viewportItem, 0, 0)
+                viewportItem.addTouchExclusionRect(pWaterPanel.x, pWaterPanel.y,
+                                                  waterStudioPanel.width, waterStudioPanel.height)
+            }
+        }
+
+        onWidthChanged: updateExclusionTimer.restart()
+        onHeightChanged: updateExclusionTimer.restart()
+    }
+
+    Timer {
+        id: updateExclusionTimer
+        interval: 100
+        repeat: false
+        onTriggered: viewportItem.updateExclusionRects()
     }
 
     // ── Mesh Edit Floating Control Bar ─────────────────────────────────────
@@ -267,6 +375,76 @@ Item {
             id: meshToolbarRow
             anchors.centerIn: parent
             spacing: Theme.dp(5)
+
+            // Generator mode: Boulder / Zenith / Zypher. Switching pushes
+            // straight into boulderx (rubySettings) and re-runs the open edit.
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                height: Theme.dp(28)
+                width: genSegRow.implicitWidth + Theme.dp(8)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.surface2, 0.9)
+                border.color: Theme.borderSubtle
+                border.width: 1
+
+                Row {
+                    id: genSegRow
+                    anchors.centerIn: parent
+                    spacing: 0
+
+                    Repeater {
+                        model: [
+                            { id: "boulder", label: qsTr("Boulder") },
+                            { id: "boulderx", label: qsTr("Zenith") },
+                            { id: "zypher",  label: qsTr("Zypher") }
+                        ]
+                        Rectangle {
+                            height: Theme.dp(22)
+                            width: genSegLabel.implicitWidth + Theme.dp(14)
+                            radius: Theme.radiusSm
+                            color: root.genMode === modelData.id
+                                   ? Theme.alpha(Theme.accentInk, 0.22) : "transparent"
+                            border.color: root.genMode === modelData.id
+                                          ? Theme.accentInk : "transparent"
+                            border.width: 1
+                            Text {
+                                id: genSegLabel
+                                anchors.centerIn: parent
+                                text: modelData.label
+                                font.pixelSize: Theme.dp(10)
+                                font.weight: root.genMode === modelData.id ? Font.Bold : Font.Medium
+                                color: root.genMode === modelData.id
+                                       ? Theme.accentInk : Theme.textSecondary
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: root.setGenerator(modelData.id)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Pencil: toggles the Zypher mesh style bar (bottom). Present only
+            // on Zypher ground objects, where the style is generated geometry
+            // and therefore actually selectable.
+            IconButton {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.zypherMode
+                iconName: "pencil"
+                buttonSize: Theme.dp(28)
+                iconSize: Theme.dp(14)
+                square: true
+                tint: root.styleBarOpen ? Theme.accentInk : Theme.textPrimary
+                plate: root.styleBarOpen ? Theme.alpha(Theme.accentInk, 0.20) : Theme.alpha(Theme.surface2, 0.9)
+                plateEdge: root.styleBarOpen ? Theme.accentInk : Theme.borderSubtle
+                onClicked: {
+                    if (typeof screenOrientation !== "undefined" && screenOrientation)
+                        screenOrientation.vibrateTouch(20)
+                    root.styleBarOpen = !root.styleBarOpen
+                    if (root.styleBarOpen) root.refreshZypherTuning()
+                }
+            }
 
             // Discard Button
             Rectangle {
@@ -522,6 +700,389 @@ Item {
         }
     }
 
+    // ── Water Mesh (W-Mesh) Floating Control Bar ───────────────────────────
+    GlassmorphicOverlay {
+        id: waterEditToolbar
+        anchors.top: root.width > root.height ? parent.top : leftHud.bottom
+        anchors.right: root.width > root.height ? parent.right : undefined
+        anchors.horizontalCenter: root.width > root.height ? undefined : parent.horizontalCenter
+        anchors.topMargin: root.width > root.height ? Theme.dp(6) : Theme.dp(8)
+        anchors.rightMargin: root.width > root.height ? Theme.dp(6) : 0
+        height: Theme.dp(40)
+        width: waterToolbarRow.implicitWidth + Theme.dp(20)
+        z: 30
+        visible: viewportItem.waterEditActive
+
+        Row {
+            id: waterToolbarRow
+            anchors.centerIn: parent
+            spacing: Theme.dp(5)
+
+            // Identity Badge
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                height: Theme.dp(28)
+                width: wBadgeRow.implicitWidth + Theme.dp(12)
+                radius: Theme.radiusSm
+                color: Theme.alpha("#06b6d4", 0.22)
+                border.color: "#06b6d4"
+                border.width: 1
+
+                Row {
+                    id: wBadgeRow
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(3)
+                    Icon { name: "water"; size: Theme.dp(12); color: "#06b6d4" }
+                    Text { text: qsTr("W-Mesh"); font.pixelSize: Theme.dp(11); font.weight: Font.Bold; color: "#06b6d4" }
+                }
+            }
+
+            // Discard Button
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                height: Theme.dp(28)
+                width: discardWRow.implicitWidth + Theme.dp(12)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.surface2, 0.9)
+                border.color: Theme.borderSubtle
+                border.width: 1
+                Row {
+                    id: discardWRow
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(3)
+                    Icon { name: "close"; size: Theme.dp(13); color: Theme.colorErrorBright }
+                    Text { text: qsTr("Discard"); font.pixelSize: Theme.dp(11); font.weight: Font.Medium; color: Theme.textPrimary }
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
+                        viewportItem.discardWaterMeshEdit()
+                    }
+                }
+            }
+
+            // Reset to Rect Button
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                height: Theme.dp(28)
+                width: resetRectRow.implicitWidth + Theme.dp(10)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.surface2, 0.9)
+                border.color: Theme.borderSubtle
+                border.width: 1
+                Row {
+                    id: resetRectRow
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(3)
+                    Icon { name: "rotate"; size: Theme.dp(12); color: Theme.textSecondary }
+                    Text { text: qsTr("Reset Rect"); font.pixelSize: Theme.dp(11); color: Theme.textSecondary }
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(20)
+                        viewportItem.resetWaterEditToRect()
+                    }
+                }
+            }
+
+            // Divider
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: 1
+                height: Theme.dp(18)
+                color: Theme.borderSubtle
+            }
+
+            // Previous Vertex Button
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: Theme.dp(26)
+                height: Theme.dp(28)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.surface2, 0.85)
+                border.color: Theme.borderSubtle
+                border.width: 1
+                Icon {
+                    anchors.centerIn: parent
+                    name: "chevron-left"
+                    size: Theme.dp(13)
+                    color: Theme.textPrimary
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                        viewportItem.selectPrevWaterVertex()
+                    }
+                }
+            }
+
+            // Vertex Index Badge
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                height: Theme.dp(28)
+                width: wVertBadgeText.implicitWidth + Theme.dp(14)
+                radius: Theme.radiusSm
+                color: Theme.alpha("#06b6d4", 0.18)
+                border.color: Theme.alpha("#06b6d4", 0.50)
+                border.width: 1
+                Text {
+                    id: wVertBadgeText
+                    anchors.centerIn: parent
+                    text: qsTr("V %1/%2").arg(viewportItem.selectedWaterVertex + 1).arg(viewportItem.waterVertexCount)
+                    font.pixelSize: Theme.dp(10)
+                    font.weight: Font.Bold
+                    color: "#06b6d4"
+                }
+            }
+
+            // Next Vertex Button
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: Theme.dp(26)
+                height: Theme.dp(28)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.surface2, 0.85)
+                border.color: Theme.borderSubtle
+                border.width: 1
+                Icon {
+                    anchors.centerIn: parent
+                    name: "chevron-right"
+                    size: Theme.dp(13)
+                    color: Theme.textPrimary
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                        viewportItem.selectNextWaterVertex()
+                    }
+                }
+            }
+
+            // Add Point Button
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                height: Theme.dp(28)
+                width: addPointRow.implicitWidth + Theme.dp(12)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.surface3, 0.9)
+                border.color: "#06b6d4"
+                border.width: 1
+                Row {
+                    id: addPointRow
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(3)
+                    Icon { name: "plus"; size: Theme.dp(12); color: "#06b6d4" }
+                    Text { text: qsTr("Point"); font.pixelSize: Theme.dp(11); font.weight: Font.DemiBold; color: "#06b6d4" }
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                        viewportItem.insertWaterVertex(viewportItem.selectedWaterVertex, 0, 0)
+                    }
+                }
+            }
+
+            // Delete Point Button
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                height: Theme.dp(28)
+                width: delPointRow.implicitWidth + Theme.dp(10)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.surface2, 0.9)
+                border.color: Theme.borderSubtle
+                border.width: 1
+                enabled: viewportItem.waterVertexCount > 3
+                opacity: enabled ? 1.0 : 0.4
+                Row {
+                    id: delPointRow
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(2)
+                    Icon { name: "trash"; size: Theme.dp(12); color: Theme.colorDanger }
+                    Text { text: qsTr("Del"); font.pixelSize: Theme.dp(11); color: Theme.colorDanger }
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
+                        viewportItem.deleteWaterVertex(viewportItem.selectedWaterVertex)
+                    }
+                }
+            }
+
+            // Divider
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: 1
+                height: Theme.dp(18)
+                color: Theme.borderSubtle
+            }
+
+            // Apply Button
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                height: Theme.dp(28)
+                width: applyWRow.implicitWidth + Theme.dp(14)
+                radius: Theme.radiusSm
+                color: Theme.colorSuccess
+                Row {
+                    id: applyWRow
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(3)
+                    Icon { name: "check"; size: Theme.dp(13); color: "#ffffff" }
+                    Text { text: qsTr("Apply"); font.pixelSize: Theme.dp(11); font.weight: Font.Bold; color: "#ffffff" }
+                }
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
+                        viewportItem.applyWaterMeshEdit()
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Mesh style bar (Zypher look) ───────────────────────────────────────
+    //
+    // The old ZypherLookPanel was a 272x430dp side window with text fields for
+    // the tuning numbers. It is now a thin bottom bar the same height as the
+    // viewport console, opened by the pencil button in the mesh-edit toolbar and
+    // smoothly revealed upward. Numeric tuning lives in the floating
+    // BubbleStepper pads on the right — press-and-hold +/- instead of a keyboard.
+    property bool styleBarOpen: false
+    property real zypFreq: 6
+    property real zypDepth: 14
+    property real zypMinColl: 8
+
+    // ── Ground-mesh generator mode (Boulder / Zenith / Zypher) ─────────────
+    // The desktop edition's Generator combo, ported as a touch segmented
+    // control for the in-scene editor. rubySettings is the single source of
+    // truth: its setter persists AND pushes into boulderx synchronously, so
+    // every generator-gated affordance below re-evaluates the moment a segment
+    // is tapped (zypherActive() alone has no notify signal and would freeze).
+    readonly property string genMode: (typeof rubySettings !== "undefined" && rubySettings)
+                                      ? rubySettings.groundGenerator
+                                      : (viewportItem.zypherActive() ? "zypher" : "boulder")
+    readonly property bool zypherMode: root.genMode === "zypher"
+
+    function setGenerator(id) {
+        if (id === root.genMode) return
+        if (typeof screenOrientation !== "undefined" && screenOrientation)
+            screenOrientation.vibrateTouch(15)
+        if (typeof rubySettings !== "undefined" && rubySettings)
+            rubySettings.groundGenerator = id
+        if (id !== "zypher" && root.styleBarOpen)
+            root.styleBarOpen = false
+        if (id === "zypher")
+            root.refreshZypherTuning()
+        // Re-run the open edit's generation path with the new engine so the
+        // switch shows new geometry immediately, not at the next commit.
+        viewportItem.refreshMeshEditPreview()
+    }
+
+    function refreshZypherTuning() {
+        if (typeof viewportItem.getZypherLook !== "function") return
+        var s = viewportItem.getZypherLook()
+        if (!s) return
+        root.zypFreq = s.frequency
+        root.zypDepth = s.depth
+        root.zypMinColl = s.minCollisionRadius
+    }
+
+    // Reveal container: animating its height (clipped) is what makes the bar
+    // grow smoothly out of the bottom edge instead of popping in.
+    Item {
+        id: styleDock
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        height: (root.styleBarOpen && viewportItem.meshEditActive
+                 && root.zypherMode) ? root.consoleHeight : 0
+        clip: true
+        z: 28
+        visible: height > 0.5 || root.styleBarOpen
+
+        Behavior on height { NumberAnimation { duration: Theme.durMed; easing.type: Easing.OutCubic } }
+
+        MeshStyleBar {
+            id: meshStyleBar
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.leftMargin: Theme.dp(6)
+            anchors.rightMargin: Theme.dp(6)
+            anchors.bottomMargin: Theme.dp(4)
+            height: root.consoleHeight - Theme.dp(8)
+            host: viewportItem
+            modeActive: root.zypherMode
+            onCloseRequested: root.styleBarOpen = false
+            onZypherStylesChanged: root.refreshZypherTuning()
+        }
+    }
+
+    // ── Floating numeric bubbles (Zypher tuning, right side) ──────────────
+    // Frequency = features per 100 unit, Depth/radius = feature size, Min radius
+    // = the size below which a feature casts no collision. Hold + / - to ramp.
+    Column {
+        id: zypBubbles
+        anchors.right: parent.right
+        anchors.verticalCenter: parent.verticalCenter
+        anchors.rightMargin: Theme.dp(6)
+        spacing: Theme.dp(8)
+        z: 29
+        visible: root.styleBarOpen && viewportItem.meshEditActive
+                 && root.zypherMode
+        opacity: visible ? 1.0 : 0.0
+
+        Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
+
+        BubbleStepper {
+            anchors.horizontalCenter: parent.horizontalCenter
+            label: qsTr("FREQ")
+            step: 0.5; decimals: 1
+            value: root.zypFreq
+            onStepped: (delta) => {
+                var nv = Math.max(0.5, Math.min(30.0, root.zypFreq + delta))
+                if (Math.abs(nv - root.zypFreq) < 1e-6) return
+                root.zypFreq = nv
+                viewportItem.setZypherLook("", "", nv, -1, -1)
+            }
+        }
+
+        BubbleStepper {
+            anchors.horizontalCenter: parent.horizontalCenter
+            label: qsTr("DEPTH")
+            tone: Theme.colorModel
+            step: 1.0; decimals: 0
+            value: root.zypDepth
+            onStepped: (delta) => {
+                var nv = Math.max(0.0, Math.min(120.0, root.zypDepth + delta))
+                if (Math.abs(nv - root.zypDepth) < 1e-6) return
+                root.zypDepth = nv
+                viewportItem.setZypherLook("", "", -1, nv, -1)
+            }
+        }
+
+        BubbleStepper {
+            anchors.horizontalCenter: parent.horizontalCenter
+            label: qsTr("MIN R")
+            tone: Theme.colorWarning
+            step: 1.0; decimals: 0
+            value: root.zypMinColl
+            onStepped: (delta) => {
+                var nv = Math.max(0.0, Math.min(120.0, root.zypMinColl + delta))
+                if (Math.abs(nv - root.zypMinColl) < 1e-6) return
+                root.zypMinColl = nv
+                viewportItem.setZypherLook("", "", -1, -1, nv)
+            }
+        }
+    }
+
     // ── HUD: left pill (identity) ──────────────────────────────────────────
     GlassmorphicOverlay {
         id: leftHud
@@ -595,12 +1156,16 @@ Item {
                                       .arg(viewportItem.meshVertexCount)
                                       .arg(viewportItem.groundGeneratorStatus)
                                 : qsTr("Mesh Edit (%1 v)").arg(viewportItem.meshVertexCount))
-                             : qsTr("%1 objects · %2").arg(viewportItem.objectCount)
-                                                    .arg(viewportItem.gizmoMode === 0
-                                                         ? qsTr("view")
-                                                         : root.gizmoModes[viewportItem.gizmoMode].name.toLowerCase()))
+                             : (viewportItem.waterEditActive
+                                ? qsTr("W-Mesh Edit (%1 v)").arg(viewportItem.waterVertexCount)
+                                : qsTr("%1 objects · %2").arg(viewportItem.objectCount)
+                                                     .arg(viewportItem.gizmoMode === 0
+                                                          ? qsTr("view")
+                                                          : root.gizmoModes[viewportItem.gizmoMode].name.toLowerCase())))
                     font.pixelSize: Theme.dp(Theme.fontXs)
-                    color: viewportItem.meshEditActive ? Theme.colorWarning : Theme.textMuted
+                    color: viewportItem.meshEditActive
+                           ? Theme.colorWarning
+                           : (viewportItem.waterEditActive ? "#06b6d4" : Theme.textMuted)
                     elide: Text.ElideRight
                 }
             }
@@ -620,7 +1185,7 @@ Item {
         border.color: root.controlsVisible ? Theme.borderSubtle : Theme.accentInk
         border.width: 1
         z: 30
-        visible: root.controlsVisible && !viewportItem.meshEditActive
+        visible: root.controlsVisible && !root.inAnyMeshEdit
 
         Row {
             anchors.centerIn: parent
@@ -658,8 +1223,8 @@ Item {
         height: Theme.dp(40)
         width: rightHudRow.implicitWidth + Theme.dp(16)
         z: 12
-        visible: root.controlsVisible && !viewportItem.meshEditActive
-        opacity: (root.controlsVisible && !viewportItem.meshEditActive) ? 1.0 : 0.0
+        visible: root.controlsVisible && !root.inAnyMeshEdit
+        opacity: (root.controlsVisible && !root.inAnyMeshEdit) ? 1.0 : 0.0
 
         Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
 
@@ -749,6 +1314,100 @@ Item {
                         } else {
                             viewportItem.beginMeshEdit()
                         }
+                    }
+                }
+            }
+
+            // Water Mesh Edit mode toggle
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: viewportItem.canWaterMeshEdit
+                height: Theme.dp(30)
+                width: wmeshEditRow.implicitWidth + Theme.dp(14)
+                radius: Theme.radiusSm
+                color: viewportItem.waterEditActive
+                       ? Theme.alpha("#06b6d4", 0.35)
+                       : Theme.alpha(Theme.surface2, 0.90)
+                border.color: viewportItem.waterEditActive ? "#06b6d4" : Theme.borderSubtle
+                border.width: 1
+
+                Row {
+                    id: wmeshEditRow
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(4)
+
+                    Icon {
+                        anchors.verticalCenter: parent.verticalCenter
+                        name: "water"
+                        size: Theme.dp(13)
+                        color: viewportItem.waterEditActive ? "#06b6d4" : Theme.textPrimary
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: viewportItem.waterEditActive ? qsTr("W-Edit") : qsTr("W-Mesh")
+                        font.pixelSize: Theme.dp(11)
+                        font.weight: Font.DemiBold
+                        color: viewportItem.waterEditActive ? "#06b6d4" : Theme.textPrimary
+                    }
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation) {
+                            screenOrientation.vibrateTouch(20)
+                            screenOrientation.lockLandscape()
+                        }
+                        if (viewportItem.waterEditActive) {
+                            viewportItem.applyWaterMeshEdit()
+                        } else {
+                            viewportItem.beginWaterMeshEdit()
+                        }
+                    }
+                }
+            }
+
+            // Dedicated Fluid Studio button (visible when selected object is water)
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: viewportItem.isSelectedWater
+                height: Theme.dp(30)
+                width: waterRow.implicitWidth + Theme.dp(14)
+                radius: Theme.radiusSm
+                color: root.waterStudioOpen
+                       ? Theme.alpha("#06b6d4", 0.35)
+                       : Theme.alpha(Theme.surface2, 0.90)
+                border.color: root.waterStudioOpen ? "#06b6d4" : Theme.borderSubtle
+                border.width: 1
+
+                Row {
+                    id: waterRow
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(4)
+
+                    Icon {
+                        anchors.verticalCenter: parent.verticalCenter
+                        name: "water"
+                        size: Theme.dp(13)
+                        color: root.waterStudioOpen ? "#06b6d4" : Theme.textPrimary
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: qsTr("Fluid")
+                        font.pixelSize: Theme.dp(11)
+                        font.weight: Font.DemiBold
+                        color: root.waterStudioOpen ? "#06b6d4" : Theme.textPrimary
+                    }
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        if (typeof screenOrientation !== "undefined" && screenOrientation)
+                            screenOrientation.vibrateTouch(20)
+                        root.waterStudioOpen = !root.waterStudioOpen
                     }
                 }
             }
@@ -850,7 +1509,7 @@ Item {
         height: Theme.dp(26)
         width: Math.min(coordsRow.implicitWidth + Theme.dp(12), root.width * 0.45)
         z: 12
-        visible: root.controlsVisible && !root.outlinerOpen && !viewportItem.meshEditActive
+        visible: root.controlsVisible && !root.outlinerOpen && !root.inAnyMeshEdit
         opacity: visible ? 1.0 : 0.0
 
         Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
@@ -932,7 +1591,7 @@ Item {
         anchors.leftMargin: Theme.dp(6)
         spacing: Theme.dp(4)
         z: 12
-        visible: root.controlsVisible && !root.outlinerOpen && !viewportItem.meshEditActive
+        visible: root.controlsVisible && !root.outlinerOpen && !root.inAnyMeshEdit
         opacity: visible ? 1.0 : 0.0
 
         Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
@@ -1049,7 +1708,7 @@ Item {
         anchors.rightMargin: Theme.dp(6)
         spacing: Theme.dp(4)
         z: 12
-        visible: root.controlsVisible && !root.inspectorOpen && root.consoleCollapsed && !viewportItem.meshEditActive
+        visible: root.controlsVisible && !root.inspectorOpen && root.consoleCollapsed && !root.inAnyMeshEdit
         opacity: visible ? 1.0 : 0.0
 
         Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
@@ -1465,7 +2124,9 @@ Item {
         anchors.bottom: parent.bottom
         height: root.consoleHeight
         z: 11
-        visible: root.controlsVisible && root.studioFits
+        // The style bar takes the deck's place while it is open, so the two
+        // never stack up and eat twice the height.
+        visible: root.controlsVisible && root.studioFits && !root.styleBarOpen
 
         // Left Thumbstick (Pan / Move Camera)
         NavPad {
@@ -1492,7 +2153,7 @@ Item {
             anchors.bottomMargin: Theme.dp(10)
             height: Theme.dp(36)
             width: gizmoRow.implicitWidth + Theme.dp(12)
-            visible: !viewportItem.meshEditActive
+            visible: !root.inAnyMeshEdit
 
             Row {
                 id: gizmoRow
@@ -1551,6 +2212,34 @@ Item {
             onPanRequested: (vx, vy) => viewportItem.panCamera(vx, vy)
             onDollyRequested: (fwd, strafe) => viewportItem.dollyCamera(fwd, strafe)
         }
+    }
+
+    // ── Floating gizmo pad for precise object transforms ───────────────────
+    // Touch-first replacement for dragging a 3D gizmo handle, which a thumb is
+    // always covering. It only appears once a transform mode is armed AND an
+    // object is selected, so it never competes with camera navigation, and its
+    // axis buttons repeat while held — the touch equivalent of keeping a desktop
+    // gizmo drag alive. It pairs with the centre mode pill, which arms the mode.
+    GizmoPad {
+        id: gizmoPad
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: root.consoleHeight + Theme.dp(8)
+        cellSize: Theme.dp(30)
+        gizmoMode: viewportItem.gizmoMode
+        hasSelection: viewportItem.selectedObject >= 0
+        visible: root.controlsVisible && root.studioFits
+                 && viewportItem.gizmoMode > 0
+                 && viewportItem.selectedObject >= 0
+                 && !root.inAnyMeshEdit
+        z: 13
+        onNudged: (axis, steps) => viewportItem.nudgeSelected(axis, steps)
+        onModeCycleRequested: {
+            if (typeof screenOrientation !== "undefined" && screenOrientation)
+                screenOrientation.vibrateTouch(15)
+            viewportItem.gizmoMode = (viewportItem.gizmoMode + 1) % 4
+        }
+        onModeRequested: (mode) => viewportItem.gizmoMode = mode
     }
 
     // ── Outliner (left, full height, over the live viewport) ──────────────
@@ -1612,10 +2301,24 @@ Item {
 
         onMaximizeRequested: (value) => root.inspectorMaximized = value
 
+        onOpenWaterStudioRequested: {
+            root.inspectorOpen = false
+            root.waterStudioOpen = true
+        }
+
         onCloseRequested: {
             root.inspectorOpen = false
             root.inspectorMaximized = false
         }
+    }
+
+    // ── WaterMesh / Fluid Studio Panel (right dock over the live viewport) ───
+    WaterMeshStudioPanel {
+        id: waterStudioPanel
+        host: viewportItem
+        open: root.waterStudioOpen && viewportItem.isSelectedWater
+        dockWidth: Math.min(Theme.dp(340), root.width * 0.85)
+        onCloseRequested: root.waterStudioOpen = false
     }
 
     // ── Overflow menu: the long tail of viewport controls ─────────────────
@@ -1755,6 +2458,9 @@ Item {
                     viewportMenu.close()
                     if (viewportItem.meshEditActive) {
                         viewportItem.applyMeshEdit()
+                    }
+                    if (viewportItem.waterEditActive) {
+                        viewportItem.applyWaterMeshEdit()
                     }
                     if (viewportItem.dirty) {
                         viewportItem.saveScene()
@@ -2083,15 +2789,11 @@ Item {
         statusText: viewportItem.isSceneLoading && viewportItem.loadingStatus.length > 0 ? viewportItem.loadingStatus : qsTr("Preparing 3D Viewport...")
     }
 
-    // ── Landscape gate — last layer, covers everything ────────────────────
+    // ── Landscape gate — non-blocking so scenes always open freely ───────
     OrientationGate {
         anchors.fill: parent
         z: 100
-        blocking: !root.studioFits
-        platformCanRotate: typeof screenOrientation !== "undefined"
-                            && screenOrientation !== null
-                            && screenOrientation.supported
-        targetName: root.sceneName
-        onBackRequested: root.requestExit()
+        blocking: false
+        visible: false
     }
 }

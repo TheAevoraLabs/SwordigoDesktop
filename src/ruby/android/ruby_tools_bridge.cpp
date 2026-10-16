@@ -439,10 +439,19 @@ QVariantMap RubyToolsBridge::exportGroundMeshSheet(const QVariantMap& sheet) {
 
     const std::vector<boulderx::Node> outline = outline_from_points(points, front, back);
     const bool relief = outline_has_relief(outline);
+    // v2 whenever the chosen generator can express more than a uniform slab:
+    // Zenith and Zypher both build per-node depth (Zypher's relief is fed from
+    // the same front/back arrays), so a sheet authored under either keeps its
+    // per-node Z. Boulder stays the v1 dialect — a uniform slab every tool can
+    // still read — and a v2 sheet reaching a Boulder session is refused by the
+    // dialect gate with the reason rather than silently flattened.
+    const QString gen_id =
+        sheet.value(QStringLiteral("generator"), QStringLiteral("boulder")).toString();
+    const auto global_gen = boulderx::ground_generator();
     const bool want_boulderx =
-        sheet.value(QStringLiteral("generator"), QStringLiteral("boulder")).toString()
-            == QStringLiteral("boulderx") ||
-        boulderx::ground_generator() == boulderx::GroundGenerator::BoulderX;
+        gen_id == QStringLiteral("boulderx") || gen_id == QStringLiteral("zypher") ||
+        global_gen == boulderx::GroundGenerator::BoulderX ||
+        global_gen == boulderx::GroundGenerator::Zypher;
 
     // Dome hats are not drawable on a 2D canvas, so the list the sheet came in
     // with is carried straight back out. Dropping it would delete domes from a

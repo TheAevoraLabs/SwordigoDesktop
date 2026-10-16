@@ -95,15 +95,64 @@ Item {
     /// map instead of keeping it.
     property bool loadedRelief: false
 
-    /// Generator this sheet is authored for. It decides the .swdm DIALECT on
-    /// export: with relief (or BoulderX selected) the sheet is written as format
-    /// v2, which stores one depth per node and which Boulder therefore cannot
-    /// open. A uniform sheet in Boulder mode stays v1, readable by both.
+    /// Generator this sheet is authored for — Boulder / Zenith / Zypher, the
+    /// desktop edition's Generator combo ported as chips in the dock. It decides
+    /// the .swdm DIALECT on export: under Zenith or Zypher (or with relief) the
+    /// sheet is written as format v2, which stores one depth per node and which
+    /// Boulder therefore cannot open. A uniform sheet in Boulder mode stays v1,
+    /// readable by both.
     ///
-    /// The fallback matches boulderx::ground_generator()'s own default, so the
-    /// bridge being unavailable cannot silently select the other generator.
+    /// The fallback matches the app's default (Zypher), so the bridge being
+    /// unavailable cannot silently select a different generator.
     property string generatorId: (typeof rubySettings !== "undefined" && rubySettings)
-                                 ? rubySettings.groundGenerator : "boulder"
+                                 ? rubySettings.groundGenerator : "zypher"
+    readonly property bool zypherMode: generatorId === "zypher"
+    readonly property string generatorLabel: generatorId === "zypher" ? qsTr("Zypher")
+                                             : generatorId === "boulderx" ? qsTr("Zenith")
+                                             : qsTr("Boulder")
+
+    // ── Zypher look (shared with the in-scene editor) ──────────────────────
+    // The BubbleSteppers own no value — same contract as SceneViewportView:
+    // this root keeps it, the pads report signed deltas, and every write goes
+    // through the shared ruby_mobile/zypher_* keys.
+    property real zypFreq: 6
+    property real zypDepth: 14
+    property real zypMinColl: 8
+
+    function refreshZypherTuning() {
+        if (typeof rubySettings === "undefined" || !rubySettings || !rubySettings.getZypherLook)
+            return
+        var s = rubySettings.getZypherLook()
+        if (!s) return
+        root.zypFreq = s.frequency
+        root.zypDepth = s.depth
+        root.zypMinColl = s.minCollisionRadius
+    }
+
+    onZypherModeChanged: if (root.zypherMode) root.refreshZypherTuning()
+
+    /// Generator switch. rubySettings is the single source of truth: its
+    /// groundGenerator setter persists the choice AND pushes it into boulderx,
+    /// so `generatorId` (and therefore zypherMode, the ZYPHER LOOK section, and
+    /// the export dialect) above re-evaluates the instant a chip is tapped.
+    function setGenerator(id) {
+        if (id === root.generatorId) return
+        if (typeof screenOrientation !== "undefined" && screenOrientation)
+            screenOrientation.vibrateTouch(15)
+        if (typeof rubySettings !== "undefined" && rubySettings)
+            rubySettings.groundGenerator = id
+        if (id === "zypher")
+            root.refreshZypherTuning()
+    }
+
+    /// Write a Zypher tuning value through the SAME shared keys the in-scene
+    /// editor and this sheet both read, so the sheet's style GUI and the
+    /// viewport's never drift. -1 means "leave that one alone".
+    function tuneZypher(freq, depth, minColl) {
+        if (typeof rubySettings === "undefined" || !rubySettings)
+            return
+        rubySettings.setZypherLook("", "", freq, depth, minColl)
+    }
     /// Generator component fields carried into the sheet (engine defaults).
     property int meshType: 1
     property int randomSeed: 1291618994
@@ -172,6 +221,7 @@ Item {
         if (typeof androidContext !== "undefined" && androidContext)
             androidContext.lockLandscape()
         canvas.requestPaint()
+        root.refreshZypherTuning()
     }
 
     Component.onDestruction: {
@@ -186,6 +236,9 @@ Item {
             screenOrientation.lockLandscape()
         if (typeof androidContext !== "undefined" && androidContext)
             androidContext.lockLandscape()
+        // Re-entering after a session in the in-scene editor: pick up whatever
+        // look that editor left in the shared keys.
+        root.refreshZypherTuning()
     }
 
     // ========================================================================
@@ -1024,7 +1077,7 @@ Item {
             }
 
             Text {
-                text: qsTr("%1 vertices · %2 tool").arg(root.pointCount).arg(root.tool)
+                text: qsTr("%1 vertices · %2 · %3 tool").arg(root.pointCount).arg(root.generatorLabel).arg(root.tool)
                 font.pixelSize: Theme.dp(Theme.fontXs)
                 color: Theme.textMuted
             }
@@ -1191,6 +1244,159 @@ Item {
                         Chip {
                             text: modelData
                             onClicked: root.loadPreset(modelData === "Island" ? "Floating Island" : modelData)
+                        }
+                    }
+                }
+
+                Rectangle { height: 1; width: parent.width; color: Theme.borderSubtle }
+
+                // ── Generator ───────────────────────────────────────────────
+                // The desktop edition's Generator combo, ported as a segmented
+                // control. The choice is app-wide (rubySettings pushes it
+                // straight into boulderx) and decides the .swdm dialect on
+                // export, so it sits above the sheet controls that follow.
+                Text {
+                    text: qsTr("GENERATOR")
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    font.weight: Font.Bold
+                    font.letterSpacing: 1.1
+                    color: Theme.textMuted
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: Theme.dp(30)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.9)
+                    border.color: Theme.borderSubtle
+                    border.width: 1
+
+                    Row {
+                        id: genSegRow
+                        anchors.centerIn: parent
+                        spacing: 0
+
+                        Repeater {
+                            model: [
+                                { id: "boulder",  label: qsTr("Boulder") },
+                                { id: "boulderx", label: qsTr("Zenith") },
+                                { id: "zypher",   label: qsTr("Zypher") }
+                            ]
+                            Rectangle {
+                                height: Theme.dp(24)
+                                width: Math.max(Theme.dp(48), genSegLabel.implicitWidth + Theme.dp(16))
+                                radius: Theme.radiusSm
+                                color: root.generatorId === modelData.id
+                                       ? Theme.alpha(Theme.accentInk, 0.22) : "transparent"
+                                border.color: root.generatorId === modelData.id
+                                              ? Theme.accentInk : "transparent"
+                                border.width: 1
+                                Text {
+                                    id: genSegLabel
+                                    anchors.centerIn: parent
+                                    text: modelData.label
+                                    font.pixelSize: Theme.dp(11)
+                                    font.weight: root.generatorId === modelData.id
+                                                 ? Font.Bold : Font.Medium
+                                    color: root.generatorId === modelData.id
+                                           ? Theme.accentInk : Theme.textSecondary
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: root.setGenerator(modelData.id)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    width: parent.width
+                    text: root.generatorId === "zypher"
+                          ? qsTr("Zypher (Gen 3): engine-shaped ground with the style controls below.")
+                          : root.generatorId === "boulderx"
+                            ? qsTr("Zenith (Gen 2): engine-faithful sheet, exported as format v2.")
+                            : qsTr("Boulder (Gen 1): classic v1 sheet, the widest-compatible dialect.")
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    color: Theme.textMuted
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: 1
+                    color: Theme.borderSubtle
+                    visible: root.zypherMode
+                }
+
+                // ── Zypher look ─────────────────────────────────────────────
+                // Same style GUI as the in-scene editor, hosted here so the
+                // sheet being drafted is shaped under the very settings the
+                // viewport will use. Hosted on rubySettings (the shared store),
+                // not the viewport: the studio has no Zypher object of its own.
+                Text {
+                    visible: root.zypherMode
+                    text: qsTr("ZYPHER LOOK")
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    font.weight: Font.Bold
+                    font.letterSpacing: 1.1
+                    color: Theme.textMuted
+                }
+
+                MeshStyleBar {
+                    id: studioStyleBar
+                    visible: root.zypherMode
+                    width: parent.width
+                    height: Theme.dp(56)
+                    showClose: false
+                    host: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings : null
+                    modeActive: root.zypherMode
+                    onZypherStylesChanged: root.refreshZypherTuning()
+                }
+
+                // Numeric tune pads. Same contract as the in-scene editor: the
+                // root owns the value, each pad reports a signed delta, and every
+                // write goes through the shared ruby_mobile/zypher_* keys.
+                Row {
+                    visible: root.zypherMode
+                    width: parent.width
+                    spacing: Theme.dp(Theme.spacingSm)
+
+                    BubbleStepper {
+                        label: qsTr("FREQ")
+                        step: 0.5; decimals: 1
+                        value: root.zypFreq
+                        onStepped: (delta) => {
+                            var nv = Math.max(0.5, Math.min(30.0, root.zypFreq + delta))
+                            if (Math.abs(nv - root.zypFreq) < 1e-6) return
+                            root.zypFreq = nv
+                            root.tuneZypher(nv, -1, -1)
+                        }
+                    }
+
+                    BubbleStepper {
+                        label: qsTr("DEPTH")
+                        tone: Theme.colorModel
+                        step: 1.0; decimals: 0
+                        value: root.zypDepth
+                        onStepped: (delta) => {
+                            var nv = Math.max(0.0, Math.min(120.0, root.zypDepth + delta))
+                            if (Math.abs(nv - root.zypDepth) < 1e-6) return
+                            root.zypDepth = nv
+                            root.tuneZypher(-1, nv, -1)
+                        }
+                    }
+
+                    BubbleStepper {
+                        label: qsTr("MIN R")
+                        tone: Theme.colorWarning
+                        step: 1.0; decimals: 0
+                        value: root.zypMinColl
+                        onStepped: (delta) => {
+                            var nv = Math.max(0.0, Math.min(120.0, root.zypMinColl + delta))
+                            if (Math.abs(nv - root.zypMinColl) < 1e-6) return
+                            root.zypMinColl = nv
+                            root.tuneZypher(-1, -1, nv)
                         }
                     }
                 }

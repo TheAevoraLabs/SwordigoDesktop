@@ -242,6 +242,7 @@ struct SceneData {
         float  tile_size = 64.0f;    // texture tile size (TextureMapping f2)
         float  tex_offset[2] = {0, 0}; // texture offset (TextureMapping f3)
         std::string texture;         // texture name (e.g. "water")
+        std::vector<float> polygon_points; // arbitrary polygon vertices [x0, y0, x1, y1, ...]
     };
     std::vector<SceneWater> waters;
 

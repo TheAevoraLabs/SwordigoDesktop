@@ -2696,9 +2696,14 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
         // LightManager is fed by the glLightfv publish path in
         // jni_bridge_arm64.cpp, which fires when a LightComponent places its light
         // and hands over the component's authored colour, position and attenuation
-        // triple. This is the first consumer that buffer has ever had: before
-        // this it was cleared at the top of every frame and thrown away empty, and
-        // the shader lit the scene from a single GL-state guess instead.
+        // triple. When the level's .scene file was parsed at scene-open time
+        // (light_manager_on_scene_open), each entry additionally carries the
+        // component's REAL Type (payload f1), Intensity (f2) and Radius (f7)
+        // instead of the fixed intensity and attenuation-derived reach that used
+        // to stand in for them. This is the first consumer that buffer has ever
+        // had: before this it was cleared at the top of every frame and thrown
+        // away empty, and the shader lit the scene from a single GL-state guess
+        // instead.
         //
         // Adaptivity. 32 lights can be collected, but only a handful can matter on
         // one screen and the shader pays for every entry it loops over, so the
@@ -2717,6 +2722,15 @@ void fbo_end_game_and_blit(int win_w, int win_h, FBOScale mode, const PostFXStat
 
             for (size_t i = 0; i < collected.size() && n_cand < int(LightManager::MAX_LIGHTS); ++i) {
                 const EnginePointLight& L = collected[i];
+                // Type separation (LightComponent payload f1): only a TYPE-3
+                // POINT light belongs in this per-pixel loop. Ambient (type 1)
+                // and directional (type 2) are global terms the guest has
+                // already baked into the pre-lit frame — accumulating them
+                // additively here would light the scene a second time — and a
+                // directional's stored position is a transformed direction,
+                // not a place, so its projected reach would be garbage too.
+                // Type 0 = no GL signal interpreted, treated as a point light.
+                if (L.type != kLightTypeUnknown && L.type != kLightTypePoint) continue;
                 if (L.radius <= 0.0f || L.intensity <= 0.0f) continue;  // global light
 
                 // The stored position is EYE space (see EnginePointLight), so the
