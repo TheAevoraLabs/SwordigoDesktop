@@ -4,6 +4,7 @@
 #include "platform/pvr_loader.h"
 #include "tools/scene_asset_resolver.h"
 #include "tools/scene_workspace.h"
+#include "tools/rubymesh_meta.h"
 #include <QThreadPool>
 #include <QOpenGLFramebufferObject>
 #include <QOpenGLFunctions>
@@ -3901,6 +3902,113 @@ static av::SceneComponent make_shape_polygon_rect_component(int id, float x, flo
     return comp;
 }
 
+static av::SceneComponent make_collision_shape_hazard_component(int id, float x, float y, float w, float h) {
+    av::SceneComponent comp;
+    comp.type_name = "CollisionShape";
+    comp.type_id = id;
+    comp.payload_field = 121;
+
+    proto::Writer shape;
+    shape.write_nested_field(1, make_water_rect(x, y, w, h));
+
+    proto::Writer col;
+    col.write_varint_field(4, 1);     // InflictsDamage: 1
+    col.write_float_field(6, -15.0f); // MinDepth: -15
+    col.write_float_field(7, 15.0f);  // MaxDepth: 15
+    col.write_varint_field(8, 6);     // SpecialType: 6 (environmental hazard / lava)
+    col.write_varint_field(11, 1);    // Enabled: 1
+    col.write_varint_field(14, 1);    // UnsafeGround: 1
+
+    proto::Writer wrapper;
+    wrapper.write_string_field(1, "CollisionShape");
+    wrapper.write_varint_field(2, id);
+    wrapper.write_nested_field(120, shape);
+    wrapper.write_nested_field(121, col);
+
+    comp.raw_data = wrapper.to_string();
+    return comp;
+}
+
+static av::SceneComponent make_collision_shape_hazard_polygon_component(int id, float x, float y, float w, float h,
+                                                                      const std::vector<boulder::PolygonPoint>& pts) {
+    av::SceneComponent comp;
+    comp.type_name = "CollisionShape";
+    comp.type_id = id;
+    comp.payload_field = 121;
+
+    proto::Writer shape;
+    shape.write_nested_field(1, make_water_rect(x, y, w, h));
+    if (pts.size() > 4) {
+        shape.write_nested_field(3, make_water_polygon(pts));
+    }
+
+    proto::Writer col;
+    col.write_varint_field(4, 1);     // InflictsDamage: 1
+    col.write_float_field(6, -15.0f); // MinDepth: -15
+    col.write_float_field(7, 15.0f);  // MaxDepth: 15
+    col.write_varint_field(8, 6);     // SpecialType: 6 (environmental hazard / lava)
+    col.write_varint_field(11, 1);    // Enabled: 1
+    col.write_varint_field(14, 1);    // UnsafeGround: 1
+
+    proto::Writer wrapper;
+    wrapper.write_string_field(1, "CollisionShape");
+    wrapper.write_varint_field(2, id);
+    wrapper.write_nested_field(120, shape);
+    wrapper.write_nested_field(121, col);
+
+    comp.raw_data = wrapper.to_string();
+    return comp;
+}
+
+static av::SceneComponent make_damage_component(int id, int minDamage, int maxDamage, int damageType, bool ignoreImmunity) {
+    av::SceneComponent comp;
+    comp.type_name = "Damage";
+    comp.type_id = id;
+    comp.payload_field = 122;
+
+    proto::Writer dmg;
+    dmg.write_varint_field(1, minDamage > 0 ? minDamage : 1);
+    dmg.write_varint_field(2, damageType == 1 ? 1 : 0); // 0 = Physical/Fire, 1 = Magical
+    dmg.write_varint_field(3, 0); // SpecialDamageType: 0
+    dmg.write_varint_field(5, maxDamage >= minDamage ? maxDamage : minDamage);
+    dmg.write_float_field(6, damageType == 0 ? 1.0f : 0.0f); // PhysicalDamageFactor
+    dmg.write_float_field(7, damageType == 1 ? 1.0f : 0.0f); // MagicDamageFactor
+    dmg.write_varint_field(8, ignoreImmunity ? 1 : 0);       // IgnoreTargetImmunity
+    dmg.write_varint_field(9, 1);                            // CanBeBlocked: 1
+
+    proto::Writer wrapper;
+    wrapper.write_string_field(1, "Damage");
+    wrapper.write_varint_field(2, id);
+    wrapper.write_nested_field(122, dmg);
+
+    comp.raw_data = wrapper.to_string();
+    return comp;
+}
+
+static av::SceneComponent make_monster_entity_component(int id) {
+    av::SceneComponent comp;
+    comp.type_name = "MonsterEntity";
+    comp.type_id = id;
+    comp.payload_field = 158;
+
+    proto::Writer ent;
+    ent.write_varint_field(1, 1); // FacingDirection: 1
+    ent.write_varint_field(2, 0); // PhysicsEnabled: 0
+
+    proto::Writer monster;
+    monster.write_varint_field(3, 0); // GivesExperience: 0
+    monster.write_varint_field(4, 1); // DefaultDeathAnimation: 1
+
+    proto::Writer wrapper;
+    wrapper.write_string_field(1, "MonsterEntity");
+    wrapper.write_varint_field(2, id);
+    wrapper.write_nested_field(152, ent);
+    wrapper.write_nested_field(158, monster);
+
+    comp.raw_data = wrapper.to_string();
+    return comp;
+}
+
 static av::SceneComponent make_texture_mapping_component(int id, const std::string& texture,
                                                         float tile_size, float off_x, float off_y) {
     av::SceneComponent comp;
@@ -3947,38 +4055,110 @@ QVariantMap RubyQuickViewport::getSelectedWaterProperties() const {
     res["objectIndex"] = objIdx;
     res["objectName"] = QString::fromStdString(obj.name);
 
+    float rx = 0.0f, ry = 0.0f, rw = 300.0f, rh = 80.0f;
+    float frontR = 0.20f, frontG = 0.50f, frontB = 0.85f, frontA = 0.78f;
+    float surfR  = 0.40f, surfG  = 0.75f, surfB  = 1.00f, surfA  = 0.82f;
+    QString tex = QStringLiteral("water");
+    float tileSize = 64.0f;
+    float offX = 0.0f, offY = 0.0f;
+
     for (const auto& w : m_scene.waters) {
         if (w.object_index == objIdx) {
-            res["x"] = w.rect[0];
-            res["y"] = w.rect[1];
-            res["width"] = w.rect[2];
-            res["height"] = w.rect[3];
-            res["frontR"] = w.front_color[0];
-            res["frontG"] = w.front_color[1];
-            res["frontB"] = w.front_color[2];
-            res["frontA"] = w.front_color[3];
-            res["surfaceR"] = w.surface_color[0];
-            res["surfaceG"] = w.surface_color[1];
-            res["surfaceB"] = w.surface_color[2];
-            res["surfaceA"] = w.surface_color[3];
-            res["texture"] = QString::fromStdString(w.texture.empty() ? "water" : w.texture);
-            res["tileSize"] = w.tile_size > 0.0f ? w.tile_size : 64.0f;
-            res["offsetX"] = w.tex_offset[0];
-            res["offsetY"] = w.tex_offset[1];
-            return res;
+            rx = w.rect[0];
+            ry = w.rect[1];
+            rw = w.rect[2];
+            rh = w.rect[3];
+            frontR = w.front_color[0];
+            frontG = w.front_color[1];
+            frontB = w.front_color[2];
+            frontA = w.front_color[3];
+            surfR  = w.surface_color[0];
+            surfG  = w.surface_color[1];
+            surfB  = w.surface_color[2];
+            surfA  = w.surface_color[3];
+            tex = QString::fromStdString(w.texture.empty() ? "water" : w.texture);
+            tileSize = w.tile_size > 0.0f ? w.tile_size : 64.0f;
+            offX = w.tex_offset[0];
+            offY = w.tex_offset[1];
+            break;
         }
     }
 
-    res["x"] = 0.0f;
-    res["y"] = 0.0f;
-    res["width"] = 300.0f;
-    res["height"] = 80.0f;
-    res["frontR"] = 0.20f; res["frontG"] = 0.50f; res["frontB"] = 0.85f; res["frontA"] = 0.78f;
-    res["surfaceR"] = 0.40f; res["surfaceG"] = 0.75f; res["surfaceB"] = 1.00f; res["surfaceA"] = 0.82f;
-    res["texture"] = "water";
-    res["tileSize"] = 64.0f;
-    res["offsetX"] = 0.0f;
-    res["offsetY"] = 0.0f;
+    res["x"] = rx;
+    res["y"] = ry;
+    res["width"] = rw;
+    res["height"] = rh;
+
+    // Both naming conventions supported so QML is guaranteed to receive correct values
+    res["frontR"] = frontR; res["frontG"] = frontG; res["frontB"] = frontB; res["frontA"] = frontA;
+    res["color_r"] = frontR; res["color_g"] = frontG; res["color_b"] = frontB; res["color_a"] = frontA;
+
+    res["surfaceR"] = surfR; res["surfaceG"] = surfG; res["surfaceB"] = surfB; res["surfaceA"] = surfA;
+    res["surface_r"] = surfR; res["surface_g"] = surfG; res["surface_b"] = surfB; res["surface_a"] = surfA;
+
+    res["texture"] = tex;
+    res["tileSize"] = tileSize;
+    res["tile_size"] = tileSize;
+    res["offsetX"] = offX;
+    res["offsetY"] = offY;
+
+    // Detect hazard/damage mechanics from attached components
+    bool isDeadly = false;
+    int minDamage = 4;
+    int maxDamage = 4;
+    int damageType = 0;
+    bool ignoreImmunity = true;
+
+    const auto& comps = obj.resolved_components.empty() ? obj.components : obj.resolved_components;
+    for (const auto& c : comps) {
+        if (c.type_name == "Damage" || c.payload_field == 122) {
+            isDeadly = true;
+            try {
+                proto::Reader wrapper(c.raw_data);
+                proto::Field wf;
+                while (wrapper.read_field(wf)) {
+                    if (wf.field_number == 122 && wf.wire_type == proto::WIRE_LEN) {
+                        proto::Reader dc(wf.bytes_val);
+                        proto::Field df;
+                        while (dc.read_field(df)) {
+                            if (df.field_number == 1 && df.wire_type == proto::WIRE_VARINT) {
+                                minDamage = int(df.varint_val);
+                            } else if (df.field_number == 2 && df.wire_type == proto::WIRE_VARINT) {
+                                damageType = int(df.varint_val);
+                            } else if (df.field_number == 5 && df.wire_type == proto::WIRE_VARINT) {
+                                maxDamage = int(df.varint_val);
+                            } else if (df.field_number == 8 && df.wire_type == proto::WIRE_VARINT) {
+                                ignoreImmunity = (df.varint_val != 0);
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+        } else if (c.type_name == "CollisionShape" || c.payload_field == 121) {
+            try {
+                proto::Reader wrapper(c.raw_data);
+                proto::Field wf;
+                while (wrapper.read_field(wf)) {
+                    if (wf.field_number == 121 && wf.wire_type == proto::WIRE_LEN) {
+                        proto::Reader csc(wf.bytes_val);
+                        proto::Field cf;
+                        while (csc.read_field(cf)) {
+                            if (cf.field_number == 4 && cf.wire_type == proto::WIRE_VARINT) {
+                                if (cf.varint_val != 0) isDeadly = true;
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
+    res["isDeadly"] = isDeadly;
+    res["minDamage"] = minDamage;
+    res["maxDamage"] = maxDamage;
+    res["damageType"] = damageType;
+    res["ignoreImmunity"] = ignoreImmunity;
+
     return res;
 }
 
@@ -3998,38 +4178,90 @@ bool RubyQuickViewport::setSelectedWaterProperties(const QVariantMap& props) {
     if (rh < 10.0f) rh = 10.0f;
 
     float front[4] = {
-        props.value("frontR", 0.20f).toFloat(),
-        props.value("frontG", 0.50f).toFloat(),
-        props.value("frontB", 0.85f).toFloat(),
-        props.value("frontA", 0.78f).toFloat()
+        props.value("frontR", props.value("color_r", 0.20f)).toFloat(),
+        props.value("frontG", props.value("color_g", 0.50f)).toFloat(),
+        props.value("frontB", props.value("color_b", 0.85f)).toFloat(),
+        props.value("frontA", props.value("color_a", 0.78f)).toFloat()
     };
     float surface[4] = {
-        props.value("surfaceR", 0.40f).toFloat(),
-        props.value("surfaceG", 0.75f).toFloat(),
-        props.value("surfaceB", 1.00f).toFloat(),
-        props.value("surfaceA", 0.82f).toFloat()
+        props.value("surfaceR", props.value("surface_r", 0.40f)).toFloat(),
+        props.value("surfaceG", props.value("surface_g", 0.75f)).toFloat(),
+        props.value("surfaceB", props.value("surface_b", 1.00f)).toFloat(),
+        props.value("surfaceA", props.value("surface_a", 0.82f)).toFloat()
     };
     std::string tex = props.value("texture", "water").toString().trimmed().toStdString();
     if (tex.empty()) tex = "water";
-    float tile = props.value("tileSize", 64.0f).toFloat();
+    float tile = props.value("tileSize", props.value("tile_size", 64.0f)).toFloat();
     if (tile <= 0.0f) tile = 64.0f;
     float off_x = props.value("offsetX", 0.0f).toFloat();
     float off_y = props.value("offsetY", 0.0f).toFloat();
+
+    bool isDeadly = props.value("isDeadly", false).toBool();
+    int minDmg = props.value("minDamage", 4).toInt();
+    int maxDmg = props.value("maxDamage", minDmg).toInt();
+    if (maxDmg < minDmg) maxDmg = minDmg;
+    int dmgType = props.value("damageType", 0).toInt();
+    bool ignoreImmunity = props.value("ignoreImmunity", true).toBool();
+
+    // Preserve existing polygon points if present
+    std::vector<boulder::PolygonPoint> existingPts;
+    for (const auto& w : m_scene.waters) {
+        if (w.object_index == m_selectedObject && w.polygon_points.size() >= 6) {
+            for (size_t pi = 0; pi + 1 < w.polygon_points.size(); pi += 2) {
+                existingPts.push_back({double(w.polygon_points[pi]), double(w.polygon_points[pi + 1])});
+            }
+            break;
+        }
+    }
 
     std::vector<av::SceneComponent> retained;
     retained.reserve(obj.components.size());
     for (const auto& c : obj.components) {
         if (c.type_name == "WaterMesh" || c.payload_field == 114) continue;
-        if (c.type_id == 103 && (c.type_name.find("Shape") != std::string::npos || c.payload_field == 120)) continue;
-        if (c.type_id == 106 && (c.type_name.find("Texture") != std::string::npos || c.payload_field == 113)) continue;
+        if (c.type_name.find("Shape") != std::string::npos || c.payload_field == 120 || c.payload_field == 121) continue;
+        if (c.type_name.find("Texture") != std::string::npos || c.payload_field == 113) continue;
+        if (c.type_name == "Damage" || c.payload_field == 122) continue;
+        if (c.type_name == "MonsterEntity" || c.payload_field == 158 || c.payload_field == 152) continue;
         retained.push_back(c);
     }
+
     retained.push_back(make_water_component(101, 103, 106, front, surface));
-    retained.push_back(make_shape_rect_component(103, rx, ry, rw, rh));
+    if (isDeadly) {
+        if (!existingPts.empty()) {
+            retained.push_back(make_collision_shape_hazard_polygon_component(103, rx, ry, rw, rh, existingPts));
+        } else {
+            retained.push_back(make_collision_shape_hazard_component(103, rx, ry, rw, rh));
+        }
+        retained.push_back(make_damage_component(109, minDmg, maxDmg, dmgType, ignoreImmunity));
+        retained.push_back(make_monster_entity_component(110));
+    } else {
+        if (!existingPts.empty()) {
+            retained.push_back(make_shape_polygon_rect_component(103, rx, ry, rw, rh, existingPts));
+        } else {
+            retained.push_back(make_shape_rect_component(103, rx, ry, rw, rh));
+        }
+    }
     retained.push_back(make_texture_mapping_component(106, tex, tile, off_x, off_y));
     obj.components = std::move(retained);
 
     obj.local_aabb = av::scene_build_local_aabb(rx, ry, rx + rw, ry + rh);
+
+    // Update scene waters directly in-memory so viewports & queries reflect immediately
+    for (auto& w : m_scene.waters) {
+        if (w.object_index == m_selectedObject) {
+            w.rect[0] = rx;
+            w.rect[1] = ry;
+            w.rect[2] = rw;
+            w.rect[3] = rh;
+            memcpy(w.front_color, front, sizeof(front));
+            memcpy(w.surface_color, surface, sizeof(surface));
+            w.texture = tex;
+            w.tile_size = tile;
+            w.tex_offset[0] = off_x;
+            w.tex_offset[1] = off_y;
+            break;
+        }
+    }
 
     validateAndRepairScene();
     touch_scene(/*geometry_changed=*/true);
@@ -4051,18 +4283,25 @@ bool RubyQuickViewport::setWaterPreset(const QString& presetName) {
     if (p == "toxic" || p == "acid") {
         cur["frontR"] = 0.12f; cur["frontG"] = 0.65f; cur["frontB"] = 0.12f; cur["frontA"] = 0.85f;
         cur["surfaceR"] = 0.35f; cur["surfaceG"] = 0.95f; cur["surfaceB"] = 0.18f; cur["surfaceA"] = 0.90f;
+        cur["isDeadly"] = true;
+        cur["minDamage"] = 2; cur["maxDamage"] = 3; cur["damageType"] = 1; cur["ignoreImmunity"] = false;
     } else if (p == "lava" || p == "magma") {
         cur["frontR"] = 0.85f; cur["frontG"] = 0.18f; cur["frontB"] = 0.05f; cur["frontA"] = 0.95f;
         cur["surfaceR"] = 1.00f; cur["surfaceG"] = 0.58f; cur["surfaceB"] = 0.08f; cur["surfaceA"] = 0.98f;
+        cur["isDeadly"] = true;
+        cur["minDamage"] = 4; cur["maxDamage"] = 4; cur["damageType"] = 0; cur["ignoreImmunity"] = true;
     } else if (p == "swamp" || p == "muck") {
         cur["frontR"] = 0.22f; cur["frontG"] = 0.25f; cur["frontB"] = 0.15f; cur["frontA"] = 0.85f;
         cur["surfaceR"] = 0.35f; cur["surfaceG"] = 0.40f; cur["surfaceB"] = 0.22f; cur["surfaceA"] = 0.88f;
+        cur["isDeadly"] = false;
     } else if (p == "spirit" || p == "ethereal" || p == "void") {
         cur["frontR"] = 0.45f; cur["frontG"] = 0.12f; cur["frontB"] = 0.75f; cur["frontA"] = 0.80f;
         cur["surfaceR"] = 0.75f; cur["surfaceG"] = 0.35f; cur["surfaceB"] = 0.98f; cur["surfaceA"] = 0.85f;
-    } else { // "azure"
+        cur["isDeadly"] = false;
+    } else { // "azure" / default
         cur["frontR"] = 0.20f; cur["frontG"] = 0.50f; cur["frontB"] = 0.85f; cur["frontA"] = 0.78f;
         cur["surfaceR"] = 0.40f; cur["surfaceG"] = 0.75f; cur["surfaceB"] = 1.00f; cur["surfaceA"] = 0.82f;
+        cur["isDeadly"] = false;
     }
     cur["texture"] = "water";
     return setSelectedWaterProperties(cur);
@@ -4300,17 +4539,74 @@ bool RubyQuickViewport::applyWaterMeshEdit() {
         }
     }
 
+    bool isDeadly = false;
+    int minDamage = 4;
+    int maxDamage = 4;
+    int damageType = 0;
+    bool ignoreImmunity = true;
+
+    for (const auto& c : obj.components) {
+        if (c.type_name == "Damage" || c.payload_field == 122) {
+            isDeadly = true;
+            try {
+                proto::Reader wrapper(c.raw_data);
+                proto::Field wf;
+                while (wrapper.read_field(wf)) {
+                    if (wf.field_number == 122 && wf.wire_type == proto::WIRE_LEN) {
+                        proto::Reader dc(wf.bytes_val);
+                        proto::Field df;
+                        while (dc.read_field(df)) {
+                            if (df.field_number == 1 && df.wire_type == proto::WIRE_VARINT) {
+                                minDamage = int(df.varint_val);
+                            } else if (df.field_number == 2 && df.wire_type == proto::WIRE_VARINT) {
+                                damageType = int(df.varint_val);
+                            } else if (df.field_number == 5 && df.wire_type == proto::WIRE_VARINT) {
+                                maxDamage = int(df.varint_val);
+                            } else if (df.field_number == 8 && df.wire_type == proto::WIRE_VARINT) {
+                                ignoreImmunity = (df.varint_val != 0);
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+        } else if (c.type_name == "CollisionShape" || c.payload_field == 121) {
+            try {
+                proto::Reader wrapper(c.raw_data);
+                proto::Field wf;
+                while (wrapper.read_field(wf)) {
+                    if (wf.field_number == 121 && wf.wire_type == proto::WIRE_LEN) {
+                        proto::Reader csc(wf.bytes_val);
+                        proto::Field cf;
+                        while (csc.read_field(cf)) {
+                            if (cf.field_number == 4 && cf.wire_type == proto::WIRE_VARINT) {
+                                if (cf.varint_val != 0) isDeadly = true;
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
     std::vector<av::SceneComponent> retained;
     retained.reserve(obj.components.size());
     for (const auto& c : obj.components) {
         if (c.type_name == "WaterMesh" || c.payload_field == 114) continue;
-        if (c.type_id == 103 && (c.type_name.find("Shape") != std::string::npos || c.payload_field == 120)) continue;
+        if (c.type_id == 103 && (c.type_name.find("Shape") != std::string::npos || c.payload_field == 120 || c.payload_field == 121)) continue;
         if (c.type_id == 106 && (c.type_name.find("Texture") != std::string::npos || c.payload_field == 113)) continue;
+        if (c.type_name == "Damage" || c.payload_field == 122) continue;
+        if (c.type_name == "MonsterEntity" || c.payload_field == 158 || c.payload_field == 152) continue;
         retained.push_back(c);
     }
 
     retained.push_back(make_water_component(101, 103, 106, front, surface));
-    retained.push_back(make_shape_polygon_rect_component(103, rx, ry, rw, rh, m_waterEditPoints));
+    if (isDeadly) {
+        retained.push_back(make_collision_shape_hazard_polygon_component(103, rx, ry, rw, rh, m_waterEditPoints));
+        retained.push_back(make_damage_component(109, minDamage, maxDamage, damageType, ignoreImmunity));
+        retained.push_back(make_monster_entity_component(110));
+    } else {
+        retained.push_back(make_shape_polygon_rect_component(103, rx, ry, rw, rh, m_waterEditPoints));
+    }
     retained.push_back(make_texture_mapping_component(106, tex, tile, off_x, off_y));
     obj.components = std::move(retained);
 
@@ -4771,12 +5067,40 @@ void RubyQuickViewport::meshImport(int idx) {
     double horiz_noise = 0.0;
     double texture_scale = 250.0;
 
+    m_hasRubyMeshMeta = false;
+    rubymeta::RubyMeshMeta loaded_meta;
+
     // Pass 1: Extract GroundPolygon, GroundMesh, GroundMeshGenerator, CollisionShape
     for (const auto& comp : comps) {
         const int payload = comp.payload_field;
         // GroundPolygon (110)
         if (payload == 110 || comp.type_name == "GroundPolygon") {
             if (comp.type_id > 0) target_ids.polygon_id = comp.type_id;
+
+            // Attempt to restore authoring baseline and style configuration from Tag 15 (RBM1)
+            if (rubymeta::extract_rubymesh_meta(comp.raw_data, loaded_meta) && !loaded_meta.baseline_points.empty()) {
+                m_hasRubyMeshMeta = true;
+                m_meshEditPoints = loaded_meta.baseline_points;
+                if (!loaded_meta.hat_style.empty()) m_zyphHatStyle = QString::fromStdString(loaded_meta.hat_style);
+                if (!loaded_meta.top_style.empty()) m_zyphTopStyle = QString::fromStdString(loaded_meta.top_style);
+                if (loaded_meta.top_frequency > 0.0f) m_zyphFrequency = loaded_meta.top_frequency;
+                if (loaded_meta.top_depth >= 0.0f) m_zyphDepth = loaded_meta.top_depth;
+                if (loaded_meta.top_min_collision >= 0.0f) m_zyphMinCollision = loaded_meta.top_min_collision;
+                horiz_noise = loaded_meta.horiz_noise;
+                random_seed = loaded_meta.random_seed;
+                mesh_type = loaded_meta.mesh_type;
+                texture_scale = loaded_meta.texture_scale;
+                {
+                    QSettings zs;
+                    zs.setValue(QStringLiteral("ruby_mobile/zypher_hat"), m_zyphHatStyle);
+                    zs.setValue(QStringLiteral("ruby_mobile/zypher_top"), m_zyphTopStyle);
+                    zs.setValue(QStringLiteral("ruby_mobile/zypher_freq"), double(m_zyphFrequency));
+                    zs.setValue(QStringLiteral("ruby_mobile/zypher_depth"), double(m_zyphDepth));
+                    zs.setValue(QStringLiteral("ruby_mobile/zypher_mincoll"), double(m_zyphMinCollision));
+                    zs.sync();
+                }
+            }
+
             try {
                 proto::Reader wrapper(comp.raw_data);
                 proto::Field f;
@@ -4792,18 +5116,21 @@ void RubyQuickViewport::meshImport(int idx) {
                         } else if (g.field_number != 2 || g.wire_type != proto::WIRE_LEN) {
                             continue;
                         }
-                        proto::Reader poly(g.bytes_val);
-                        proto::Field p;
-                        while (poly.read_field(p)) {
-                            if (p.field_number != 1 || p.wire_type != proto::WIRE_LEN) continue;  // Vertex
-                            proto::Reader vec2(p.bytes_val);
-                            proto::Field v;
-                            float x = 0, y = 0;
-                            while (vec2.read_field(v)) {
-                                if (v.field_number == 1) x = v.float_val;
-                                else if (v.field_number == 2) y = v.float_val;
+                        // Fallback: only read Tag 2 compiled polygon if no RBM1 baseline was present
+                        if (m_meshEditPoints.empty()) {
+                            proto::Reader poly(g.bytes_val);
+                            proto::Field p;
+                            while (poly.read_field(p)) {
+                                if (p.field_number != 1 || p.wire_type != proto::WIRE_LEN) continue;  // Vertex
+                                proto::Reader vec2(p.bytes_val);
+                                proto::Field v;
+                                float x = 0, y = 0;
+                                while (vec2.read_field(v)) {
+                                    if (v.field_number == 1) x = v.float_val;
+                                    else if (v.field_number == 2) y = v.float_val;
+                                }
+                                m_meshEditPoints.push_back({x, y});
                             }
-                            m_meshEditPoints.push_back({x, y});
                         }
                     }
                 }
@@ -4849,12 +5176,20 @@ void RubyQuickViewport::meshImport(int idx) {
     // Pass 2: Extract TextureMapping (113) matching surface_tm_id and front_tm_id
     std::string top_tex_from_tm, front_tex_from_tm;
     float scale_from_tm = 250.0f;
+    m_meshEditSurfaceScale = 200.0;
+    m_meshEditFrontScale = 250.0;
+    m_meshEditSurfaceOffsetX = 0.0;
+    m_meshEditSurfaceOffsetY = 0.0;
+    m_meshEditFrontOffsetX = 0.0;
+    m_meshEditFrontOffsetY = 0.0;
     for (const auto& comp : comps) {
         const int payload = comp.payload_field;
         if (payload == 113 || comp.type_name == "TextureMapping") {
             const uint32_t tm_id = static_cast<uint32_t>(comp.type_id);
             std::string tname;
             float tscale = 250.0f;
+            float toffset_x = 0.0f;
+            float toffset_y = 0.0f;
             try {
                 proto::Reader wrapper(comp.raw_data);
                 proto::Field f;
@@ -4865,15 +5200,29 @@ void RubyQuickViewport::meshImport(int idx) {
                     while (tmc.read_field(g)) {
                         if (g.field_number == 1 && g.wire_type == proto::WIRE_LEN) tname = g.bytes_val;
                         else if (g.field_number == 2 && g.wire_type == proto::WIRE_I32) tscale = g.float_val;
+                        else if (g.field_number == 3 && g.wire_type == proto::WIRE_LEN) {
+                            proto::Reader off_r(g.bytes_val);
+                            proto::Field o;
+                            while (off_r.read_field(o)) {
+                                if (o.field_number == 1 && o.wire_type == proto::WIRE_I32) toffset_x = o.float_val;
+                                else if (o.field_number == 2 && o.wire_type == proto::WIRE_I32) toffset_y = o.float_val;
+                            }
+                        }
                     }
                 }
             } catch (...) {}
             if (tm_id == surface_tm_id || (surface_tm_id == 0 && top_tex_from_tm.empty())) {
                 top_tex_from_tm = tname;
                 scale_from_tm = tscale;
+                m_meshEditSurfaceScale = tscale;
+                m_meshEditSurfaceOffsetX = toffset_x;
+                m_meshEditSurfaceOffsetY = toffset_y;
                 if (comp.type_id > 0) target_ids.tm_surface_id = comp.type_id;
             } else if (tm_id == front_tm_id || (front_tm_id == 0 && front_tex_from_tm.empty())) {
                 front_tex_from_tm = tname;
+                m_meshEditFrontScale = tscale;
+                m_meshEditFrontOffsetX = toffset_x;
+                m_meshEditFrontOffsetY = toffset_y;
                 if (comp.type_id > 0) target_ids.tm_front_id = comp.type_id;
             }
         }
@@ -5014,8 +5363,16 @@ void RubyQuickViewport::meshImport(int idx) {
                                        m_meshEditVanillaFrontZ, m_meshEditVanillaBackZ);
         }
     }
-    m_meshEditFrontZ = m_meshEditVanillaFrontZ;
-    m_meshEditBackZ = m_meshEditVanillaBackZ;
+    if (m_hasRubyMeshMeta && loaded_meta.front_z.size() == m_meshEditPoints.size() &&
+        loaded_meta.back_z.size() == m_meshEditPoints.size()) {
+        m_meshEditFrontZ.assign(loaded_meta.front_z.begin(), loaded_meta.front_z.end());
+        m_meshEditBackZ.assign(loaded_meta.back_z.begin(), loaded_meta.back_z.end());
+        m_meshEditVanillaFrontZ = m_meshEditFrontZ;
+        m_meshEditVanillaBackZ = m_meshEditBackZ;
+    } else {
+        m_meshEditFrontZ = m_meshEditVanillaFrontZ;
+        m_meshEditBackZ = m_meshEditVanillaBackZ;
+    }
     m_meshEditReliefSeed = 0;   // 0 = the object's own depths, not sculpted
     m_meshEditParams.texture_scale = scale_from_tm;
     m_meshEditParams.random_seed = random_seed;
@@ -5241,6 +5598,12 @@ bool RubyQuickViewport::regenerateGroundMesh() {
             params.hat_width = (hw_sum > 0.0 ? static_cast<float>(hw_sum) : 8.0f);
         }
         params.texture_scale = m_meshEditTextureScale > 0 ? m_meshEditTextureScale : 250.0f;
+        params.surface_texture_scale = m_meshEditSurfaceScale > 0 ? m_meshEditSurfaceScale : params.texture_scale;
+        params.front_texture_scale = m_meshEditFrontScale > 0 ? m_meshEditFrontScale : params.texture_scale;
+        params.surface_offset_x = static_cast<float>(m_meshEditSurfaceOffsetX);
+        params.surface_offset_y = static_cast<float>(m_meshEditSurfaceOffsetY);
+        params.front_offset_x = static_cast<float>(m_meshEditFrontOffsetX);
+        params.front_offset_y = static_cast<float>(m_meshEditFrontOffsetY);
         params.fbm_amplitude = 12.0f;
         params.rear_closure = true;
         // Selectable Zypher look (side + top). Defaults are vanilla shoulder /
@@ -5370,6 +5733,37 @@ bool RubyQuickViewport::regenerateGroundMesh() {
     }
     target.components = std::move(fresh.components);
     for (auto& c : preserved) target.components.push_back(std::move(c));
+
+    // Stamping Tag 15 (RubyMeshMeta RBM1) into the GroundPolygon component
+    rubymeta::RubyMeshMeta meta;
+    meta.generator = (gen_choice == boulderx::GroundGenerator::Zypher ? rubymeta::GenZypher :
+                     (gen_choice == boulderx::GroundGenerator::BoulderX ? rubymeta::GenZenith : rubymeta::GenBoulder));
+    meta.editor_source = rubymeta::SourceRubyTouch;
+    meta.hat_style = m_zyphHatStyle.toStdString();
+    meta.top_style = m_zyphTopStyle.toStdString();
+    meta.top_frequency = m_zyphFrequency;
+    meta.top_depth = m_zyphDepth;
+    meta.top_min_collision = m_zyphMinCollision;
+    meta.random_seed = m_meshEditSeed;
+    meta.horiz_noise = static_cast<float>(m_meshEditNoise);
+    meta.mesh_type = m_meshEditMeshType;
+    meta.texture_scale = static_cast<float>(m_meshEditTextureScale);
+    meta.baseline_points = m_meshEditPoints;
+    if (m_meshEditFrontZ.size() == m_meshEditPoints.size()) {
+        meta.front_z.assign(m_meshEditFrontZ.begin(), m_meshEditFrontZ.end());
+    }
+    if (m_meshEditBackZ.size() == m_meshEditPoints.size()) {
+        meta.back_z.assign(m_meshEditBackZ.begin(), m_meshEditBackZ.end());
+    }
+    const std::string meta_bytes = rubymeta::pack_rubymesh_meta(meta);
+
+    for (auto& c : target.components) {
+        if (c.payload_field == 110 || c.type_name == "GroundPolygon") {
+            c.raw_data = rubymeta::inject_rubymesh_meta(c.raw_data, meta_bytes);
+            break;
+        }
+    }
+    m_hasRubyMeshMeta = true;
 
     if (was_dim) {
         // 559, NOT 253.  Verified against the decompiled extension table in
@@ -6192,6 +6586,80 @@ void RubyQuickViewport::nudgeSelectedMeshVertex(float dx, float dy) {
     liveMeshPreview();
     emit meshEditVerticesChanged();
     update();
+}
+
+static double rdp_dist_to_segment_sq(const boulder::PolygonPoint& p,
+                                     const boulder::PolygonPoint& a,
+                                     const boulder::PolygonPoint& b) {
+    double l2 = (b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y);
+    if (l2 < 1e-9) {
+        return (p.x - a.x) * (p.x - a.x) + (p.y - a.y) * (p.y - a.y);
+    }
+    double t = std::clamp(((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2, 0.0, 1.0);
+    double px = a.x + t * (b.x - a.x);
+    double py = a.y + t * (b.y - a.y);
+    return (p.x - px) * (p.x - px) + (p.y - py) * (p.y - py);
+}
+
+static void rdp_simplify(const std::vector<boulder::PolygonPoint>& pts,
+                         size_t start_idx, size_t end_idx, double tol_sq,
+                         std::vector<bool>& keep) {
+    if (end_idx <= start_idx + 1) return;
+    double max_dist_sq = 0.0;
+    size_t max_idx = start_idx;
+    for (size_t i = start_idx + 1; i < end_idx; ++i) {
+        double d_sq = rdp_dist_to_segment_sq(pts[i], pts[start_idx], pts[end_idx]);
+        if (d_sq > max_dist_sq) {
+            max_dist_sq = d_sq;
+            max_idx = i;
+        }
+    }
+    if (max_dist_sq > tol_sq) {
+        keep[max_idx] = true;
+        rdp_simplify(pts, start_idx, max_idx, tol_sq, keep);
+        rdp_simplify(pts, max_idx, end_idx, tol_sq, keep);
+    }
+}
+
+bool RubyQuickViewport::simplifyMeshPolygon(float tolerance) {
+    if (!m_meshEditActive || m_meshEditPoints.size() <= 3) return false;
+    double tol_sq = static_cast<double>(tolerance * tolerance);
+    size_t n = m_meshEditPoints.size();
+
+    size_t far_idx = 0;
+    double max_d_sq = 0.0;
+    for (size_t i = 1; i < n; ++i) {
+        double d_sq = (m_meshEditPoints[i].x - m_meshEditPoints[0].x) * (m_meshEditPoints[i].x - m_meshEditPoints[0].x) +
+                      (m_meshEditPoints[i].y - m_meshEditPoints[0].y) * (m_meshEditPoints[i].y - m_meshEditPoints[0].y);
+        if (d_sq > max_d_sq) {
+            max_d_sq = d_sq;
+            far_idx = i;
+        }
+    }
+    if (far_idx == 0 || far_idx >= n) return false;
+
+    std::vector<bool> keep(n, false);
+    keep[0] = true;
+    keep[far_idx] = true;
+    rdp_simplify(m_meshEditPoints, 0, far_idx, tol_sq, keep);
+    rdp_simplify(m_meshEditPoints, far_idx, n - 1, tol_sq, keep);
+
+    std::vector<boulder::PolygonPoint> simplified;
+    for (size_t i = 0; i < n; ++i) {
+        if (keep[i]) simplified.push_back(m_meshEditPoints[i]);
+    }
+    if (simplified.size() < 3) return false;
+
+    m_meshEditPoints = std::move(simplified);
+    m_meshEditFrontZ.clear();
+    m_meshEditBackZ.clear();
+    m_selectedMeshVertex = 0;
+    m_meshDirty = true;
+    liveMeshPreview();
+    emit meshEditVerticesChanged();
+    emit selectedMeshVertexChanged();
+    update();
+    return true;
 }
 
 void RubyQuickViewport::dragSelected(float deltaX, float deltaY, float deltaZ) {

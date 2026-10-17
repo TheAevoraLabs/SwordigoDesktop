@@ -347,7 +347,7 @@ for ABI in "${ABIS[@]}"; do
         -DCMAKE_PREFIX_PATH="${QT_ABI_DIR}" \
         -DQT_HOST_PATH="${QT_HOST_DIR}" \
         -DQt6_DIR="${QT_ABI_DIR}/lib/cmake/Qt6" \
-        -DRUBY_BUILD_VERSION="${RUBY_VERSION_NAME:-v1.4.3}" \
+        -DRUBY_BUILD_VERSION="${RUBY_VERSION_NAME:-v1.4.4}" \
         "${FOSS_CMAKE_FLAG}"
 
     cmake --build "${ABI_BUILD_DIR}" --config Release -j"$(nproc)"

@@ -448,6 +448,12 @@ private:
     // the object was (field 7 MeshType, field 6 HorizNoise).
     int    m_mesh_type = 1;
     double m_mesh_noise = 0.0;
+    double m_mesh_surface_scale = 200.0;
+    double m_mesh_front_scale = 250.0;
+    double m_mesh_surface_offset_x = 0.0;
+    double m_mesh_surface_offset_y = 0.0;
+    double m_mesh_front_offset_x = 0.0;
+    double m_mesh_front_offset_y = 0.0;
     // Which generator actually produced the mesh on screen ("BoulderX", or
     // "Boulder · BoulderX declined: <reason>"). The Boulder fallback is the ONE
     // remaining path that re-emits a uniform-thickness slab, so it must never be

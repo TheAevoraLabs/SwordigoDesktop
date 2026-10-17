@@ -472,6 +472,7 @@ const std::unordered_map<std::string, SchemaClass> g_schemas = {
         {50, SchemaField{"OnCollide", "Program", true}},
         {61, SchemaField{"Friction", "", false}},
         {64, SchemaField{"UnsafeGround", "", false}},
+        {122, SchemaField{"RubyMeshMeta", "", false}},
     }}},
     {"Gstate", SchemaClass{"Gstate", {
         {10, SchemaField{"CharacterState", "CharacterState", true}},

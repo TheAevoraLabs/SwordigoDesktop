@@ -6010,12 +6010,20 @@ void Viewport3DWidget::mesh_import(int idx) {
     // Pass 2: Extract TextureMapping (113) matching surface_tm_id and front_tm_id
     std::string top_tex_from_tm, front_tex_from_tm;
     float scale_from_tm = 250.0f;
+    m_mesh_surface_scale = 200.0;
+    m_mesh_front_scale = 250.0;
+    m_mesh_surface_offset_x = 0.0;
+    m_mesh_surface_offset_y = 0.0;
+    m_mesh_front_offset_x = 0.0;
+    m_mesh_front_offset_y = 0.0;
     for (const auto& comp : comps) {
         const int payload = comp.payload_field;
         if (payload == 113 || comp.type_name == "TextureMapping") {
             const uint32_t tm_id = static_cast<uint32_t>(comp.type_id);
             std::string tname;
             float tscale = 250.0f;
+            float toffset_x = 0.0f;
+            float toffset_y = 0.0f;
             try {
                 proto::Reader wrapper(comp.raw_data);
                 proto::Field f;
@@ -6026,15 +6034,29 @@ void Viewport3DWidget::mesh_import(int idx) {
                     while (tmc.read_field(g)) {
                         if (g.field_number == 1 && g.wire_type == proto::WIRE_LEN) tname = g.bytes_val;
                         else if (g.field_number == 2 && g.wire_type == proto::WIRE_I32) tscale = g.float_val;
+                        else if (g.field_number == 3 && g.wire_type == proto::WIRE_LEN) {
+                            proto::Reader off_r(g.bytes_val);
+                            proto::Field o;
+                            while (off_r.read_field(o)) {
+                                if (o.field_number == 1 && o.wire_type == proto::WIRE_I32) toffset_x = o.float_val;
+                                else if (o.field_number == 2 && o.wire_type == proto::WIRE_I32) toffset_y = o.float_val;
+                            }
+                        }
                     }
                 }
             } catch (...) {}
             if (tm_id == surface_tm_id || (surface_tm_id == 0 && top_tex_from_tm.empty())) {
                 top_tex_from_tm = tname;
                 scale_from_tm = tscale;
+                m_mesh_surface_scale = tscale;
+                m_mesh_surface_offset_x = toffset_x;
+                m_mesh_surface_offset_y = toffset_y;
                 if (comp.type_id > 0) target_ids.tm_surface_id = comp.type_id;
             } else if (tm_id == front_tm_id || (front_tm_id == 0 && front_tex_from_tm.empty())) {
                 front_tex_from_tm = tname;
+                m_mesh_front_scale = tscale;
+                m_mesh_front_offset_x = toffset_x;
+                m_mesh_front_offset_y = toffset_y;
                 if (comp.type_id > 0) target_ids.tm_front_id = comp.type_id;
             }
         }
@@ -6427,6 +6449,12 @@ bool Viewport3DWidget::mesh_apply() {
             params.hat_width = (hw_sum > 0.0 ? static_cast<float>(hw_sum) : 8.0f);
         }
         params.texture_scale = m_mesh_params.texture_scale > 0 ? m_mesh_params.texture_scale : 250.0f;
+        params.surface_texture_scale = m_mesh_surface_scale > 0 ? m_mesh_surface_scale : params.texture_scale;
+        params.front_texture_scale = m_mesh_front_scale > 0 ? m_mesh_front_scale : params.texture_scale;
+        params.surface_offset_x = static_cast<float>(m_mesh_surface_offset_x);
+        params.surface_offset_y = static_cast<float>(m_mesh_surface_offset_y);
+        params.front_offset_x = static_cast<float>(m_mesh_front_offset_x);
+        params.front_offset_y = static_cast<float>(m_mesh_front_offset_y);
         params.fbm_amplitude = 12.0f;
         params.rear_closure = true;
 

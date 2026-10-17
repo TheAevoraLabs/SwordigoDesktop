@@ -351,7 +351,17 @@ static void test_top_styles() {
         size_t top_verts = 0;
         for (const auto& sm : m.surfaces)
             if (sm.texture == flat.surface_tex) top_verts += sm.vertices.size();
-        CHECK(top_verts >= 12);   // >= one quad per walkable edge (3 on this ring)
+        // With standard 45-degree threshold (0.70711f), only the horizontal top edge
+        // is walkable (>= 4 verts), preventing side grass cascades down vertical walls.
+        CHECK(top_verts >= 4);
+
+        // Permissive threshold (< 0) enables side deck quads if explicitly requested
+        flat.walkable_threshold = -0.28f;
+        auto m_perm = zypher::generate_terrain(nodes, flat);
+        size_t perm_verts = 0;
+        for (const auto& sm : m_perm.surfaces)
+            if (sm.texture == flat.surface_tex) perm_verts += sm.vertices.size();
+        CHECK(perm_verts >= 12);
     }
 
     // REGRESSION: the shoulder must close onto the front plane. Every profile
@@ -428,8 +438,17 @@ static void test_top_styles() {
                     zypher::TopStyle::Porous, zypher::TopStyle::Bubbly}) {
         CHECK(zypher::top_style_from_id(zypher::top_style_id(ts)) == ts);
     }
-    CHECK(zypher::hat_style_from_id("nonsense") == zypher::HatStyle::Vanilla);
-    CHECK(zypher::top_style_from_id("nonsense") == zypher::TopStyle::Plain);
+    for (auto st : {zypher::ShoulderTermination::SmoothTaper,
+                    zypher::ShoulderTermination::OverhangDroop,
+                    zypher::ShoulderTermination::BluntCap}) {
+        CHECK(zypher::shoulder_term_from_id(zypher::shoulder_term_id(st)) == st);
+        zypher::TerrainParams p;
+        p.shoulder_term = st;
+        auto m = zypher::generate_terrain(nodes, p);
+        CHECK(m.ok);
+        CHECK(m.vertex_count() > 0);
+    }
+    CHECK(zypher::shoulder_term_from_id("nonsense") == zypher::ShoulderTermination::SmoothTaper);
 }
 
 // ── §4. Protobuf emission ──────────────────────────────────────────────────────

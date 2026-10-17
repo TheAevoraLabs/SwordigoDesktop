@@ -20,6 +20,7 @@
 #include "tools/boulder.h"
 #include "tools/boulderx.h"   // boulderx::ground_generator() — generator choice
 #include "tools/roller.h"     // zypher::generate_terrain_object() — Gen 3 modern generator
+#include "tools/rubymesh_meta.h" // Tag 15 non-destructive authoring metadata
 #include "ruby/viewport/ruby_gizmo.h"
 #include "ruby/viewport/ruby_picking.h"
 
@@ -201,6 +202,8 @@ public:
     Q_INVOKABLE bool beginMeshEdit();
     Q_INVOKABLE bool applyMeshEdit();
     Q_INVOKABLE void discardMeshEdit();
+    Q_INVOKABLE bool simplifyMeshPolygon(float tolerance = 2.0f);
+    Q_INVOKABLE bool hasRubyMeshMeta() const { return m_hasRubyMeshMeta; }
     /// Re-runs the open mesh edit's generation path with the CURRENT generator
     /// choice and look. Called by the Boulder/Zenith/Zypher mode pill so a
     /// switch shows new geometry immediately instead of at the next commit.
@@ -474,6 +477,12 @@ private:
     double   m_meshEditNoise = 0.0;
     uint32_t m_meshEditSeed = 1291618994u;
     double   m_meshEditTextureScale = 250.0;
+    double   m_meshEditSurfaceScale = 200.0;
+    double   m_meshEditFrontScale = 250.0;
+    double   m_meshEditSurfaceOffsetX = 0.0;
+    double   m_meshEditSurfaceOffsetY = 0.0;
+    double   m_meshEditFrontOffsetX = 0.0;
+    double   m_meshEditFrontOffsetY = 0.0;
     double   m_meshEditMinDepth = -45.0;
     double   m_meshEditMaxDepth = 45.0;
     // Per-node depth for the outline currently being edited. Empty means
@@ -518,6 +527,7 @@ private:
     QVector3D m_meshSavedCamTarget{0.0f, 0.0f, 0.0f};
     bool m_meshSavedCamValid = false;
     bool m_meshDirty = false;
+    bool m_hasRubyMeshMeta = false;
 
     // Mesh edit direct touch manipulation
     bool m_meshDragging = false;

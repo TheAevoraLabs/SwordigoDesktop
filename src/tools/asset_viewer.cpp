@@ -38,6 +38,7 @@
 #include "platform/IconsFontAwesome6.h"
 #include "platform/protobuf_reader.h"
 #include "tools/pod_loader.h"
+#include "tools/rubymesh_meta.h"
 #include "tools/gltf_glb.h"
 #include "tools/obj_loader.h"
 #include "tools/ani_loader.h"
@@ -690,6 +691,8 @@ struct ViewerState {
     float gm_hat_offset_2 = 5.0f;
     float gm_texture_scale = 250.0f;
     uint32_t gm_random_seed = 1291618994u;
+    int   gm_mesh_type = 1;
+    float gm_noise = 0.0f;
     boulder::GroundComponentIds gm_target_ids;
     int   gm_drag_point = -1;           // point being dragged (-1 = none)
     bool  gm_dragging = false;
@@ -5825,6 +5828,16 @@ static void gm_import_from_scene(ViewerState& st) {
         // GroundPolygon (110)
         if (payload == 110 || comp.type_name == "GroundPolygon") {
             if (comp.type_id > 0) st.gm_target_ids.polygon_id = comp.type_id;
+
+            rubymeta::RubyMeshMeta meta;
+            if (rubymeta::extract_rubymesh_meta(comp.raw_data, meta) && !meta.baseline_points.empty()) {
+                st.gm_points = meta.baseline_points;
+                st.gm_noise = meta.horiz_noise;
+                st.gm_random_seed = meta.random_seed;
+                st.gm_mesh_type = meta.mesh_type;
+                st.gm_texture_scale = meta.texture_scale;
+            }
+
             try {
                 proto::Reader wrapper(comp.raw_data);
                 proto::Field f;
@@ -5840,18 +5853,20 @@ static void gm_import_from_scene(ViewerState& st) {
                         } else if (g.field_number != 2 || g.wire_type != proto::WIRE_LEN) {
                             continue;
                         }
-                        proto::Reader poly(g.bytes_val);
-                        proto::Field p;
-                        while (poly.read_field(p)) {
-                            if (p.field_number != 1 || p.wire_type != proto::WIRE_LEN) continue; // Vertex
-                            proto::Reader vec2(p.bytes_val);
-                            proto::Field v;
-                            float x = 0, y = 0;
-                            while (vec2.read_field(v)) {
-                                if (v.field_number == 1) x = v.float_val;
-                                else if (v.field_number == 2) y = v.float_val;
+                        if (st.gm_points.empty()) {
+                            proto::Reader poly(g.bytes_val);
+                            proto::Field p;
+                            while (poly.read_field(p)) {
+                                if (p.field_number != 1 || p.wire_type != proto::WIRE_LEN) continue; // Vertex
+                                proto::Reader vec2(p.bytes_val);
+                                proto::Field v;
+                                float x = 0, y = 0;
+                                while (vec2.read_field(v)) {
+                                    if (v.field_number == 1) x = v.float_val;
+                                    else if (v.field_number == 2) y = v.float_val;
+                                }
+                                st.gm_points.push_back({x, y});
                             }
-                            st.gm_points.push_back({x, y});
                         }
                     }
                 }
@@ -6046,6 +6061,23 @@ static bool gm_regenerate_object_geometry(ViewerState& st, int idx, std::string*
     target.components = std::move(fresh.components);
     for (auto& c : preserved) {
         target.components.push_back(std::move(c));
+    }
+
+    rubymeta::RubyMeshMeta meta;
+    meta.generator = rubymeta::GenBoulder;
+    meta.editor_source = rubymeta::SourceRubyGG;
+    meta.random_seed = st.gm_random_seed;
+    meta.horiz_noise = st.gm_noise;
+    meta.mesh_type = st.gm_mesh_type;
+    meta.texture_scale = static_cast<float>(st.gm_texture_scale);
+    meta.baseline_points = st.gm_points;
+    const std::string meta_bytes = rubymeta::pack_rubymesh_meta(meta);
+
+    for (auto& c : target.components) {
+        if (c.payload_field == 110 || c.type_name == "GroundPolygon") {
+            c.raw_data = rubymeta::inject_rubymesh_meta(c.raw_data, meta_bytes);
+            break;
+        }
     }
 
     if (was_dim || st.gm_dimension_object)

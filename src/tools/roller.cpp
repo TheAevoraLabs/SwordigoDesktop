@@ -266,51 +266,50 @@ struct HatPt { float lat, vert; };
 
 static std::vector<HatPt> build_hat_profile(HatStyle style, float h, float w, int steps) {
     std::vector<HatPt> out;
-    steps = std::max(3, steps);
+    steps = std::max(4, steps);
     switch (style) {
         case HatStyle::None:
             out.push_back({0.0f, 0.0f});
             return out;
-        case HatStyle::Plain:  // straight chamfer out and down
-            for (int i = 0; i <= steps; ++i) {
-                float t = static_cast<float>(i) / steps;
-                out.push_back({w * t, h * t});
-            }
+        case HatStyle::Plain:  // straight chamfer out and down, returning to wall
+            out.push_back({0.0f, 0.0f});
+            out.push_back({w, h * 0.5f});
+            out.push_back({0.0f, h});
             break;
-        case HatStyle::ZigZag:  // saw-toothed lip
+        case HatStyle::ZigZag:  // saw-toothed lip returning to wall
+            out.push_back({0.0f, 0.0f});
             for (int i = 0; i < steps; ++i) {
                 float t0 = static_cast<float>(i) / steps;
                 float t1 = static_cast<float>(i + 1) / steps;
-                out.push_back({w * (t0 + t1) * 0.5f, h * 0.5f});  // tooth valley
-                out.push_back({w * t1, 0.0f});                     // tooth tip
+                float env = std::sin(t0 * 3.14159265f);
+                out.push_back({w * (0.4f + 0.6f * env), h * (t0 + t1) * 0.5f});
             }
-            out.push_back({w, h});
+            out.push_back({0.0f, h});
             break;
-        case HatStyle::Vanilla:  // two insets then the drop (engine round hat)
-            out.push_back({0.0f, 0.0f});
-            out.push_back({w * 0.5f, 0.0f});
-            out.push_back({w, h * 0.4f});
-            out.push_back({w, h});
-            break;
-        case HatStyle::Curvy:
-        default: {  // smooth quarter-circle fillet
+        case HatStyle::Vanilla: {  // engine round hat: smooth curve peaking at 0.4*h, returning flush to 0 at h
             for (int i = 0; i <= steps; ++i) {
                 float t = static_cast<float>(i) / steps;
-                float ang = t * 1.57079633f;
-                out.push_back({w * std::sin(ang), h * (1.0f - std::cos(ang))});
+                float lat = (t < 0.4f)
+                    ? w * std::sin((t / 0.4f) * 1.57079633f)
+                    : w * std::cos(((t - 0.4f) / 0.6f) * 1.57079633f);
+                out.push_back({std::max(0.0f, lat), h * t});
+            }
+            break;
+        }
+        case HatStyle::Curvy:
+        default: {  // smooth half-sine / semi-circular fillet curving out and back to wall
+            for (int i = 0; i <= steps; ++i) {
+                float t = static_cast<float>(i) / steps;
+                float ang = t * 3.141592653589793f;
+                out.push_back({w * std::sin(ang), h * t});
             }
             break;
         }
     }
-    // Close the lip onto the front face. Every profile used to stop at the
-    // OUTER bottom of the drop, so the shoulder's underside was an open edge
-    // that never met the cliff plane — the silhouette did not close onto the
-    // top/face and read as a floating, torn lip. Returning to lat 0 at the
-    // final drop height ties the sweep back to the front plane (z = fz), which
-    // is exactly where the FrontMesh cap sits, so the shoulder and the cliff
-    // now share an edge instead of leaving a gap.
-    if (!out.empty() && std::fabs(out.back().lat) > 1e-6f) {
-        out.push_back({0.0f, out.back().vert});
+    // Guarantee final point returns flush to the front cliff face at full drop height
+    if (!out.empty()) {
+        out.back().lat = 0.0f;
+        out.back().vert = h;
     }
     return out;
 }
@@ -379,6 +378,10 @@ static HatStyle hat_style_env(HatStyle fallback) {
 static TopStyle top_style_env(TopStyle fallback) {
     const char* e = std::getenv("RUBY_ZYPHER_TOP_STYLE");
     return (e && *e) ? top_style_from_id(e) : fallback;
+}
+static ShoulderTermination shoulder_term_env(ShoulderTermination fallback) {
+    const char* e = std::getenv("RUBY_ZYPHER_SHOULDER_TERM");
+    return (e && *e) ? shoulder_term_from_id(e) : fallback;
 }
 static float float_env(const char* name, float fallback) {
     const char* e = std::getenv(name);
@@ -455,6 +458,9 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
     }
 
     const float TSCALE = params.texture_scale > 0.0f ? params.texture_scale : 250.0f;
+    const float front_scale = params.front_texture_scale > 0.0f ? params.front_texture_scale : TSCALE;
+    const float surf_scale  = params.surface_texture_scale > 0.0f ? params.surface_texture_scale : TSCALE;
+    const float walk_thresh = params.walkable_threshold;
     const float FAMP   = params.fbm_amplitude;
     const float FFREQ  = params.fbm_freq;
     const int   FOCT   = params.fbm_octaves;
@@ -491,7 +497,37 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
         return zypher::normalize(zypher::V3{-d_dx, -d_dy, 1.0f});
     };
 
-    // ── 5. FrontMesh: Solid rock cliff face covering the entire polygon interior ──
+    // ── 5. Edge classification & Arc lengths ──────────────────────────────────
+    std::vector<double> arc(N + 1, 0.0);
+    std::vector<bool> is_walkable(N, false);
+    std::vector<zypher::V2> edge_norms(N);
+
+    for (size_t i = 0; i < N; ++i) {
+        size_t next = (i + 1) % N;
+        double dx = nodes[next].x - nodes[i].x;
+        double dy = nodes[next].y - nodes[i].y;
+        double len = std::sqrt(dx * dx + dy * dy);
+        arc[i + 1] = arc[i] + len;
+        if (len > 1e-6) {
+            // Outward 2D normal for CCW polygon: (dy, -dx) / len
+            double nx = dy / len;
+            double ny = -dx / len;
+            edge_norms[i] = {static_cast<float>(nx), static_cast<float>(ny)};
+            if (ny >= walk_thresh) {
+                is_walkable[i] = true;
+            }
+        }
+    }
+
+    std::vector<bool> is_boundary_walkable(N, false);
+    for (size_t i = 0; i < N; ++i) {
+        size_t prev = (i + N - 1) % N;
+        if (is_walkable[prev] || is_walkable[i]) {
+            is_boundary_walkable[i] = true;
+        }
+    }
+
+    // ── 6. FrontMesh: Solid rock cliff face covering the entire polygon interior ──
     std::vector<zypher::V2> poly2d;
     poly2d.reserve(N);
     for (const auto& n : nodes) poly2d.push_back({static_cast<float>(n.x), static_cast<float>(n.y)});
@@ -516,43 +552,22 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
     for (size_t i = 0; i < N; ++i) {
         float vx = static_cast<float>(nodes[i].x);
         float vy = static_cast<float>(nodes[i].y);
-        float vz = static_cast<float>(fz[i]) + rock_disp(vx, vy, nodes[i].noise_scale);
+        float vz = static_cast<float>(fz[i]);
+        if (is_boundary_walkable[i]) {
+            vz += rock_disp(vx, vy, nodes[i].noise_scale) * 0.1f;
+        } else {
+            vz += rock_disp(vx, vy, nodes[i].noise_scale);
+        }
         zypher::V3 fnorm = rock_normal(vx, vy, nodes[i].noise_scale);
-        float fu = vx / TSCALE;
-        float fv = -vy / TSCALE;
+        // Engine parity: UV formula matches Caver::TextureMapping::TexCoordForPosition
+        // result = (pos.xy - offset.xy) / scale + 0.5f
+        float fu = (vx - params.front_offset_x) / front_scale + 0.5f;
+        float fv = (vy - params.front_offset_y) / front_scale + 0.5f;
         front_sm.vertices.push_back(make_vert(vx, vy, vz, fnorm, fu, fv));
     }
     result.fronts.push_back(std::move(front_sm));
 
-    // ── 6. Edge classification & Arc lengths ──────────────────────────────────
-    std::vector<double> arc(N + 1, 0.0);
-    std::vector<bool> is_walkable(N, false);
-    std::vector<zypher::V2> edge_norms(N);
-
-    for (size_t i = 0; i < N; ++i) {
-        size_t next = (i + 1) % N;
-        double dx = nodes[next].x - nodes[i].x;
-        double dy = nodes[next].y - nodes[i].y;
-        double len = std::sqrt(dx * dx + dy * dy);
-        arc[i + 1] = arc[i] + len;
-        if (len > 1e-6) {
-            // Outward 2D normal for CCW polygon: (dy, -dx) / len
-            double nx = dy / len;
-            double ny = -dx / len;
-            edge_norms[i] = {static_cast<float>(nx), static_cast<float>(ny)};
-            if (ny > -0.28) {
-                is_walkable[i] = true;
-            }
-        }
-    }
-
     // ── 7. SurfaceMesh 1: Walkable Top (deck + selectable shoulder) ───────────
-    //
-    // Two independent looks, mirroring how Caver splits the same job:
-    //   hat_style — the shoulder swept over the rim (GenerateSurfaceMeshWith-
-    //               RoundHat / InsertRoundHatVertices).
-    //   top_style — the relief across the deck itself (GeneratePlainSurface-
-    //               WithHatGaps). Plain reproduces the engine's flat surface.
     Submesh top_sm;
     top_sm.kind = "SurfaceMesh";
     top_sm.texture = params.surface_tex;
@@ -560,33 +575,17 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
 
     const HatStyle hat_style = hat_style_env(params.hat_style);
     const TopStyle top_style = top_style_env(params.top_style);
+    const ShoulderTermination shoulder_term = shoulder_term_env(params.shoulder_term);
     const float top_freq  = std::max(0.0f, float_env("RUBY_ZYPHER_TOP_FREQ", params.top_frequency));
     const float top_depth = std::max(0.0f, float_env("RUBY_ZYPHER_TOP_DEPTH", params.top_depth));
     const float top_min_coll = std::max(0.0f, params.top_min_collision_radius);
+    const float taper_len_param = params.taper_length > 0.0f ? params.taper_length : 25.0f;
 
     const float hat_h = params.hat_height > 0.0f ? params.hat_height : 20.0f;
     const float hat_w = params.hat_width > 0.0f ? params.hat_width : 8.0f;
     const std::vector<HatPt> hat_profile =
-        build_hat_profile(hat_style, hat_h, hat_w, std::max(3, params.bevel_steps));
+        build_hat_profile(hat_style, hat_h, hat_w, std::max(4, params.bevel_steps));
 
-    // ── Profile frame: arc length + per-point surface normals ────────────────
-    //
-    // The shoulder is a sweep of the profile along the rim, so its surface
-    // normal comes from the profile's own tangent, not from the edge's outward
-    // direction: the lateral axis is world +Z and the drop axis is world -Y, so
-    // a profile segment (dlat in +Z, dvert in -Y) has the normal (0, dlat, dvert).
-    // The old code tilted the normal with the 2D edge normal instead, which is
-    // the wrong plane entirely — that mismatch is a large part of the "weird"
-    // shading on the side. Averaging the two adjacent segment normals keeps a
-    // curved profile smooth and a chamfer crisp.
-    //
-    // Arc length is in world units and drives V, so the texture tiles around
-    // the lip at its natural scale. V used to be the near-constant world depth
-    // (fz + lat), which barely changed while the lip dropped a full hat_height,
-    // squashing the whole texture into a thin band — the "side looks stretched"
-    // report.
-    // Signed count so `NP - 1` cannot wrap into a huge size_t (which also trips
-    // GCC's alloc-size warning under inlining even though the branch guards it).
     const int NP = static_cast<int>(hat_profile.size());
     std::vector<float> hat_arc(static_cast<size_t>(NP), 0.0f);
     std::vector<float> hat_ny(static_cast<size_t>(NP), 1.0f), hat_nz(static_cast<size_t>(NP), 0.0f);
@@ -615,33 +614,26 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
     const float spacing =
         (top_style != TopStyle::Plain && top_freq > 0.0f) ? 100.0f / top_freq : 0.0f;
 
-    // Collision bumps gathered while the deck is built, per source edge, so
-    // they can be spliced into the outline in traversal order (below).
+    // Collision bumps gathered while the deck is built, per source edge
     std::vector<std::vector<std::array<double, 3>>> edge_bumps(N);  // {edge_param, x, y}
 
     for (size_t i = 0; i < N; ++i) {
         if (!is_walkable[i]) continue;
         size_t next = (i + 1) % N;
+        size_t prev = (i + N - 1) % N;
 
         const auto& nA = nodes[i];
         const auto& nB = nodes[next];
         double bzA = bz[i], bzB = bz[next];
         double fzA = fz[i], fzB = fz[next];
-        float uA = static_cast<float>(arc[i]) / TSCALE;
-        float uB = static_cast<float>(arc[i + 1]) / TSCALE;
+
+        float uA = static_cast<float>(arc[i] - params.surface_offset_x) / surf_scale + 0.5f;
+        float uB = static_cast<float>(arc[i + 1] - params.surface_offset_x) / surf_scale + 0.5f;
 
         const double edge_dx = nB.x - nA.x;
         const double edge_dy = nB.y - nA.y;
         const double edge_len = std::hypot(edge_dx, edge_dy);
 
-        // The deck is horizontal (normal +Y): the polygon edge in X, the
-        // front/back depth in Z. A pattern needs samples on both axes to
-        // resolve its features, so a Plain deck stays a single quad per edge.
-        // rows starts at 2, i.e. ONE quad across the depth, because the deck
-        // quad loop runs `ri < rows - 1`. It used to start at 1, so a Plain
-        // deck (spacing <= 1, the subdivision branch skipped) emitted NO top
-        // quads at all — the walkable surface was simply missing and only the
-        // shoulder lip remained, which is the "there is no mesh" report.
         int cols = 1, rows = 2;
         if (spacing > 1.0f) {
             cols = std::max(1, std::min(128, static_cast<int>(std::ceil(edge_len / (spacing * 0.5)))));
@@ -649,8 +641,8 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
             rows = std::max(2, std::min(64, static_cast<int>(std::ceil(span / (spacing * 0.5)))));
         }
 
-        // Deck vertex at (edge fraction a, depth fraction d). UVs stay on the
-        // engine's law: U = distance along the rim, V = depth, both / scale.
+        // Deck vertex at (edge fraction a, depth fraction d). UV formula matches Caver engine:
+        // U = (arc - offset_x) / scale + 0.5f, V = (depth - offset_y) / scale + 0.5f
         auto deck_vert = [&](double a, double d) -> Vertex {
             const double x = nA.x + edge_dx * a;
             const double y0 = nA.y + edge_dy * a;
@@ -662,8 +654,8 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
             const zypher::V3 nrm = top_pattern_normal(top_style, static_cast<float>(x),
                                                       static_cast<float>(z), spacing,
                                                       top_depth, params.seed);
-            const float u = static_cast<float>(arc[i] + edge_len * a) / TSCALE;
-            const float v = static_cast<float>(z) / TSCALE;
+            const float u = static_cast<float>(arc[i] + edge_len * a - params.surface_offset_x) / surf_scale + 0.5f;
+            const float v = static_cast<float>(z - params.surface_offset_y) / surf_scale + 0.5f;
             return make_vert(static_cast<float>(x), static_cast<float>(y0 + disp),
                              static_cast<float>(z), nrm, u, v);
         };
@@ -679,52 +671,141 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
             }
         }
 
-        // Shoulder: sweep the selected hat profile outward from the deck's
-        // front edge. lat is beyond the front depth, vert is the drop below the
-        // node's top — both in world units, so the lip keeps its real size.
-        //
-        // The rim carries the SAME deck displacement the top surface uses, so a
-        // patterned deck and its lip meet instead of leaving a gap (before,
-        // the shoulder always sat at the raw node height while a Spikey/Bubbly
-        // deck rose or fell under it). V walks the profile's own arc length so
-        // the lip texture tiles naturally.
+        // Shoulder: sweep the selected hat profile outward from the deck's front edge.
         const float rimDispA = top_pattern_disp(top_style, static_cast<float>(nA.x),
                                                 static_cast<float>(fzA), spacing,
                                                 top_depth, params.seed);
         const float rimDispB = top_pattern_disp(top_style, static_cast<float>(nB.x),
                                                 static_cast<float>(fzB), spacing,
                                                 top_depth, params.seed);
-        for (int p = 0; p + 1 < NP; ++p) {
-            const float lat0 = hat_profile[p].lat,     lat1 = hat_profile[p + 1].lat;
-            const float ver0 = hat_profile[p].vert,    ver1 = hat_profile[p + 1].vert;
 
-            const float yA0 = static_cast<float>(nA.y) + rimDispA - ver0;
-            const float yA1 = static_cast<float>(nA.y) + rimDispA - ver1;
-            const float yB0 = static_cast<float>(nB.y) + rimDispB - ver0;
-            const float yB1 = static_cast<float>(nB.y) + rimDispB - ver1;
+        // Compute smooth continuous corner normals between adjacent walkable edges
+        zypher::V2 corner_normA = edge_norms[i];
+        if (is_walkable[prev]) {
+            corner_normA = {edge_norms[prev].x + edge_norms[i].x, edge_norms[prev].y + edge_norms[i].y};
+            float l = std::hypot(corner_normA.x, corner_normA.y);
+            if (l > 1e-5f) { corner_normA.x /= l; corner_normA.y /= l; }
+            else { corner_normA = edge_norms[i]; }
+        }
 
-            const float zA0 = static_cast<float>(fzA) + lat0;
-            const float zA1 = static_cast<float>(fzA) + lat1;
-            const float zB0 = static_cast<float>(fzB) + lat0;
-            const float zB1 = static_cast<float>(fzB) + lat1;
+        zypher::V2 corner_normB = edge_norms[i];
+        if (is_walkable[next]) {
+            corner_normB = {edge_norms[i].x + edge_norms[next].x, edge_norms[i].y + edge_norms[next].y};
+            float l = std::hypot(corner_normB.x, corner_normB.y);
+            if (l > 1e-5f) { corner_normB.x /= l; corner_normB.y /= l; }
+            else { corner_normB = edge_norms[i]; }
+        }
 
-            const zypher::V3 nrm0{0.0f, hat_ny[p],     hat_nz[p]};
-            const zypher::V3 nrm1{0.0f, hat_ny[p + 1], hat_nz[p + 1]};
+        // ── Shoulder & Transition: Sweep hat profile along the edge ──────────
+        const bool is_start_of_run = !is_walkable[prev];
+        const bool is_end_of_run   = !is_walkable[next];
+        const bool needs_taper = (is_start_of_run || is_end_of_run) &&
+                                 (shoulder_term == ShoulderTermination::SmoothTaper ||
+                                  shoulder_term == ShoulderTermination::OverhangDroop);
+        const int scols = needs_taper
+            ? std::max(cols, std::min(32, std::max(8, static_cast<int>(std::ceil(edge_len / 15.0)))))
+            : 1;
+        const float taper_dist = std::min(taper_len_param, static_cast<float>(edge_len * 0.45));
 
-            // V starts where the deck's front edge V is (fz / TSCALE) so the
-            // grass keeps tiling across the seam, then advances along the
-            // profile in world units.
-            const float vA0 = (static_cast<float>(fzA) + hat_arc[p])     / TSCALE;
-            const float vA1 = (static_cast<float>(fzA) + hat_arc[p + 1]) / TSCALE;
-            const float vB0 = (static_cast<float>(fzB) + hat_arc[p])     / TSCALE;
-            const float vB1 = (static_cast<float>(fzB) + hat_arc[p + 1]) / TSCALE;
+        if (NP >= 2 && hat_style != HatStyle::None) {
+            std::vector<std::vector<Vertex>> slice_verts(scols + 1, std::vector<Vertex>(NP));
+            for (int s = 0; s <= scols; ++s) {
+                const double a = static_cast<double>(s) / scols;
+                const double x = nA.x + edge_dx * a;
+                const double y_base = nA.y + edge_dy * a;
+                const double fz_base = fzA * (1.0 - a) + fzB * a;
+                const float u = static_cast<float>(arc[i] + edge_len * a - params.surface_offset_x) / surf_scale + 0.5f;
+                const float rimDisp = rimDispA * static_cast<float>(1.0 - a) + rimDispB * static_cast<float>(a);
 
-            Vertex pA0 = make_vert(nA.x, yA0, zA0, nrm0, uA, vA0);
-            Vertex pA1 = make_vert(nA.x, yA1, zA1, nrm1, uA, vA1);
-            Vertex pB0 = make_vert(nB.x, yB0, zB0, nrm0, uB, vB0);
-            Vertex pB1 = make_vert(nB.x, yB1, zB1, nrm1, uB, vB1);
+                // Interpolate corner normal along the edge
+                double cnx = corner_normA.x * (1.0 - a) + corner_normB.x * a;
+                double cny = corner_normA.y * (1.0 - a) + corner_normB.y * a;
+                double cnl = std::hypot(cnx, cny);
+                zypher::V2 cnorm = (cnl > 1e-5) ? zypher::V2{static_cast<float>(cnx / cnl), static_cast<float>(cny / cnl)} : edge_norms[i];
 
-            push_quad(top_sm, pA0, pB0, pA1, pB1);
+                // Compute taper factor
+                float factor = 1.0f;
+                const float dist_A = static_cast<float>(a * edge_len);
+                const float dist_B = static_cast<float>((1.0 - a) * edge_len);
+                if (is_start_of_run && dist_A < taper_dist && taper_dist > 1e-4f) {
+                    float t = dist_A / taper_dist;
+                    factor = std::min(factor, t * t * (3.0f - 2.0f * t));
+                }
+                if (is_end_of_run && dist_B < taper_dist && taper_dist > 1e-4f) {
+                    float t = dist_B / taper_dist;
+                    factor = std::min(factor, t * t * (3.0f - 2.0f * t));
+                }
+
+                for (int p = 0; p < NP; ++p) {
+                    float lat = hat_profile[p].lat;
+                    float vert = hat_profile[p].vert;
+                    if (shoulder_term == ShoulderTermination::SmoothTaper) {
+                        lat *= factor;
+                        vert *= factor;
+                    } else if (shoulder_term == ShoulderTermination::OverhangDroop) {
+                        const float droop_factor = static_cast<float>(p) / std::max(1, NP - 1);
+                        lat = lat * (0.25f + 0.75f * factor);
+                        vert = vert * factor + 8.0f * (1.0f - factor) * droop_factor;
+                    }
+
+                    const float y = static_cast<float>(y_base) + rimDisp - vert;
+                    const float z = static_cast<float>(fz_base) + lat;
+                    zypher::V3 nrm{
+                        cnorm.x * hat_ny[p],
+                        cnorm.y * hat_ny[p],
+                        hat_nz[p]
+                    };
+                    const float v = static_cast<float>(fz_base + hat_arc[p] * factor - params.surface_offset_y) / surf_scale + 0.5f;
+                    slice_verts[s][p] = make_vert(static_cast<float>(x), y, z, nrm, u, v);
+                }
+            }
+
+            for (int s = 0; s < scols; ++s) {
+                for (int p = 0; p + 1 < NP; ++p) {
+                    push_quad(top_sm, slice_verts[s][p], slice_verts[s + 1][p],
+                                       slice_verts[s][p + 1], slice_verts[s + 1][p + 1]);
+                }
+            }
+
+            // ── Side Capping (Watertight shoulder termination) ───────────────
+            // When using BluntCap (or OverhangDroop), cap the open cross-section.
+            // For SmoothTaper, the profile cross-section smoothly converges to 0 at the boundary,
+            // so no cap fan is needed (profile is already flush with the cliff wall).
+            if (is_start_of_run && NP >= 3 && shoulder_term != ShoulderTermination::SmoothTaper) {
+                std::vector<Vertex> cap_verts;
+                cap_verts.reserve(NP);
+                zypher::V3 cap_norm{
+                    static_cast<float>(-edge_dx / edge_len),
+                    static_cast<float>(-edge_dy / edge_len),
+                    0.0f
+                };
+                for (int p = 0; p < NP; ++p) {
+                    Vertex vt = slice_verts[0][p];
+                    vt.nx = cap_norm.x; vt.ny = cap_norm.y; vt.nz = 0.0f;
+                    cap_verts.push_back(vt);
+                }
+                for (int p = 1; p + 1 < NP; ++p) {
+                    push_tri(top_sm, cap_verts[0], cap_verts[p], cap_verts[p + 1]);
+                }
+            }
+
+            if (is_end_of_run && NP >= 3 && shoulder_term != ShoulderTermination::SmoothTaper) {
+                std::vector<Vertex> cap_verts;
+                cap_verts.reserve(NP);
+                zypher::V3 cap_norm{
+                    static_cast<float>(edge_dx / edge_len),
+                    static_cast<float>(edge_dy / edge_len),
+                    0.0f
+                };
+                for (int p = 0; p < NP; ++p) {
+                    Vertex vt = slice_verts[scols][p];
+                    vt.nx = cap_norm.x; vt.ny = cap_norm.y; vt.nz = 0.0f;
+                    cap_verts.push_back(vt);
+                }
+                for (int p = 1; p + 1 < NP; ++p) {
+                    push_tri(top_sm, cap_verts[0], cap_verts[p + 1], cap_verts[p]);
+                }
+            }
         }
 
         // Collision intent, per the modder contract:
@@ -751,8 +832,8 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
                         for (int k = 0; k <= 4; ++k) {
                             const double ang = 3.14159265358979 * k / 4.0;
                             edge_bumps[i].push_back({a,
-                                px + r * std::cos(ang),
-                                ytop + r * 0.5 * std::sin(ang)});
+                                 px + r * std::cos(ang),
+                                 ytop + r * 0.5 * std::sin(ang)});
                         }
                     }
                 }
@@ -764,11 +845,6 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
     }
 
     // ── 7b. 2D collision outline: the CCW polygon plus any pattern bumps ──────
-    //
-    // A spike or bubble that cleared top_min_collision_radius splices extra
-    // points onto its source edge, in traversal order, so the outline stays a
-    // simple CCW polygon. Everything else keeps vanilla's plain silhouette, and
-    // the emitter's shoelace sweep still corrects the winding.
     result.collision_outline.clear();
     result.collision_outline.reserve(N);
     for (size_t i = 0; i < N; ++i) {
@@ -795,19 +871,16 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
         zypher::V2 out = edge_norms[i];
         zypher::V3 wall_norm{out.x, out.y, 0.0f};
 
-        float uA = static_cast<float>(arc[i]) / TSCALE;
-        float uB = static_cast<float>(arc[i + 1]) / TSCALE;
+        float uA = static_cast<float>(arc[i] - params.surface_offset_x) / surf_scale + 0.5f;
+        float uB = static_cast<float>(arc[i + 1] - params.surface_offset_x) / surf_scale + 0.5f;
 
         // On non-walkable edges (cliffs/overhangs/bottom floor):
         // Extrude full wall between front and back
         if (!is_walkable[i]) {
-            // V is the vertex's own depth / scale, same scheme as the deck, so
-            // the cliff tiles down the wall instead of stretching the whole
-            // front-to-back span into one frozen band (old v_front / 0.0).
-            Vertex wA_f = make_vert(nA.x, nA.y, static_cast<float>(fz[i]), wall_norm, uA, static_cast<float>(fz[i]) / TSCALE);
-            Vertex wB_f = make_vert(nB.x, nB.y, static_cast<float>(fz[next]), wall_norm, uB, static_cast<float>(fz[next]) / TSCALE);
-            Vertex wA_b = make_vert(nA.x, nA.y, static_cast<float>(bz[i]), wall_norm, uA, static_cast<float>(bz[i]) / TSCALE);
-            Vertex wB_b = make_vert(nB.x, nB.y, static_cast<float>(bz[next]), wall_norm, uB, static_cast<float>(bz[next]) / TSCALE);
+            Vertex wA_f = make_vert(nA.x, nA.y, static_cast<float>(fz[i]), wall_norm, uA, static_cast<float>(fz[i] - params.surface_offset_y) / surf_scale + 0.5f);
+            Vertex wB_f = make_vert(nB.x, nB.y, static_cast<float>(fz[next]), wall_norm, uB, static_cast<float>(fz[next] - params.surface_offset_y) / surf_scale + 0.5f);
+            Vertex wA_b = make_vert(nA.x, nA.y, static_cast<float>(bz[i]), wall_norm, uA, static_cast<float>(bz[i] - params.surface_offset_y) / surf_scale + 0.5f);
+            Vertex wB_b = make_vert(nB.x, nB.y, static_cast<float>(bz[next]), wall_norm, uB, static_cast<float>(bz[next] - params.surface_offset_y) / surf_scale + 0.5f);
             push_quad(ribbon_sm, wA_f, wB_f, wA_b, wB_b);
         }
     }
@@ -819,12 +892,9 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
             float vx = static_cast<float>(nodes[i].x);
             float vy = static_cast<float>(nodes[i].y);
             float vz = static_cast<float>(bz[i]);
-            // Same planar mapping as the front face: vanilla's GenerateFrontMesh
-            // textures every triangle through TexCoordForPosition(worldPos), so
-            // it does not mirror the back cap. Negating U here made the rear
-            // seam flip against the front one.
-            float u = vx / TSCALE;
-            float v = -vy / TSCALE;
+            // Planar mapping matches vanilla GenerateFrontMesh TexCoordForPosition
+            float u = (vx - params.front_offset_x) / front_scale + 0.5f;
+            float v = (vy - params.front_offset_y) / front_scale + 0.5f;
             ribbon_sm.vertices.push_back(make_vert(vx, vy, vz, {0, 0, -1}, u, v));
         }
         // Reversed winding for rear face
@@ -841,22 +911,20 @@ static GeneratedMesh terrain_generate(const std::vector<TerrainNode>& nodes_in,
     // ── 10. AABB & Depths ─────────────────────────────────────────────────────
     compute_aabb(result);
     result.depth_z = max_depth + hat_w + 5.0;
-    // The generator's own inputs, for the emitted GroundMeshGenerator. NOT the
-    // AABB: see GeneratedMesh::gen_surface_width. A re-import that reads the
-    // AABB back as SurfaceWidth derives a depth of half the plate and grows the
-    // mesh on every edit.
     result.gen_surface_width = params.surface_width > 0 ? params.surface_width : def_hw * 2.0;
     result.gen_hat_height = hat_h;
-    // offset1 carries the entire shoulder width and offset2 stays 0. Vanilla
-    // splits its round-hat lateral extent across P31 + P32 (offset1 + offset2),
-    // so a re-import that sums the two recovers exactly hat_w instead of
-    // doubling it — which is what writing hat_w into both used to do.
     result.gen_hat_width_offset_1 = hat_w;
     result.gen_hat_width_offset_2 = 0.0;
     result.gen_horiz_noise = 0.0;
     result.gen_seed = params.seed;
     result.gen_mesh_type = 1;
     result.tex_scale = TSCALE;
+    result.tex_scale_surface = surf_scale;
+    result.tex_scale_front   = front_scale;
+    result.tm_offset_surface_x = params.surface_offset_x;
+    result.tm_offset_surface_y = params.surface_offset_y;
+    result.tm_offset_front_x = params.front_offset_x;
+    result.tm_offset_front_y = params.front_offset_y;
     result.ok = true;
     return result;
 }
@@ -1624,11 +1692,11 @@ std::string emit_scene_object(const GeneratedMesh& mesh,
     comp_col.write_nested_field(kWireShapeComp, csc);
 
     // TextureMappings
-    auto make_tm = [&](const std::string& tex, int cid) {
+    auto make_tm = [&](const std::string& tex, int cid, float scale, float off_x, float off_y) {
         proto::Writer tm;
         tm.write_string_field(1, tex);
-        tm.write_float_field(2, mesh.tex_scale > 0.f ? mesh.tex_scale : 250.f);
-        tm.write_nested_field(3, pw_v2(0, 0));
+        tm.write_float_field(2, scale > 0.f ? scale : 250.f);
+        tm.write_nested_field(3, pw_v2(off_x, off_y));
         proto::Writer c;
         c.write_string_field(1, "TextureMapping");
         c.write_varint_field(2, static_cast<uint64_t>(cid));
@@ -1644,10 +1712,27 @@ std::string emit_scene_object(const GeneratedMesh& mesh,
     obj.write_bytes_field(3, comp_mesh.to_string());
     obj.write_bytes_field(3, comp_gen.to_string());
     obj.write_bytes_field(3, comp_col.to_string());
-    int tm_cid = ids.tm_surface_id;
+
+    // Emit surface TextureMapping using tm_surface_id
+    std::string surf_tex = !mesh.surfaces.empty() ? mesh.surfaces[0].texture : "fire_grass";
+    auto c_surf = make_tm(surf_tex, ids.tm_surface_id, mesh.tex_scale_surface,
+                          mesh.tm_offset_surface_x, mesh.tm_offset_surface_y);
+    obj.write_bytes_field(3, c_surf.to_string());
+
+    // Emit front TextureMapping using tm_front_id
+    std::string front_tex = !mesh.fronts.empty() ? mesh.fronts[0].texture : "graveyard_ground";
+    int f_id = ids.tm_front_id > 0 ? ids.tm_front_id : (ids.tm_surface_id + 1);
+    auto c_front = make_tm(front_tex, f_id, mesh.tex_scale_front,
+                           mesh.tm_offset_front_x, mesh.tm_offset_front_y);
+    obj.write_bytes_field(3, c_front.to_string());
+
+    // Emit any remaining extra textures
+    int extra_cid = std::max(ids.tm_surface_id, f_id) + 1;
     for (const auto& tex : textures) {
-        auto c = make_tm(tex, tm_cid++);
-        obj.write_bytes_field(3, c.to_string());
+        if (tex != surf_tex && tex != front_tex) {
+            auto c = make_tm(tex, extra_cid++, mesh.tex_scale_front, 0.0f, 0.0f);
+            obj.write_bytes_field(3, c.to_string());
+        }
     }
     obj.write_nested_field(4, pw_v2(static_cast<float>(pos_x), static_cast<float>(pos_y)));
     obj.write_float_field(5, 0.f); // Depth (standalone = 0, caller sets when injecting)
@@ -1775,6 +1860,20 @@ TopStyle top_style_from_id(const std::string& id) {
     if (id == "porous" || id == "holes" || id == "pitted") return TopStyle::Porous;
     if (id == "bubbly" || id == "bubbles" || id == "bubble") return TopStyle::Bubbly;
     return TopStyle::Plain;
+}
+
+const char* shoulder_term_id(ShoulderTermination s) {
+    switch (s) {
+        case ShoulderTermination::OverhangDroop: return "droop";
+        case ShoulderTermination::BluntCap:      return "blunt";
+        default:                                 return "taper";
+    }
+}
+
+ShoulderTermination shoulder_term_from_id(const std::string& id) {
+    if (id == "droop" || id == "overhang" || id == "sod") return ShoulderTermination::OverhangDroop;
+    if (id == "blunt" || id == "cap" || id == "vanilla") return ShoulderTermination::BluntCap;
+    return ShoulderTermination::SmoothTaper;
 }
 
 } // namespace zypher

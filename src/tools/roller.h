@@ -107,10 +107,18 @@ enum class TopStyle {
     Bubbly,  ///< Rounded domes; small pentagonal collision bumps (default)
 };
 
+enum class ShoulderTermination {
+    SmoothTaper,   ///< Zypher modern: smoothly fades/melts flush into cliff rock (default)
+    OverhangDroop, ///< Natural organic: overhanging turf droop at cliff edges
+    BluntCap       ///< Vanilla style: full shoulder width with flat end cap fan
+};
+
 const char* hat_style_id(HatStyle s);
 HatStyle    hat_style_from_id(const std::string& id);
 const char* top_style_id(TopStyle s);
 TopStyle    top_style_from_id(const std::string& id);
+const char* shoulder_term_id(ShoulderTermination s);
+ShoulderTermination shoulder_term_from_id(const std::string& id);
 
 // ── Terrain subsystem parameters ─────────────────────────────────────────
 struct TerrainParams {
@@ -126,7 +134,20 @@ struct TerrainParams {
     int    fbm_octaves      = 3;      ///< Noise octave count
     float  worley_blend     = 0.20f;  ///< Worley noise blend ratio
     float  alpha_for_hull   = 0.0f;   ///< 0 = convex hull for collision; >0 = alpha-shape
-    float  texture_scale    = 250.0f; ///< UV scale for texture tiling
+    float  texture_scale    = 250.0f; ///< UV scale for texture tiling (default fallback)
+    float  front_texture_scale   = 0.0f; ///< FrontMesh UV scale (0 = use texture_scale)
+    float  surface_texture_scale = 0.0f; ///< SurfaceMesh UV scale (0 = use texture_scale)
+    float  front_offset_x        = 0.0f; ///< FrontMesh UV offset X
+    float  front_offset_y        = 0.0f; ///< FrontMesh UV offset Y
+    float  surface_offset_x      = 0.0f; ///< SurfaceMesh UV offset X
+    float  surface_offset_y      = 0.0f; ///< SurfaceMesh UV offset Y
+    // Slope threshold: normal.y >= threshold is a walkable top surface.
+    // Vanilla Swordigo Caver engine strictly uses 0.70711f (45 degree slope cutoff).
+    // Slopes steeper than this (including vertical walls with ny = 0.0f) are cliff walls.
+    // TODO: Expose configurable walkable slope angle slider in GroundMeshStudio & Mobile Viewport UI.
+    float  walkable_threshold    = 0.70711f; ///< Normal.y >= threshold is walkable top deck (vanilla = 0.70711)
+    ShoulderTermination shoulder_term = ShoulderTermination::SmoothTaper; ///< Cliff corner shoulder transition
+    float  taper_length          = 25.0f;    ///< Distance in world units over which shoulder tapers into cliff
 
     // ── Selectable looks (see HatStyle / TopStyle above) ──────────────────
     HatStyle hat_style = HatStyle::Vanilla;  ///< Rim/shoulder silhouette
@@ -245,7 +266,13 @@ struct GeneratedMesh {
     double gen_horiz_noise = 0.0;          ///< field 6
     uint32_t gen_seed = 1291618994u;       ///< field 5
     int gen_mesh_type = 1;                 ///< field 7
-    float tex_scale = 250.0f;              ///< TextureMapping field 2
+    float tex_scale = 250.0f;              ///< TextureMapping field 2 (fallback)
+    float tex_scale_surface = 200.0f;      ///< TextureMapping field 2 for surface
+    float tex_scale_front   = 250.0f;      ///< TextureMapping field 2 for front
+    float tm_offset_surface_x = 0.0f;      ///< TextureMapping field 3 offset X for surface
+    float tm_offset_surface_y = 0.0f;      ///< TextureMapping field 3 offset Y for surface
+    float tm_offset_front_x = 0.0f;        ///< TextureMapping field 3 offset X for front
+    float tm_offset_front_y = 0.0f;        ///< TextureMapping field 3 offset Y for front
 
     size_t vertex_count() const;
     size_t triangle_count() const;
