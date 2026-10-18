@@ -30,6 +30,7 @@ class RubySettingsBridge : public QObject {
     Q_OBJECT
     Q_PROPERTY(QString userName READ userName WRITE setUserName NOTIFY userNameChanged)
     Q_PROPERTY(QString userTitle READ userTitle WRITE setUserTitle NOTIFY userTitleChanged)
+    Q_PROPERTY(QString avatarImage READ avatarImage WRITE setAvatarImage NOTIFY avatarImageChanged)
     Q_PROPERTY(bool showGrid READ showGrid WRITE setShowGrid NOTIFY showGridChanged)
     Q_PROPERTY(bool msaaEnabled READ msaaEnabled WRITE setMsaaEnabled NOTIFY msaaEnabledChanged)
     Q_PROPERTY(bool wireframeMode READ wireframeMode WRITE setWireframeMode NOTIFY wireframeModeChanged)
@@ -47,6 +48,7 @@ class RubySettingsBridge : public QObject {
     // and "zypher"; the default is "zypher" (Gen 3).
     Q_PROPERTY(QString groundGenerator READ groundGenerator WRITE setGroundGenerator
                    NOTIFY groundGeneratorChanged)
+    Q_PROPERTY(QString themeId READ themeId WRITE setThemeId NOTIFY themeIdChanged)
     Q_PROPERTY(int nameDatabaseCount READ nameDatabaseCount CONSTANT)
     Q_PROPERTY(QString appName READ appName CONSTANT)
     Q_PROPERTY(QString appVersion READ appVersion CONSTANT)
@@ -66,6 +68,9 @@ public:
 
     QString userTitle() const;
     void setUserTitle(const QString& title);
+
+    QString avatarImage() const;
+    void setAvatarImage(const QString& path);
 
     bool showGrid() const;
     void setShowGrid(bool val);
@@ -103,6 +108,9 @@ public:
     QString groundGenerator() const;
     void setGroundGenerator(const QString& id);
 
+    QString themeId() const;
+    void setThemeId(const QString& id);
+
     int nameDatabaseCount() const;
     QString appName() const { return QStringLiteral("Ruby Touch (Ruby Mobile)"); }
 #ifdef RUBY_BUILD_VERSION
@@ -127,6 +135,8 @@ public:
     Q_INVOKABLE QString randomizeUserName();
     Q_INVOKABLE QString getRandomName() const;
     Q_INVOKABLE QStringList getPresetNames() const;
+    Q_INVOKABLE QString randomizeAvatarImage();
+    Q_INVOKABLE QStringList getPresetAvatars() const;
     Q_INVOKABLE void resetToDefaults();
 
     QVariantList customMeshPresets() const;
@@ -136,6 +146,7 @@ public:
 signals:
     void userNameChanged(const QString& name);
     void userTitleChanged(const QString& title);
+    void avatarImageChanged(const QString& path);
     void showGridChanged(bool val);
     void msaaEnabledChanged(bool val);
     void wireframeModeChanged(bool val);
@@ -148,6 +159,7 @@ signals:
     void hapticsEnabledChanged(bool val);
     void holdToSelectChanged(bool val);
     void groundGeneratorChanged(const QString& id);
+    void themeIdChanged(const QString& id);
     void customMeshPresetsChanged();
 };
 

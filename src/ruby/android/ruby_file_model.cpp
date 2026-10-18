@@ -7,6 +7,11 @@
 #include <QStandardPaths>
 #include <QImage>
 #include <QSettings>
+#include <QStorageInfo>
+#include <QDirIterator>
+#include <QCryptographicHash>
+#include <QRegularExpression>
+#include <QTextStream>
 #include "platform/zip_archive.h"
 #include "platform/scl_parser.h"
 #include "platform/pvr_loader.h"
@@ -36,6 +41,7 @@ RubyFileModel::RubyFileModel(QObject* parent)
             m_currentDir = QDir::current();
         }
     }
+    refreshStorageInfo();
     reload();
 }
 
@@ -58,6 +64,7 @@ QVariant RubyFileModel::data(const QModelIndex& index, int role) const {
     case FileSizeStrRole: return item.fileSizeStr;
     case FileDateStrRole: return item.fileDateStr;
     case IsPinnedRole: return item.isPinned;
+    case IsSelectedRole: return m_selectedPaths.contains(item.filePath);
     default: return QVariant();
     }
 }
@@ -71,6 +78,7 @@ QHash<int, QByteArray> RubyFileModel::roleNames() const {
     roles[FileSizeStrRole] = "fileSizeStr";
     roles[FileDateStrRole] = "fileDateStr";
     roles[IsPinnedRole] = "isPinned";
+    roles[IsSelectedRole] = "isSelected";
     return roles;
 }
 
@@ -80,6 +88,11 @@ void RubyFileModel::navigateTo(const QString& path) {
         m_currentDir = dir;
         m_filter.clear();
         m_allItems.clear();
+        clearSelection();
+        cancelSearch();
+        m_isSearchMode = false;
+        emit isSearchModeChanged();
+        refreshStorageInfo();
         reload();
         emit currentPathChanged();
     }
@@ -89,6 +102,11 @@ void RubyFileModel::navigateUp() {
     if (m_currentDir.cdUp()) {
         m_filter.clear();
         m_allItems.clear();
+        clearSelection();
+        cancelSearch();
+        m_isSearchMode = false;
+        emit isSearchModeChanged();
+        refreshStorageInfo();
         reload();
         emit currentPathChanged();
     }
@@ -958,6 +976,7 @@ static bool zip_folder_recursive_impl(const QString& root_dir, const QString& cu
 
 void RubyFileModel::cutItem(const QString& path) {
     m_clipboardPath = path;
+    m_clipboardPaths = { path };
     m_clipboardIsCut = true;
     emit clipboardChanged();
     emit statusMessage(QStringLiteral("Cut: %1").arg(QFileInfo(path).fileName()));
@@ -965,6 +984,7 @@ void RubyFileModel::cutItem(const QString& path) {
 
 void RubyFileModel::copyItem(const QString& path) {
     m_clipboardPath = path;
+    m_clipboardPaths = { path };
     m_clipboardIsCut = false;
     emit clipboardChanged();
     emit statusMessage(QStringLiteral("Copied: %1").arg(QFileInfo(path).fileName()));
@@ -972,70 +992,68 @@ void RubyFileModel::copyItem(const QString& path) {
 
 void RubyFileModel::clearClipboard() {
     m_clipboardPath.clear();
+    m_clipboardPaths.clear();
     m_clipboardIsCut = false;
     emit clipboardChanged();
 }
 
 bool RubyFileModel::paste() {
-    if (m_clipboardPath.isEmpty()) return false;
-
-    QFileInfo src(m_clipboardPath);
-    if (!src.exists()) {
-        emit statusMessage(QStringLiteral("Source item no longer exists!"));
-        clearClipboard();
-        return false;
+    if (m_clipboardPaths.isEmpty()) {
+        if (!m_clipboardPath.isEmpty()) {
+            m_clipboardPaths.append(m_clipboardPath);
+        } else {
+            return false;
+        }
     }
 
-    const QString dest = m_currentDir.filePath(src.fileName());
-    if (dest == m_clipboardPath) {
-        emit statusMessage(QStringLiteral("Cannot paste into same location!"));
-        return false;
+    int successCount = 0;
+    for (const QString& srcPath : m_clipboardPaths) {
+        QFileInfo src(srcPath);
+        if (!src.exists()) continue;
+
+        const QString dest = m_currentDir.filePath(src.fileName());
+        if (dest == srcPath) continue;
+
+        if (m_clipboardIsCut) {
+            bool moved = QFile::rename(srcPath, dest);
+            if (!moved) {
+                if (src.isDir()) {
+                    if (copy_dir_recursive(srcPath, dest)) {
+                        QDir(srcPath).removeRecursively();
+                        moved = true;
+                    }
+                } else {
+                    if (QFile::exists(dest)) QFile::remove(dest);
+                    if (QFile::copy(srcPath, dest)) {
+                        QFile::remove(srcPath);
+                        moved = true;
+                    }
+                }
+            }
+            if (moved) successCount++;
+        } else {
+            bool copied = false;
+            if (src.isDir()) {
+                copied = copy_dir_recursive(srcPath, dest);
+            } else {
+                if (QFile::exists(dest)) QFile::remove(dest);
+                copied = QFile::copy(srcPath, dest);
+            }
+            if (copied) successCount++;
+        }
     }
 
     if (m_clipboardIsCut) {
-        // Move / Rename
-        bool moved = QFile::rename(m_clipboardPath, dest);
-        if (!moved) {
-            // Cross-filesystem move fallback
-            if (src.isDir()) {
-                if (copy_dir_recursive(m_clipboardPath, dest)) {
-                    QDir(m_clipboardPath).removeRecursively();
-                    moved = true;
-                }
-            } else {
-                if (QFile::exists(dest)) QFile::remove(dest);
-                if (QFile::copy(m_clipboardPath, dest)) {
-                    QFile::remove(m_clipboardPath);
-                    moved = true;
-                }
-            }
-        }
-        if (moved) {
-            emit statusMessage(QStringLiteral("Moved: %1").arg(src.fileName()));
-            clearClipboard();
-            reload();
-            return true;
-        } else {
-            emit statusMessage(QStringLiteral("Error moving item!"));
-            return false;
-        }
+        clearClipboard();
+    }
+
+    if (successCount > 0) {
+        emit statusMessage(m_clipboardIsCut ? QStringLiteral("Moved %1 item(s)").arg(successCount) : QStringLiteral("Pasted %1 item(s)").arg(successCount));
+        reload();
+        return true;
     } else {
-        // Copy
-        bool copied = false;
-        if (src.isDir()) {
-            copied = copy_dir_recursive(m_clipboardPath, dest);
-        } else {
-            if (QFile::exists(dest)) QFile::remove(dest);
-            copied = QFile::copy(m_clipboardPath, dest);
-        }
-        if (copied) {
-            emit statusMessage(QStringLiteral("Copied: %1").arg(src.fileName()));
-            reload();
-            return true;
-        } else {
-            emit statusMessage(QStringLiteral("Error copying item!"));
-            return false;
-        }
+        emit statusMessage(QStringLiteral("Failed to paste item(s)!"));
+        return false;
     }
 }
 
@@ -1357,6 +1375,388 @@ QVariantList RubyFileModel::recentFiles() const {
         if (list.size() >= 10) break;
     }
     return list;
+}
+
+// ── Multi-Selection & Batch Operations (Index FM SelectionBar) ─────────
+void RubyFileModel::setItemSelected(const QString& path, bool selected) {
+    if (path.isEmpty()) return;
+    bool changed = false;
+    if (selected) {
+        if (!m_selectedPaths.contains(path)) {
+            m_selectedPaths.insert(path);
+            changed = true;
+        }
+    } else {
+        if (m_selectedPaths.contains(path)) {
+            m_selectedPaths.remove(path);
+            changed = true;
+        }
+    }
+    if (changed) {
+        for (int i = 0; i < m_items.size(); ++i) {
+            if (m_items[i].filePath == path) {
+                m_items[i].isSelected = selected;
+                QModelIndex idx = index(i, 0);
+                emit dataChanged(idx, idx, {IsSelectedRole});
+                break;
+            }
+        }
+        emit selectionChanged();
+    }
+}
+
+void RubyFileModel::toggleItemSelected(const QString& path) {
+    bool current = m_selectedPaths.contains(path);
+    setItemSelected(path, !current);
+}
+
+bool RubyFileModel::isItemSelected(const QString& path) const {
+    return m_selectedPaths.contains(path);
+}
+
+void RubyFileModel::selectAll() {
+    bool changed = false;
+    for (int i = 0; i < m_items.size(); ++i) {
+        if (!m_selectedPaths.contains(m_items[i].filePath)) {
+            m_selectedPaths.insert(m_items[i].filePath);
+            m_items[i].isSelected = true;
+            changed = true;
+        }
+    }
+    if (changed) {
+        if (!m_items.isEmpty()) {
+            emit dataChanged(index(0, 0), index(m_items.size() - 1, 0), {IsSelectedRole});
+        }
+        emit selectionChanged();
+    }
+}
+
+void RubyFileModel::clearSelection() {
+    if (m_selectedPaths.isEmpty()) return;
+    m_selectedPaths.clear();
+    for (int i = 0; i < m_items.size(); ++i) {
+        m_items[i].isSelected = false;
+    }
+    if (!m_items.isEmpty()) {
+        emit dataChanged(index(0, 0), index(m_items.size() - 1, 0), {IsSelectedRole});
+    }
+    emit selectionChanged();
+}
+
+QStringList RubyFileModel::getSelectedPaths() const {
+    return m_selectedPaths.values();
+}
+
+QString RubyFileModel::getSelectedTotalBytesStr() const {
+    qint64 total = 0;
+    for (const auto& item : m_items) {
+        if (m_selectedPaths.contains(item.filePath)) {
+            total += item.bytes;
+        }
+    }
+    return formatSize(total);
+}
+
+bool RubyFileModel::deleteMultiple(const QStringList& paths) {
+    if (paths.isEmpty()) return false;
+    int successCount = 0;
+    for (const QString& p : paths) {
+        QFileInfo fi(p);
+        bool ok = false;
+        if (fi.isDir()) {
+            QDir d(p);
+            ok = d.removeRecursively();
+        } else {
+            ok = QFile::remove(p);
+        }
+        if (ok) {
+            m_pinnedPaths.remove(p);
+            m_selectedPaths.remove(p);
+            successCount++;
+        }
+    }
+    emit statusMessage(QStringLiteral("Deleted %1 item(s)").arg(successCount));
+    m_allItems.clear();
+    reload();
+    emit selectionChanged();
+    return successCount > 0;
+}
+
+void RubyFileModel::copyMultiple(const QStringList& paths) {
+    if (paths.isEmpty()) return;
+    m_clipboardPaths = paths;
+    m_clipboardPath = paths.first();
+    m_clipboardIsCut = false;
+    emit clipboardChanged();
+    emit statusMessage(QStringLiteral("Copied %1 item(s) to clipboard").arg(paths.size()));
+}
+
+void RubyFileModel::cutMultiple(const QStringList& paths) {
+    if (paths.isEmpty()) return;
+    m_clipboardPaths = paths;
+    m_clipboardPath = paths.first();
+    m_clipboardIsCut = true;
+    emit clipboardChanged();
+    emit statusMessage(QStringLiteral("Cut %1 item(s) to clipboard").arg(paths.size()));
+}
+
+bool RubyFileModel::compressMultiple(const QStringList& paths, const QString& outZipPath) {
+    if (paths.isEmpty()) return false;
+    QString destZip = outZipPath;
+    if (destZip.isEmpty()) {
+        destZip = m_currentDir.filePath(QStringLiteral("Archive_%1.zip").arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_hhmmss"))));
+    }
+
+    std::vector<zip::OutEntry> entries;
+    for (const QString& targetPath : paths) {
+        QFileInfo fi(targetPath);
+        if (!fi.exists()) continue;
+        if (fi.isDir()) {
+            if (!zip_folder_recursive_impl(fi.dir().absolutePath(), targetPath, entries)) {
+                emit statusMessage(QStringLiteral("Error reading folder for compression: ") + fi.fileName());
+            }
+        } else {
+            QFile f(targetPath);
+            if (f.open(QIODevice::ReadOnly)) {
+                QByteArray bytes = f.readAll();
+                f.close();
+                zip::OutEntry e;
+                e.name = fi.fileName().toStdString();
+                e.data = std::string(bytes.constData(), bytes.size());
+                e.method = 8;
+                entries.push_back(std::move(e));
+            }
+        }
+    }
+
+    if (entries.empty()) {
+        emit statusMessage(QStringLiteral("No readable files to compress!"));
+        return false;
+    }
+
+    emit statusMessage(QStringLiteral("Compressing %1 files into %2...").arg(entries.size()).arg(QFileInfo(destZip).fileName()));
+    bool ok = zip::write_archive(destZip.toStdString(), entries);
+    if (ok) {
+        emit statusMessage(QStringLiteral("Created zip: %1 (%2 items)").arg(QFileInfo(destZip).fileName()).arg(entries.size()));
+        clearSelection();
+        reload();
+    } else {
+        emit statusMessage(QStringLiteral("Failed to create zip archive!"));
+    }
+    return ok;
+}
+
+// ── Deep Recursive Search (Index & HyprFM SearchEngine) ────────────────
+void RubyFileModel::searchRecursive(const QString& query) {
+    const QString q = query.trimmed();
+    if (q.isEmpty()) {
+        clearSearch();
+        return;
+    }
+
+    uint64_t gen = ++m_searchGeneration;
+    m_isSearching = true;
+    m_isSearchMode = true;
+    m_searchResultCount = 0;
+    emit isSearchingChanged();
+    emit isSearchModeChanged();
+    emit searchResultCountChanged();
+
+    QPointer<RubyFileModel> self(this);
+    QString rootPath = m_currentDir.absolutePath();
+    bool showHidden = m_showHidden;
+    QString cat = m_category;
+
+    QThreadPool::globalInstance()->start([self, gen, rootPath, q, showHidden, cat]() {
+        if (!self || self->m_searchGeneration.load() != gen) return;
+
+        QDir::Filters filters = QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot;
+        if (showHidden) filters |= QDir::Hidden;
+
+        QDirIterator it(rootPath, filters, QDirIterator::Subdirectories);
+        QVector<FileItem> matches;
+        matches.reserve(120);
+
+        bool isWildcard = q.contains(QLatin1Char('*')) || q.contains(QLatin1Char('?'));
+        QRegularExpression regex;
+        if (isWildcard) {
+            regex = QRegularExpression(QRegularExpression::wildcardToRegularExpression(q), QRegularExpression::CaseInsensitiveOption);
+        }
+
+        int count = 0;
+        const int maxResults = 1000;
+
+        while (it.hasNext() && count < maxResults) {
+            if (!self || self->m_searchGeneration.load() != gen) return;
+
+            it.next();
+            QFileInfo fi = it.fileInfo();
+            const QString fileName = fi.fileName();
+
+            bool match = false;
+            if (isWildcard) {
+                match = regex.match(fileName).hasMatch();
+            } else {
+                match = fileName.contains(q, Qt::CaseInsensitive);
+            }
+
+            if (!match) continue;
+
+            if (!fi.isDir() && !passesCategorySuffix(fi.suffix().toLower(), cat)) {
+                continue;
+            }
+
+            FileItem item;
+            item.fileName = fileName;
+            item.filePath = fi.absoluteFilePath();
+            item.isDir = fi.isDir();
+            item.fileType = detectFileType(fi);
+            item.isPinned = self->m_pinnedPaths.contains(item.filePath);
+            item.isSelected = self->m_selectedPaths.contains(item.filePath);
+            item.bytes = fi.isDir() ? 0 : fi.size();
+            item.modified = fi.lastModified();
+            item.suffix = fi.suffix();
+
+            if (item.isDir) {
+                item.fileSizeStr = QStringLiteral("Folder");
+            } else {
+                item.fileSizeStr = formatSize(fi.size());
+            }
+
+            QString relParent = QDir(rootPath).relativeFilePath(fi.path());
+            if (relParent.isEmpty() || relParent == QLatin1String(".")) {
+                item.fileDateStr = fi.lastModified().toString(QStringLiteral("MMM dd, yyyy"));
+            } else {
+                item.fileDateStr = relParent;
+            }
+
+            matches.append(item);
+            count++;
+        }
+
+        if (!self || self->m_searchGeneration.load() != gen) return;
+
+        QMetaObject::invokeMethod(self, [self, gen, matches = std::move(matches)]() mutable {
+            if (!self || self->m_searchGeneration.load() != gen) return;
+
+            self->beginResetModel();
+            self->m_items = std::move(matches);
+            self->m_dirCount = 0;
+            self->m_fileCount = self->m_items.size();
+            self->endResetModel();
+
+            self->m_isSearching = false;
+            self->m_searchResultCount = self->m_items.size();
+            emit self->isSearchingChanged();
+            emit self->searchResultCountChanged();
+            emit self->countChanged();
+        }, Qt::QueuedConnection);
+    });
+}
+
+void RubyFileModel::cancelSearch() {
+    m_searchGeneration++;
+    if (m_isSearching) {
+        m_isSearching = false;
+        emit isSearchingChanged();
+    }
+}
+
+void RubyFileModel::clearSearch() {
+    m_searchGeneration++;
+    m_isSearching = false;
+    m_isSearchMode = false;
+    m_searchResultCount = 0;
+    emit isSearchingChanged();
+    emit isSearchModeChanged();
+    emit searchResultCountChanged();
+    applyFilterAndSort();
+}
+
+// ── Inspection, Storage Metrics & File Preview (Index FilePreviewer) ───
+void RubyFileModel::refreshStorageInfo() {
+    QStorageInfo storage(m_currentDir);
+    if (storage.isValid() && storage.isReady()) {
+        qint64 total = storage.bytesTotal();
+        qint64 avail = storage.bytesAvailable();
+        m_availableStorageStr = formatSize(avail);
+        m_totalStorageStr = formatSize(total);
+        if (total > 0) {
+            m_storageUsagePercent = static_cast<qreal>(total - avail) / static_cast<qreal>(total);
+        } else {
+            m_storageUsagePercent = 0.0;
+        }
+    } else {
+        m_availableStorageStr = QStringLiteral("Unknown");
+        m_totalStorageStr = QStringLiteral("Unknown");
+        m_storageUsagePercent = 0.0;
+    }
+    emit storageInfoChanged();
+}
+
+QString RubyFileModel::calculateMd5(const QString& path) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return QString();
+    QCryptographicHash hash(QCryptographicHash::Md5);
+    char buf[65536];
+    while (!f.atEnd()) {
+        qint64 bytesRead = f.read(buf, sizeof(buf));
+        if (bytesRead > 0) hash.addData(QByteArrayView(buf, bytesRead));
+    }
+    return QString::fromLatin1(hash.result().toHex());
+}
+
+QString RubyFileModel::readFileSnippet(const QString& path, int maxLines) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return QString();
+    QTextStream in(&f);
+    QString result;
+    int lines = 0;
+    while (!in.atEnd() && lines < maxLines) {
+        result.append(in.readLine());
+        result.append(QLatin1Char('\n'));
+        lines++;
+    }
+    if (!in.atEnd()) {
+        result.append(QStringLiteral("\n--- [Truncated: File has more lines] ---"));
+    }
+    return result;
+}
+
+QVariantMap RubyFileModel::getDetailedFileProperties(const QString& path) {
+    QVariantMap map;
+    QFileInfo fi(path);
+    if (!fi.exists()) return map;
+
+    map[QStringLiteral("name")] = fi.fileName();
+    map[QStringLiteral("path")] = fi.absoluteFilePath();
+    map[QStringLiteral("dir")] = fi.absolutePath();
+    map[QStringLiteral("isDir")] = fi.isDir();
+    map[QStringLiteral("fileType")] = detectFileType(fi);
+    map[QStringLiteral("sizeBytes")] = fi.size();
+    map[QStringLiteral("sizeStr")] = fi.isDir() ? QStringLiteral("Directory") : formatSize(fi.size());
+    map[QStringLiteral("modifiedStr")] = fi.lastModified().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    map[QStringLiteral("createdStr")] = fi.birthTime().isValid() ? fi.birthTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")) : fi.lastModified().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    map[QStringLiteral("isPinned")] = m_pinnedPaths.contains(fi.absoluteFilePath());
+
+    QFile::Permissions p = fi.permissions();
+    QString perm;
+    perm += fi.isDir() ? 'd' : '-';
+    perm += (p & QFile::ReadOwner) ? 'r' : '-';
+    perm += (p & QFile::WriteOwner) ? 'w' : '-';
+    perm += (p & QFile::ExeOwner) ? 'x' : '-';
+    perm += (p & QFile::ReadGroup) ? 'r' : '-';
+    perm += (p & QFile::WriteGroup) ? 'w' : '-';
+    perm += (p & QFile::ExeGroup) ? 'x' : '-';
+    perm += (p & QFile::ReadOther) ? 'r' : '-';
+    perm += (p & QFile::WriteOther) ? 'w' : '-';
+    perm += (p & QFile::ExeOther) ? 'x' : '-';
+    map[QStringLiteral("permissions")] = perm;
+
+    map[QStringLiteral("owner")] = fi.owner();
+    map[QStringLiteral("group")] = fi.group();
+
+    return map;
 }
 
 } // namespace ruby::android

@@ -141,6 +141,11 @@ struct SceneObject {
     // Ruby ghosts it (very faint + transparent) unless the rift is toggled on.
     bool        is_dimension_object = false;
 
+    // Multi-sheet water extrusion: true if this object is a companion sheet
+    // of a primary WaterMesh pool tiled along the Z axis.
+    bool        is_secondary_water_sheet = false;
+    std::string water_master_name;
+
     // True when this object carries no renderable geometry — its components are
     // purely non-visual (Light, Portal, CollisionShape, SpawnPoint, controllers,
     // AI, triggers). Such objects resolve fine but have nothing to draw, so the
@@ -243,6 +248,15 @@ struct SceneData {
         float  tex_offset[2] = {0, 0}; // texture offset (TextureMapping f3)
         std::string texture;         // texture name (e.g. "water")
         std::vector<float> polygon_points; // arbitrary polygon vertices [x0, y0, x1, y1, ...]
+        float  front_z = 40.0f;      // front face local Z (fluid sheet front extent)
+        float  back_z  = -20.0f;     // back face local Z (fluid sheet back extent)
+        float  z_depth = 60.0f;      // mesh thickness in Z: front_z - back_z
+        bool   is_secondary_sheet = false; // true if this sheet is a companion sheet
+        std::string master_name;     // identifier of the master WaterMesh object
+        int    sheet_index = 0;      // 0 for master, signed or positive for sheets
+        int    sheets_front = 0;     // count of front sheets
+        int    sheets_back = 0;      // count of back sheets
+        int    total_sheets = 1;     // total sheets composing the fluid volume
     };
     std::vector<SceneWater> waters;
 

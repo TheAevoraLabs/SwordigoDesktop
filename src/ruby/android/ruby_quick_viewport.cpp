@@ -5,6 +5,7 @@
 #include "tools/scene_asset_resolver.h"
 #include "tools/scene_workspace.h"
 #include "tools/rubymesh_meta.h"
+#include "tools/rubywater_meta.h"
 #include <QThreadPool>
 #include <QOpenGLFramebufferObject>
 #include <QOpenGLFunctions>
@@ -23,6 +24,7 @@
 #include <cstring>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <filesystem>
 #include <atomic>
 #include <functional>
@@ -1437,8 +1439,8 @@ private:
             const int m = cols + 1;
             const int num_verts = m * 4;
 
-            const float front_z = 40.0f;
-            const float back_z  = -20.0f;
+            const float front_z = (w.front_z == 0.0f && w.back_z == 0.0f) ? 40.0f : w.front_z;
+            const float back_z  = (w.front_z == 0.0f && w.back_z == 0.0f) ? -20.0f : w.back_z;
 
             const size_t vertCount = static_cast<size_t>(num_verts) * 5;
             const size_t idxCount  = static_cast<size_t>(cols) * 12;
@@ -1561,15 +1563,20 @@ private:
             m_waterShader->setUniformValue("uFrontColor", QVector4D(w.front_color[0], w.front_color[1], w.front_color[2], w.front_color[3]));
             m_waterShader->setUniformValue("uSurfaceColor", QVector4D(w.surface_color[0], w.surface_color[1], w.surface_color[2], w.surface_color[3]));
 
-            const bool isSelected = (w.object_index == m_selectedObject);
+            const bool isSelected = (w.object_index == m_selectedObject) ||
+                (w.is_secondary_sheet && m_selectedObject >= 0 &&
+                 m_selectedObject < static_cast<int>(m_sceneObjects.size()) &&
+                 w.master_name == m_sceneObjects[m_selectedObject].name);
             m_waterShader->setUniformValue("uIsSelected", isSelected ? 1 : 0);
             if (isSelected) {
                 m_waterShader->setUniformValue("uSelectionColor", QVector4D(0.16f, 0.82f, 1.0f, 0.35f));
             }
 
-            // 1. Draw Front Face
-            m_waterShader->setUniformValue("uIsBackFace", 0);
-            glDrawElements(GL_TRIANGLES, cols * 6, GL_UNSIGNED_SHORT, nullptr);
+            // 1. Draw Front Face (only if front curtain is visible)
+            if (w.front_color[3] > 0.001f) {
+                m_waterShader->setUniformValue("uIsBackFace", 0);
+                glDrawElements(GL_TRIANGLES, cols * 6, GL_UNSIGNED_SHORT, nullptr);
+            }
 
             // 2. Draw Top Surface Sheet
             m_waterShader->setUniformValue("uIsBackFace", 1);
@@ -1772,7 +1779,8 @@ private:
 
                 const float x0 = rx, x1 = rx + rw;
                 const float y0 = ry, y1 = ry + rh;
-                const float z0 = -20.0f, z1 = 40.0f;
+                const float z0 = (w.front_z == 0.0f && w.back_z == 0.0f) ? -20.0f : w.back_z;
+                const float z1 = (w.front_z == 0.0f && w.back_z == 0.0f) ? 40.0f : w.front_z;
 
                 float boxVerts[] = {
                     x0, y0, z1,  x1, y0, z1,
@@ -1950,12 +1958,12 @@ private:
     }
 
     // ====================================================================
-    // In-Scene WaterMesh (W-Mesh) Edit Wireframe Overlay
+    // In-Scene WaterMesh (W-Mesh) Edit Wireframe Overlay — 3D Volumetric Fluid Cage
     // ====================================================================
     void renderWaterMeshEditOverlay(const QMatrix4x4& view, const QMatrix4x4& proj) {
         if (!m_waterEditActive || m_waterEditObject < 0 ||
             m_waterEditObject >= int(m_sceneObjects.size()) ||
-            !m_unlitShader || !m_unlitShader->isLinked() || m_waterEditPoints.empty())
+            !m_unlitShader || !m_unlitShader->isLinked() || m_waterEditPoints.size() < 4)
         {
             return;
         }
@@ -1970,65 +1978,105 @@ private:
         m_unlitShader->setUniformValue("uProj", proj);
         m_unlitShader->setUniformValue("uModelView", view * worldMat);
 
-        // 1. Water Perimeter Wireframe Outline
-        std::vector<float> outlineVerts;
-        outlineVerts.reserve(m_waterEditPoints.size() * 3);
+        double min_x = 1e30, max_x = -1e30, min_y = 1e30, max_y = -1e30;
         for (const auto& pt : m_waterEditPoints) {
-            outlineVerts.push_back(float(pt.x));
-            outlineVerts.push_back(float(pt.y));
-            outlineVerts.push_back(0.0f);
+            min_x = std::min(min_x, pt.x); max_x = std::max(max_x, pt.x);
+            min_y = std::min(min_y, pt.y); max_y = std::max(max_y, pt.y);
         }
+        const float mx0 = float(min_x), mx1 = float(max_x);
+        const float my0 = float(min_y), my1 = float(max_y);
+
+        float front_z = 40.0f;
+        float back_z = -20.0f;
+        for (const auto& w : m_sceneWaters) {
+            if (w.object_index == m_waterEditObject) {
+                front_z = w.front_z;
+                back_z = w.back_z;
+                break;
+            }
+        }
+
+        // 1. Back Sheet Plane & 3D Depth Struts (if volumetric / multi-sheet)
+        if (std::abs(front_z - back_z) > 1.0f) {
+            float backRect[12] = {
+                mx0, my1, back_z,
+                mx1, my1, back_z,
+                mx1, my0, back_z,
+                mx0, my0, back_z
+            };
+            glLineWidth(1.8f);
+            m_unlitShader->setUniformValue("uColor", QVector4D(0.20f, 0.45f, 0.85f, 0.35f));
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, backRect);
+            glDrawArrays(GL_LINE_LOOP, 0, 4);
+
+            float struts[24] = {
+                mx0, my1, back_z,  mx0, my1, front_z,
+                mx1, my1, back_z,  mx1, my1, front_z,
+                mx1, my0, back_z,  mx1, my0, front_z,
+                mx0, my0, back_z,  mx0, my0, front_z
+            };
+            m_unlitShader->setUniformValue("uColor", QVector4D(0.15f, 0.60f, 0.95f, 0.40f));
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, struts);
+            glDrawArrays(GL_LINES, 0, 8);
+        }
+
+        // 2. Front Active Water Perimeter Wireframe Outline
+        float frontRect[12] = {
+            mx0, my1, front_z,
+            mx1, my1, front_z,
+            mx1, my0, front_z,
+            mx0, my0, front_z
+        };
 
         // Outer Radiant Aquatic Glow
         glLineWidth(5.0f);
-        m_unlitShader->setUniformValue("uColor", QVector4D(0.0f, 0.75f, 1.0f, 0.40f));
+        m_unlitShader->setUniformValue("uColor", QVector4D(0.0f, 0.75f, 1.0f, 0.35f));
         glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, outlineVerts.data());
-        glDrawArrays(GL_LINE_LOOP, 0, int(outlineVerts.size() / 3));
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, frontRect);
+        glDrawArrays(GL_LINE_LOOP, 0, 4);
 
         // Inner Core Sharp Cyan Line
         glLineWidth(2.5f);
         m_unlitShader->setUniformValue("uColor", QVector4D(0.20f, 0.95f, 1.0f, 0.95f));
-        glDrawArrays(GL_LINE_LOOP, 0, int(outlineVerts.size() / 3));
+        glDrawArrays(GL_LINE_LOOP, 0, 4);
 
-        // 2. Animated Surface Wave Crest Line (along top boundary)
+        // 3. Animated Surface Wave Crest Line (along top boundary)
         const float time_sec = float(m_renderTimer.elapsed()) / 1000.0f;
         constexpr float k_two_pi = 6.28318530718f;
-        double max_y = -1e30, min_x = 1e30, max_x = -1e30;
-        for (const auto& pt : m_waterEditPoints) {
-            max_y = std::max(max_y, pt.y);
-            min_x = std::min(min_x, pt.x);
-            max_x = std::max(max_x, pt.x);
-        }
         std::vector<float> waveVerts;
-        int waveSteps = std::max(12, int((max_x - min_x) / 15.0));
+        int waveSteps = std::max(12, int((mx1 - mx0) / 15.0f));
         waveSteps = std::min(waveSteps, 64);
-        float stepW = float(max_x - min_x) / float(std::max(1, waveSteps));
+        float stepW = (mx1 - mx0) / float(std::max(1, waveSteps));
         for (int wi = 0; wi <= waveSteps; ++wi) {
-            float wx = float(min_x) + wi * stepW;
+            float wx = mx0 + wi * stepW;
             float phase1 = (wx / 160.0f + time_sec * 0.2f) * k_two_pi;
             float phase2 = (wx / 320.0f + time_sec * 0.6f) * k_two_pi;
             float wWave = std::sin(phase1) * 6.0f + std::sin(phase2) * 6.0f;
             waveVerts.push_back(wx);
-            waveVerts.push_back(float(max_y) + wWave);
-            waveVerts.push_back(40.0f); // front crest plane
+            waveVerts.push_back(my1 + wWave);
+            waveVerts.push_back(front_z);
         }
         glLineWidth(3.0f);
         m_unlitShader->setUniformValue("uColor", QVector4D(0.60f, 1.0f, 0.95f, 0.85f));
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, waveVerts.data());
         glDrawArrays(GL_LINE_STRIP, 0, int(waveVerts.size() / 3));
 
-        // 3. Vertex Handles (3D Diamonds)
-        for (size_t vi = 0; vi < m_waterEditPoints.size(); ++vi) {
-            const auto& pt = m_waterEditPoints[vi];
-            bool isSel = (int(vi) == m_selectedWaterVertex);
-
+        // 4. Corner Handles (3D Diamonds at front_z)
+        const float corners[4][2] = {
+            { mx0, my1 }, // 0: Top-Left
+            { mx1, my1 }, // 1: Top-Right
+            { mx1, my0 }, // 2: Bottom-Right
+            { mx0, my0 }  // 3: Bottom-Left
+        };
+        for (int vi = 0; vi < 4; ++vi) {
+            bool isSel = (vi == m_selectedWaterVertex);
             float hSize = isSel ? 24.0f : 15.0f;
-            float hx = float(pt.x), hy = float(pt.y);
+            float hx = corners[vi][0], hy = corners[vi][1];
 
             float diamond[18] = {
-                hx, hy + hSize, 0.0f,   hx - hSize, hy, 0.0f,   hx, hy - hSize, 0.0f,
-                hx, hy + hSize, 0.0f,   hx, hy - hSize, 0.0f,   hx + hSize, hy, 0.0f
+                hx, hy + hSize, front_z,   hx - hSize, hy, front_z,   hx, hy - hSize, front_z,
+                hx, hy + hSize, front_z,   hx, hy - hSize, front_z,   hx + hSize, hy, front_z
             };
 
             if (isSel) {
@@ -2040,10 +2088,10 @@ private:
             glDrawArrays(GL_TRIANGLES, 0, 6);
 
             float diamondBorder[24] = {
-                hx, hy + hSize, 0.0f,   hx - hSize, hy, 0.0f,
-                hx - hSize, hy, 0.0f,   hx, hy - hSize, 0.0f,
-                hx, hy - hSize, 0.0f,   hx + hSize, hy, 0.0f,
-                hx + hSize, hy, 0.0f,   hx, hy + hSize, 0.0f
+                hx, hy + hSize, front_z,   hx - hSize, hy, front_z,
+                hx - hSize, hy, front_z,   hx, hy - hSize, front_z,
+                hx, hy - hSize, front_z,   hx + hSize, hy, front_z,
+                hx + hSize, hy, front_z,   hx, hy + hSize, front_z
             };
             glLineWidth(2.2f);
             m_unlitShader->setUniformValue("uColor", isSel ? QVector4D(1.0f, 1.0f, 1.0f, 1.0f) : QVector4D(0.0f, 0.25f, 0.50f, 1.0f));
@@ -2051,19 +2099,41 @@ private:
             glDrawArrays(GL_LINES, 0, 8);
         }
 
-        // 4. Edge Midpoint Indicators (+ button affordance)
-        for (size_t ei = 0; ei < m_waterEditPoints.size(); ++ei) {
-            size_t nextEi = (ei + 1) % m_waterEditPoints.size();
-            float mx = float(m_waterEditPoints[ei].x + m_waterEditPoints[nextEi].x) * 0.5f;
-            float my = float(m_waterEditPoints[ei].y + m_waterEditPoints[nextEi].y) * 0.5f;
-            float mSize = 7.0f;
-            float midBox[18] = {
-                mx - mSize, my - mSize, 0.0f,  mx + mSize, my - mSize, 0.0f,  mx + mSize, my + mSize, 0.0f,
-                mx - mSize, my - mSize, 0.0f,  mx + mSize, my + mSize, 0.0f,  mx - mSize, my + mSize, 0.0f
+        // 5. Edge Resize Handles (Surface, Bed, Left Wall, Right Wall)
+        const struct EdgeHandle {
+            float x, y;
+            float hw, hh;
+        } edgeHandles[4] = {
+            { (mx0 + mx1) * 0.5f, my1, 18.0f, 5.0f }, // 0: Top Surface Level
+            { mx1, (my0 + my1) * 0.5f, 5.0f, 18.0f }, // 1: Right Boundary Wall
+            { (mx0 + mx1) * 0.5f, my0, 18.0f, 5.0f }, // 2: Bottom Bed Level
+            { mx0, (my0 + my1) * 0.5f, 5.0f, 18.0f }  // 3: Left Boundary Wall
+        };
+
+        for (int ei = 0; ei < 4; ++ei) {
+            float ex = edgeHandles[ei].x;
+            float ey = edgeHandles[ei].y;
+            float hw = edgeHandles[ei].hw;
+            float hh = edgeHandles[ei].hh;
+
+            float pill[18] = {
+                ex - hw, ey - hh, front_z,  ex + hw, ey - hh, front_z,  ex + hw, ey + hh, front_z,
+                ex - hw, ey - hh, front_z,  ex + hw, ey + hh, front_z,  ex - hw, ey + hh, front_z
             };
-            m_unlitShader->setUniformValue("uColor", QVector4D(0.85f, 0.95f, 1.0f, 0.70f));
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, midBox);
+            m_unlitShader->setUniformValue("uColor", QVector4D(0.0f, 0.90f, 1.0f, 0.85f));
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, pill);
             glDrawArrays(GL_TRIANGLES, 0, 6);
+
+            float pillBorder[24] = {
+                ex - hw, ey - hh, front_z,  ex + hw, ey - hh, front_z,
+                ex + hw, ey - hh, front_z,  ex + hw, ey + hh, front_z,
+                ex + hw, ey + hh, front_z,  ex - hw, ey + hh, front_z,
+                ex - hw, ey + hh, front_z,  ex - hw, ey - hh, front_z
+            };
+            glLineWidth(1.8f);
+            m_unlitShader->setUniformValue("uColor", QVector4D(0.0f, 0.20f, 0.40f, 1.0f));
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, pillBorder);
+            glDrawArrays(GL_LINES, 0, 8);
         }
 
         glDisableVertexAttribArray(0);
@@ -2352,9 +2422,16 @@ void RubyQuickViewport::nudgeSelectedCoord(int axis, float delta) {
         m_lastNudgeMs = now;
 
         auto& obj = m_scene.objects[m_selectedObject];
-        if (axis == 0) obj.pos_x += delta;
-        else if (axis == 1) obj.pos_y += delta;
-        else if (axis == 2) obj.pos_z += delta;
+        if (axis == 0) {
+            obj.pos_x += delta;
+            if (isSelectedWater()) propagateWaterCompanionDelta(m_selectedObject, delta, 0.0f, 0.0f);
+        } else if (axis == 1) {
+            obj.pos_y += delta;
+            if (isSelectedWater()) propagateWaterCompanionDelta(m_selectedObject, 0.0f, delta, 0.0f);
+        } else if (axis == 2) {
+            obj.pos_z += delta;
+            if (isSelectedWater()) propagateWaterCompanionDelta(m_selectedObject, 0.0f, 0.0f, delta);
+        }
         touch_scene(/*geometry_changed=*/false);
         markDirty(true);
         emit objectTransformChanged();
@@ -2954,6 +3031,17 @@ void RubyQuickViewport::redo() {
 }
 
 void RubyQuickViewport::selectObject(int idx) {
+    if (idx >= 0 && idx < int(m_scene.objects.size())) {
+        const auto& target = m_scene.objects[idx];
+        if (target.is_secondary_water_sheet && !target.water_master_name.empty()) {
+            for (size_t mi = 0; mi < m_scene.objects.size(); ++mi) {
+                if (m_scene.objects[mi].name == target.water_master_name) {
+                    idx = static_cast<int>(mi);
+                    break;
+                }
+            }
+        }
+    }
     if (idx >= -1 && idx < int(m_scene.objects.size())) {
         m_selectedObject = idx;
         m_lastNudgeMs = 0;
@@ -3091,11 +3179,15 @@ int RubyQuickViewport::pickObjectAtInternal(float x, float y, bool allow_cycle) 
         // 2. Water sheets: test fluid bounding box
         bool has_water = false;
         float water_rect[4] = {0, 0, 0, 0};
+        float w_front_z = 40.0f;
+        float w_back_z = -20.0f;
         for (const auto& w : m_scene.waters) {
             if (w.object_index == static_cast<int>(i)) {
                 has_water = true;
                 water_rect[0] = w.rect[0]; water_rect[1] = w.rect[1];
                 water_rect[2] = w.rect[2]; water_rect[3] = w.rect[3];
+                w_front_z = (w.front_z == 0.0f && w.back_z == 0.0f) ? 40.0f : w.front_z;
+                w_back_z  = (w.front_z == 0.0f && w.back_z == 0.0f) ? -20.0f : w.back_z;
                 break;
             }
         }
@@ -3103,8 +3195,8 @@ int RubyQuickViewport::pickObjectAtInternal(float x, float y, bool allow_cycle) 
         if (has_water) {
             float mat[16];
             calc_object_world_matrix(obj, mat);
-            const float lmin[3] = { water_rect[0], water_rect[1], -20.0f };
-            const float lmax[3] = { water_rect[0] + water_rect[2], water_rect[1] + water_rect[3], 40.0f };
+            const float lmin[3] = { water_rect[0], water_rect[1], w_back_z };
+            const float lmax[3] = { water_rect[0] + water_rect[2], water_rect[1] + water_rect[3], w_front_z };
             float bmin[3], bmax[3];
             if (world_box_of(mat, lmin, lmax, bmin, bmax)) {
                 BoundingBox b;
@@ -3346,6 +3438,15 @@ QVariantList RubyQuickViewport::objectsSnapshot() const {
 // the camera inside it, and on a small prop it stayed a speck.
 void RubyQuickViewport::frameObject(int idx) {
     if (idx < 0 || idx >= int(m_scene.objects.size())) return;
+    const auto& target = m_scene.objects[idx];
+    if (target.is_secondary_water_sheet && !target.water_master_name.empty()) {
+        for (size_t mi = 0; mi < m_scene.objects.size(); ++mi) {
+            if (m_scene.objects[mi].name == target.water_master_name) {
+                idx = static_cast<int>(mi);
+                break;
+            }
+        }
+    }
     const auto& obj = m_scene.objects[idx];
     m_cameraTarget = QVector3D(obj.pos_x, obj.pos_y, obj.pos_z);
 
@@ -3361,12 +3462,28 @@ void RubyQuickViewport::frameObject(int idx) {
             have_box = true;
         }
     } else {
-        const std::string modelName = !obj.mesh_name.empty() ? obj.mesh_name : obj.template_name;
-        auto itb = m_podLocalBounds.find(modelName);
-        if (itb != m_podLocalBounds.end()) {
-            std::memcpy(local_min, itb->second.min, sizeof(local_min));
-            std::memcpy(local_max, itb->second.max, sizeof(local_max));
-            have_box = true;
+        bool isWater = false;
+        for (const auto& w : m_scene.waters) {
+            if (w.object_index == idx) {
+                isWater = true;
+                local_min[0] = w.rect[0];
+                local_min[1] = w.rect[1];
+                local_min[2] = (w.front_z == 0.0f && w.back_z == 0.0f) ? -20.0f : w.back_z;
+                local_max[0] = w.rect[0] + w.rect[2];
+                local_max[1] = w.rect[1] + w.rect[3];
+                local_max[2] = (w.front_z == 0.0f && w.back_z == 0.0f) ? 40.0f : w.front_z;
+                have_box = true;
+                break;
+            }
+        }
+        if (!isWater) {
+            const std::string modelName = !obj.mesh_name.empty() ? obj.mesh_name : obj.template_name;
+            auto itb = m_podLocalBounds.find(modelName);
+            if (itb != m_podLocalBounds.end()) {
+                std::memcpy(local_min, itb->second.min, sizeof(local_min));
+                std::memcpy(local_max, itb->second.max, sizeof(local_max));
+                have_box = true;
+            }
         }
     }
 
@@ -3828,7 +3945,10 @@ static proto::Writer make_water_v2(float x, float y) {
 
 static av::SceneComponent make_water_component(int id, int shape_id, int tex_id,
                                               const float front_rgba[4],
-                                              const float surface_rgba[4]) {
+                                              const float surface_rgba[4],
+                                              float front_z = 40.0f,
+                                              float back_z = -20.0f,
+                                              const rubywater::WaterMeta* meta = nullptr) {
     av::SceneComponent comp;
     comp.type_name = "WaterMesh";
     comp.type_id = id;
@@ -3839,6 +3959,12 @@ static av::SceneComponent make_water_component(int id, int shape_id, int tex_id,
     wmc.write_varint_field(2, tex_id);
     wmc.write_nested_field(3, make_water_float_color(front_rgba[0], front_rgba[1], front_rgba[2], front_rgba[3]));
     wmc.write_nested_field(4, make_water_float_color(surface_rgba[0], surface_rgba[1], surface_rgba[2], surface_rgba[3]));
+    wmc.write_float_field(5, front_z);
+    wmc.write_float_field(6, back_z);
+    if (meta) {
+        std::string meta_bytes = rubywater::encode_water_meta(*meta);
+        wmc.write_string_field(rubywater::kTagWaterMeta, meta_bytes);
+    }
 
     proto::Writer wrapper;
     wrapper.write_string_field(1, "WaterMesh");
@@ -3889,7 +4015,7 @@ static av::SceneComponent make_shape_polygon_rect_component(int id, float x, flo
 
     proto::Writer shape;
     shape.write_nested_field(1, make_water_rect(x, y, w, h));
-    if (pts.size() > 4) {
+    if (pts.size() >= 3) {
         shape.write_nested_field(3, make_water_polygon(pts));
     }
 
@@ -3902,7 +4028,8 @@ static av::SceneComponent make_shape_polygon_rect_component(int id, float x, flo
     return comp;
 }
 
-static av::SceneComponent make_collision_shape_hazard_component(int id, float x, float y, float w, float h) {
+static av::SceneComponent make_collision_shape_hazard_component(int id, float x, float y, float w, float h,
+                                                              float front_z = 40.0f, float back_z = -20.0f) {
     av::SceneComponent comp;
     comp.type_name = "CollisionShape";
     comp.type_id = id;
@@ -3912,12 +4039,11 @@ static av::SceneComponent make_collision_shape_hazard_component(int id, float x,
     shape.write_nested_field(1, make_water_rect(x, y, w, h));
 
     proto::Writer col;
-    col.write_varint_field(4, 1);     // InflictsDamage: 1
-    col.write_float_field(6, -15.0f); // MinDepth: -15
-    col.write_float_field(7, 15.0f);  // MaxDepth: 15
-    col.write_varint_field(8, 6);     // SpecialType: 6 (environmental hazard / lava)
-    col.write_varint_field(11, 1);    // Enabled: 1
-    col.write_varint_field(14, 1);    // UnsafeGround: 1
+    col.write_varint_field(5, 1);       // InflictsDamage: 1
+    col.write_float_field(6, back_z);   // MinDepth: back_z
+    col.write_float_field(7, front_z);  // MaxDepth: front_z
+    col.write_varint_field(11, 1);      // Enabled: 1
+    col.write_varint_field(14, 1);      // UnsafeGround: 1
 
     proto::Writer wrapper;
     wrapper.write_string_field(1, "CollisionShape");
@@ -3930,7 +4056,8 @@ static av::SceneComponent make_collision_shape_hazard_component(int id, float x,
 }
 
 static av::SceneComponent make_collision_shape_hazard_polygon_component(int id, float x, float y, float w, float h,
-                                                                      const std::vector<boulder::PolygonPoint>& pts) {
+                                                                      const std::vector<boulder::PolygonPoint>& pts,
+                                                                      float front_z = 40.0f, float back_z = -20.0f) {
     av::SceneComponent comp;
     comp.type_name = "CollisionShape";
     comp.type_id = id;
@@ -3938,17 +4065,16 @@ static av::SceneComponent make_collision_shape_hazard_polygon_component(int id, 
 
     proto::Writer shape;
     shape.write_nested_field(1, make_water_rect(x, y, w, h));
-    if (pts.size() > 4) {
+    if (pts.size() >= 3) {
         shape.write_nested_field(3, make_water_polygon(pts));
     }
 
     proto::Writer col;
-    col.write_varint_field(4, 1);     // InflictsDamage: 1
-    col.write_float_field(6, -15.0f); // MinDepth: -15
-    col.write_float_field(7, 15.0f);  // MaxDepth: 15
-    col.write_varint_field(8, 6);     // SpecialType: 6 (environmental hazard / lava)
-    col.write_varint_field(11, 1);    // Enabled: 1
-    col.write_varint_field(14, 1);    // UnsafeGround: 1
+    col.write_varint_field(5, 1);       // InflictsDamage: 1
+    col.write_float_field(6, back_z);   // MinDepth: back_z
+    col.write_float_field(7, front_z);  // MaxDepth: front_z
+    col.write_varint_field(11, 1);      // Enabled: 1
+    col.write_varint_field(14, 1);      // UnsafeGround: 1
 
     proto::Writer wrapper;
     wrapper.write_string_field(1, "CollisionShape");
@@ -3974,7 +4100,7 @@ static av::SceneComponent make_damage_component(int id, int minDamage, int maxDa
     dmg.write_float_field(6, damageType == 0 ? 1.0f : 0.0f); // PhysicalDamageFactor
     dmg.write_float_field(7, damageType == 1 ? 1.0f : 0.0f); // MagicDamageFactor
     dmg.write_varint_field(8, ignoreImmunity ? 1 : 0);       // IgnoreTargetImmunity
-    dmg.write_varint_field(9, 1);                            // CanBeBlocked: 1
+    dmg.write_varint_field(9, 0);                            // CanBeBlocked: 0 (environmental hazard damage cannot be blocked)
 
     proto::Writer wrapper;
     wrapper.write_string_field(1, "Damage");
@@ -4062,6 +4188,12 @@ QVariantMap RubyQuickViewport::getSelectedWaterProperties() const {
     float tileSize = 64.0f;
     float offX = 0.0f, offY = 0.0f;
 
+    float front_z = 40.0f;
+    float back_z = -20.0f;
+    int sheets_front = 0;
+    int sheets_back = 0;
+    int total_sheets = 1;
+
     for (const auto& w : m_scene.waters) {
         if (w.object_index == objIdx) {
             rx = w.rect[0];
@@ -4080,7 +4212,26 @@ QVariantMap RubyQuickViewport::getSelectedWaterProperties() const {
             tileSize = w.tile_size > 0.0f ? w.tile_size : 64.0f;
             offX = w.tex_offset[0];
             offY = w.tex_offset[1];
+            sheets_front = w.sheets_front;
+            sheets_back = w.sheets_back;
+            total_sheets = w.total_sheets > 0 ? w.total_sheets : (1 + sheets_front + sheets_back);
+            front_z = (w.front_z == 0.0f && w.back_z == 0.0f) ? (float(sheets_front) * 60.0f + 40.0f) : w.front_z;
+            back_z  = (w.front_z == 0.0f && w.back_z == 0.0f) ? (-float(sheets_back) * 60.0f - 20.0f) : w.back_z;
             break;
+        }
+    }
+
+    if (sheets_front > 0) {
+        const std::string frontSheetName = rubywater::make_secondary_name(obj.name, sheets_front);
+        for (const auto& w : m_scene.waters) {
+            if (w.object_index >= 0 && w.object_index < int(m_scene.objects.size()) &&
+                m_scene.objects[w.object_index].name == frontSheetName) {
+                frontR = w.front_color[0];
+                frontG = w.front_color[1];
+                frontB = w.front_color[2];
+                frontA = w.front_color[3];
+                break;
+            }
         }
     }
 
@@ -4088,6 +4239,24 @@ QVariantMap RubyQuickViewport::getSelectedWaterProperties() const {
     res["y"] = ry;
     res["width"] = rw;
     res["height"] = rh;
+    res["posX"] = obj.pos_x;
+    res["posY"] = obj.pos_y;
+    res["posZ"] = obj.pos_z;
+    res["z"] = obj.pos_z;
+    res["depth"] = obj.pos_z;
+
+    // Fluid Mesh 3D Z length/depth & recursive sheeting
+    res["frontZ"] = front_z;
+    res["backZ"] = back_z;
+    res["worldFrontZ"] = obj.pos_z + front_z;
+    res["worldBackZ"] = obj.pos_z + back_z;
+    res["sheetsFront"] = sheets_front;
+    res["sheetsBack"] = sheets_back;
+    res["totalSheets"] = total_sheets;
+    res["totalDepth"] = float(total_sheets) * 60.0f;
+    res["meshZDepth"] = float(total_sheets) * 60.0f;
+    res["zDepth"] = float(total_sheets) * 60.0f;
+    res["meshDepth"] = float(total_sheets) * 60.0f;
 
     // Both naming conventions supported so QML is guaranteed to receive correct values
     res["frontR"] = frontR; res["frontG"] = frontG; res["frontB"] = frontB; res["frontA"] = frontA;
@@ -4143,7 +4312,7 @@ QVariantMap RubyQuickViewport::getSelectedWaterProperties() const {
                         proto::Reader csc(wf.bytes_val);
                         proto::Field cf;
                         while (csc.read_field(cf)) {
-                            if (cf.field_number == 4 && cf.wire_type == proto::WIRE_VARINT) {
+                            if ((cf.field_number == 4 || cf.field_number == 5) && cf.wire_type == proto::WIRE_VARINT) {
                                 if (cf.varint_val != 0) isDeadly = true;
                             }
                         }
@@ -4162,6 +4331,168 @@ QVariantMap RubyQuickViewport::getSelectedWaterProperties() const {
     return res;
 }
 
+void RubyQuickViewport::propagateWaterCompanionDelta(int masterIdx, float dx, float dy, float dz) {
+    if (masterIdx < 0 || masterIdx >= int(m_scene.objects.size())) return;
+    const std::string& masterName = m_scene.objects[masterIdx].name;
+    for (size_t i = 0; i < m_scene.objects.size(); ++i) {
+        if (int(i) == masterIdx) continue;
+        auto& o = m_scene.objects[i];
+        std::string parsedMaster;
+        bool isSec = (o.is_secondary_water_sheet && o.water_master_name == masterName);
+        if (!isSec && rubywater::is_secondary_name(o.name, &parsedMaster)) {
+            if (parsedMaster == masterName) isSec = true;
+        }
+        if (isSec) {
+            o.pos_x += dx;
+            o.pos_y += dy;
+            o.pos_z += dz;
+        }
+    }
+}
+
+void RubyQuickViewport::synchronizeWaterSheets(int masterIdx, int sheetsFront, int sheetsBack,
+                                              const float front[4], const float surface[4],
+                                              const std::string& tex, float tile, float off_x, float off_y,
+                                              const std::vector<boulder::PolygonPoint>& pts,
+                                              float rx, float ry, float rw, float rh,
+                                              bool isDeadly, int minDmg, int maxDmg, int dmgType, bool ignoreImmunity) {
+    if (masterIdx < 0 || masterIdx >= int(m_scene.objects.size())) return;
+    if (m_scene.objects[masterIdx].name.empty()) {
+        m_scene.objects[masterIdx].name = av::scene_fresh_identifier(m_scene);
+    }
+    const std::string masterName = m_scene.objects[masterIdx].name;
+
+    sheetsFront = std::max(0, sheetsFront);
+    sheetsBack = std::max(0, sheetsBack);
+    const int totalSheets = 1 + sheetsFront + sheetsBack;
+    const float totalDepth = float(totalSheets) * 60.0f;
+    const float frontZ = float(sheetsFront) * 60.0f + 40.0f;
+    const float backZ = -float(sheetsBack) * 60.0f - 20.0f;
+
+    struct ExistingComp {
+        size_t objIdx;
+        int k;
+    };
+    std::vector<ExistingComp> existingComps;
+    for (size_t i = 0; i < m_scene.objects.size(); ++i) {
+        if (int(i) == masterIdx) continue;
+        const auto& o = m_scene.objects[i];
+        std::string parsedMaster;
+        int parsedK = 0;
+        bool isSec = (o.is_secondary_water_sheet && o.water_master_name == masterName);
+        if (!isSec && rubywater::is_secondary_name(o.name, &parsedMaster, &parsedK)) {
+            if (parsedMaster == masterName) isSec = true;
+        } else if (isSec) {
+            rubywater::is_secondary_name(o.name, &parsedMaster, &parsedK);
+        }
+        if (isSec) {
+            existingComps.push_back({ i, parsedK });
+        }
+    }
+
+    std::vector<size_t> toDelete;
+    std::map<int, size_t> keptComps;
+    for (const auto& ec : existingComps) {
+        bool needed = false;
+        if (ec.k > 0 && ec.k <= sheetsFront) needed = true;
+        if (ec.k < 0 && -ec.k <= sheetsBack) needed = true;
+
+        if (needed && keptComps.find(ec.k) == keptComps.end()) {
+            keptComps[ec.k] = ec.objIdx;
+        } else {
+            toDelete.push_back(ec.objIdx);
+        }
+    }
+
+    if (!toDelete.empty()) {
+        std::sort(toDelete.rbegin(), toDelete.rend());
+        for (size_t rmIdx : toDelete) {
+            av::scene_delete_object(m_scene, rmIdx);
+        }
+        for (size_t i = 0; i < m_scene.objects.size(); ++i) {
+            if (m_scene.objects[i].name == masterName) {
+                masterIdx = static_cast<int>(i);
+                m_selectedObject = masterIdx;
+                break;
+            }
+        }
+        keptComps.clear();
+        for (size_t i = 0; i < m_scene.objects.size(); ++i) {
+            if (int(i) == masterIdx) continue;
+            const auto& o = m_scene.objects[i];
+            std::string parsedMaster;
+            int parsedK = 0;
+            if (rubywater::is_secondary_name(o.name, &parsedMaster, &parsedK) && parsedMaster == masterName) {
+                if ((parsedK > 0 && parsedK <= sheetsFront) || (parsedK < 0 && -parsedK <= sheetsBack)) {
+                    if (keptComps.find(parsedK) == keptComps.end()) {
+                        keptComps[parsedK] = i;
+                    }
+                }
+            }
+        }
+    }
+
+    const float transparentFront[4] = { front[0], front[1], front[2], 0.0f };
+
+    auto configureSheet = [&](av::SceneObject& compObj, int k) {
+        compObj.name = rubywater::make_secondary_name(masterName, k);
+        compObj.template_name = "";
+        compObj.is_secondary_water_sheet = true;
+        compObj.water_master_name = masterName;
+        compObj.pos_x = m_scene.objects[masterIdx].pos_x;
+        compObj.pos_y = m_scene.objects[masterIdx].pos_y;
+        compObj.pos_z = rubywater::calculate_sheet_pos_z(m_scene.objects[masterIdx].pos_z, k);
+        compObj.rot_x = m_scene.objects[masterIdx].rot_x;
+        compObj.rot_y = m_scene.objects[masterIdx].rot_y;
+        compObj.rot_z = m_scene.objects[masterIdx].rot_z;
+        compObj.scale_x = m_scene.objects[masterIdx].scale_x;
+        compObj.scale_y = m_scene.objects[masterIdx].scale_y;
+        compObj.scale_z = m_scene.objects[masterIdx].scale_z;
+        compObj.hidden = m_scene.objects[masterIdx].hidden;
+        compObj.local_aabb = m_scene.objects[masterIdx].local_aabb;
+
+        rubywater::WaterMeta compMeta;
+        compMeta.is_secondary = 1;
+        compMeta.sheet_index = static_cast<int16_t>(k);
+        compMeta.sheets_front = static_cast<uint16_t>(sheetsFront);
+        compMeta.sheets_back = static_cast<uint16_t>(sheetsBack);
+        compMeta.total_sheets = static_cast<uint16_t>(totalSheets);
+        compMeta.total_depth = totalDepth;
+        compMeta.front_z = frontZ;
+        compMeta.back_z = backZ;
+        compMeta.master_name = masterName;
+
+        const float* sheetFrontColor = (k == sheetsFront) ? front : transparentFront;
+
+        std::vector<av::SceneComponent> comps;
+        comps.push_back(make_water_component(101, 103, 106, sheetFrontColor, surface, 40.0f, -20.0f, &compMeta));
+        if (isDeadly) {
+            comps.push_back(make_collision_shape_hazard_polygon_component(103, rx, ry, rw, rh, pts, 40.0f, -20.0f));
+            comps.push_back(make_damage_component(109, minDmg, maxDmg, dmgType, ignoreImmunity));
+        } else {
+            comps.push_back(make_shape_polygon_rect_component(103, rx, ry, rw, rh, pts));
+        }
+        comps.push_back(make_texture_mapping_component(106, tex, tile, off_x, off_y));
+        compObj.components = std::move(comps);
+        compObj.resolved_components = compObj.components;
+    };
+
+    std::vector<int> neededKs;
+    for (int k = 1; k <= sheetsFront; ++k) neededKs.push_back(k);
+    for (int k = -1; k >= -sheetsBack; --k) neededKs.push_back(k);
+
+    for (int k : neededKs) {
+        auto it = keptComps.find(k);
+        if (it != keptComps.end() && it->second < m_scene.objects.size()) {
+            configureSheet(m_scene.objects[it->second], k);
+        } else {
+            av::SceneObject compObj;
+            configureSheet(compObj, k);
+            m_scene.objects.push_back(std::move(compObj));
+        }
+    }
+}
+
 bool RubyQuickViewport::setSelectedWaterProperties(const QVariantMap& props) {
     if (!m_hasScene || m_selectedObject < 0 || m_selectedObject >= int(m_scene.objects.size()))
         return false;
@@ -4176,6 +4507,12 @@ bool RubyQuickViewport::setSelectedWaterProperties(const QVariantMap& props) {
     float rh = props.value("height", 80.0f).toFloat();
     if (rw < 10.0f) rw = 10.0f;
     if (rh < 10.0f) rh = 10.0f;
+
+    if (props.contains("posZ") || props.contains("z") || props.contains("depth")) {
+        obj.pos_z = props.value("posZ", props.value("z", props.value("depth", obj.pos_z))).toFloat();
+    }
+    if (props.contains("posX")) obj.pos_x = props.value("posX").toFloat();
+    if (props.contains("posY")) obj.pos_y = props.value("posY").toFloat();
 
     float front[4] = {
         props.value("frontR", props.value("color_r", 0.20f)).toFloat(),
@@ -4203,6 +4540,35 @@ bool RubyQuickViewport::setSelectedWaterProperties(const QVariantMap& props) {
     int dmgType = props.value("damageType", 0).toInt();
     bool ignoreImmunity = props.value("ignoreImmunity", true).toBool();
 
+    int sheets_front = 0;
+    int sheets_back = 0;
+    for (const auto& w : m_scene.waters) {
+        if (w.object_index == m_selectedObject) {
+            sheets_front = w.sheets_front;
+            sheets_back = w.sheets_back;
+            break;
+        }
+    }
+    if (props.contains("sheetsFront")) sheets_front = std::max(0, props.value("sheetsFront").toInt());
+    if (props.contains("sheetsBack"))  sheets_back  = std::max(0, props.value("sheetsBack").toInt());
+
+    // Preserve existing component IDs if present
+    int waterCompId = 101;
+    int boundsCompId = 103;
+    int texCompId = 106;
+    int dmgCompId = 109;
+    for (const auto& c : obj.components) {
+        if (c.type_name == "WaterMesh" || c.payload_field == 114) {
+            waterCompId = c.type_id;
+        } else if (c.type_name.find("Shape") != std::string::npos || c.payload_field == 120 || c.payload_field == 121) {
+            boundsCompId = c.type_id;
+        } else if (c.type_name.find("Texture") != std::string::npos || c.payload_field == 113) {
+            texCompId = c.type_id;
+        } else if (c.type_name == "Damage" || c.payload_field == 122) {
+            dmgCompId = c.type_id;
+        }
+    }
+
     // Preserve existing polygon points if present
     std::vector<boulder::PolygonPoint> existingPts;
     for (const auto& w : m_scene.waters) {
@@ -4213,6 +4579,36 @@ bool RubyQuickViewport::setSelectedWaterProperties(const QVariantMap& props) {
             break;
         }
     }
+    if (existingPts.empty() && m_waterEditActive && !m_waterEditPoints.empty() && m_waterEditObject == m_selectedObject) {
+        existingPts = m_waterEditPoints;
+    }
+    if (existingPts.empty()) {
+        existingPts = {
+            {double(rx), double(ry + rh)},       // Top-Left
+            {double(rx + rw), double(ry + rh)},  // Top-Right
+            {double(rx + rw), double(ry)},       // Bottom-Right
+            {double(rx), double(ry)}            // Bottom-Left
+        };
+    }
+
+    const int total_sheets = 1 + sheets_front + sheets_back;
+    const float total_depth = float(total_sheets) * 60.0f;
+    const float front_z = float(sheets_front) * 60.0f + 40.0f;
+    const float back_z = -float(sheets_back) * 60.0f - 20.0f;
+
+    rubywater::WaterMeta masterMeta;
+    masterMeta.is_secondary = 0;
+    masterMeta.sheet_index = 0;
+    masterMeta.sheets_front = static_cast<uint16_t>(sheets_front);
+    masterMeta.sheets_back = static_cast<uint16_t>(sheets_back);
+    masterMeta.total_sheets = static_cast<uint16_t>(total_sheets);
+    masterMeta.total_depth = total_depth;
+    masterMeta.front_z = front_z;
+    masterMeta.back_z = back_z;
+    masterMeta.master_name = obj.name;
+
+    const float transparentFront[4] = { front[0], front[1], front[2], 0.0f };
+    const float* masterFrontColor = (sheets_front == 0) ? front : transparentFront;
 
     std::vector<av::SceneComponent> retained;
     retained.reserve(obj.components.size());
@@ -4225,43 +4621,23 @@ bool RubyQuickViewport::setSelectedWaterProperties(const QVariantMap& props) {
         retained.push_back(c);
     }
 
-    retained.push_back(make_water_component(101, 103, 106, front, surface));
+    retained.push_back(make_water_component(waterCompId, boundsCompId, texCompId, masterFrontColor, surface, 40.0f, -20.0f, &masterMeta));
     if (isDeadly) {
-        if (!existingPts.empty()) {
-            retained.push_back(make_collision_shape_hazard_polygon_component(103, rx, ry, rw, rh, existingPts));
-        } else {
-            retained.push_back(make_collision_shape_hazard_component(103, rx, ry, rw, rh));
-        }
-        retained.push_back(make_damage_component(109, minDmg, maxDmg, dmgType, ignoreImmunity));
-        retained.push_back(make_monster_entity_component(110));
+        retained.push_back(make_collision_shape_hazard_polygon_component(boundsCompId, rx, ry, rw, rh, existingPts, 40.0f, -20.0f));
+        retained.push_back(make_damage_component(dmgCompId, minDmg, maxDmg, dmgType, ignoreImmunity));
     } else {
-        if (!existingPts.empty()) {
-            retained.push_back(make_shape_polygon_rect_component(103, rx, ry, rw, rh, existingPts));
-        } else {
-            retained.push_back(make_shape_rect_component(103, rx, ry, rw, rh));
-        }
+        retained.push_back(make_shape_polygon_rect_component(boundsCompId, rx, ry, rw, rh, existingPts));
     }
-    retained.push_back(make_texture_mapping_component(106, tex, tile, off_x, off_y));
+    retained.push_back(make_texture_mapping_component(texCompId, tex, tile, off_x, off_y));
     obj.components = std::move(retained);
+    obj.resolved_components = obj.components;
 
     obj.local_aabb = av::scene_build_local_aabb(rx, ry, rx + rw, ry + rh);
 
-    // Update scene waters directly in-memory so viewports & queries reflect immediately
-    for (auto& w : m_scene.waters) {
-        if (w.object_index == m_selectedObject) {
-            w.rect[0] = rx;
-            w.rect[1] = ry;
-            w.rect[2] = rw;
-            w.rect[3] = rh;
-            memcpy(w.front_color, front, sizeof(front));
-            memcpy(w.surface_color, surface, sizeof(surface));
-            w.texture = tex;
-            w.tile_size = tile;
-            w.tex_offset[0] = off_x;
-            w.tex_offset[1] = off_y;
-            break;
-        }
-    }
+    synchronizeWaterSheets(m_selectedObject, sheets_front, sheets_back,
+                           front, surface, tex, tile, off_x, off_y,
+                           existingPts, rx, ry, rw, rh,
+                           isDeadly, minDmg, maxDmg, dmgType, ignoreImmunity);
 
     validateAndRepairScene();
     touch_scene(/*geometry_changed=*/true);
@@ -4368,6 +4744,51 @@ int RubyQuickViewport::createWaterObject(float x, float y, float width, float he
     return new_idx;
 }
 
+bool RubyQuickViewport::setWaterSheets(int sheetsFront, int sheetsBack) {
+    if (!isSelectedWater()) return false;
+    QVariantMap p = getSelectedWaterProperties();
+    if (!p.value("valid", false).toBool()) return false;
+    p["sheetsFront"] = std::max(0, sheetsFront);
+    p["sheetsBack"] = std::max(0, sheetsBack);
+    return setSelectedWaterProperties(p);
+}
+
+bool RubyQuickViewport::addWaterSheetFront() {
+    if (!isSelectedWater()) return false;
+    QVariantMap p = getSelectedWaterProperties();
+    if (!p.value("valid", false).toBool()) return false;
+    int f = p.value("sheetsFront", 0).toInt() + 1;
+    int b = p.value("sheetsBack", 0).toInt();
+    return setWaterSheets(f, b);
+}
+
+bool RubyQuickViewport::removeWaterSheetFront() {
+    if (!isSelectedWater()) return false;
+    QVariantMap p = getSelectedWaterProperties();
+    if (!p.value("valid", false).toBool()) return false;
+    int f = std::max(0, p.value("sheetsFront", 0).toInt() - 1);
+    int b = p.value("sheetsBack", 0).toInt();
+    return setWaterSheets(f, b);
+}
+
+bool RubyQuickViewport::addWaterSheetBack() {
+    if (!isSelectedWater()) return false;
+    QVariantMap p = getSelectedWaterProperties();
+    if (!p.value("valid", false).toBool()) return false;
+    int f = p.value("sheetsFront", 0).toInt();
+    int b = p.value("sheetsBack", 0).toInt() + 1;
+    return setWaterSheets(f, b);
+}
+
+bool RubyQuickViewport::removeWaterSheetBack() {
+    if (!isSelectedWater()) return false;
+    QVariantMap p = getSelectedWaterProperties();
+    if (!p.value("valid", false).toBool()) return false;
+    int f = p.value("sheetsFront", 0).toInt();
+    int b = std::max(0, p.value("sheetsBack", 0).toInt() - 1);
+    return setWaterSheets(f, b);
+}
+
 bool RubyQuickViewport::canWaterMeshEdit() const {
     if (!m_hasScene || m_selectedObject < 0 || m_selectedObject >= int(m_scene.objects.size()))
         return false;
@@ -4378,9 +4799,30 @@ bool RubyQuickViewport::beginWaterMeshEdit() {
     if (!canWaterMeshEdit()) return false;
     m_waterEditObject = m_selectedObject;
 
+    // Resolve to master object if a secondary sheet was selected
+    if (m_waterEditObject >= 0 && m_waterEditObject < int(m_scene.objects.size())) {
+        const auto& target = m_scene.objects[m_waterEditObject];
+        std::string masterName;
+        if (target.is_secondary_water_sheet && !target.water_master_name.empty()) {
+            masterName = target.water_master_name;
+        } else if (rubywater::is_secondary_name(target.name, &masterName)) {
+            // detected from secondary naming convention
+        }
+        if (!masterName.empty()) {
+            for (size_t mi = 0; mi < m_scene.objects.size(); ++mi) {
+                if (m_scene.objects[mi].name == masterName) {
+                    m_waterEditObject = static_cast<int>(mi);
+                    m_selectedObject = m_waterEditObject;
+                    break;
+                }
+            }
+        }
+    }
+
     m_waterSceneSaved = m_scene;
     m_waterSceneSavedValid = true;
     m_waterDragPoint = -1;
+    m_waterDragEdge = -1;
     m_waterDragging = false;
     m_waterPanning = false;
 
@@ -4391,7 +4833,7 @@ bool RubyQuickViewport::beginWaterMeshEdit() {
     m_waterSavedCamTarget = m_cameraTarget;
     m_waterSavedCamValid = true;
 
-    // Load existing water geometry
+    // Load existing water geometry as a pure 4-corner rectangle
     m_waterEditPoints.clear();
     const auto& obj = m_scene.objects[m_waterEditObject];
 
@@ -4400,30 +4842,26 @@ bool RubyQuickViewport::beginWaterMeshEdit() {
     for (const auto& w : m_scene.waters) {
         if (w.object_index == m_waterEditObject) {
             rx = w.rect[0]; ry = w.rect[1]; rw = w.rect[2]; rh = w.rect[3];
-            if (!w.polygon_points.empty() && w.polygon_points.size() >= 6) {
-                for (size_t pi = 0; pi + 1 < w.polygon_points.size(); pi += 2) {
-                    m_waterEditPoints.push_back({double(w.polygon_points[pi]), double(w.polygon_points[pi + 1])});
-                }
-            }
             foundWater = true;
             break;
         }
     }
-    if (m_waterEditPoints.empty()) {
-        if (!foundWater) {
-            QVariantMap props = getSelectedWaterProperties();
-            rx = props.value("x", 0.0f).toFloat();
-            ry = props.value("y", 0.0f).toFloat();
-            rw = props.value("width", 300.0f).toFloat();
-            rh = props.value("height", 80.0f).toFloat();
-        }
-        m_waterEditPoints = {
-            {double(rx), double(ry + rh)},       // Top-Left
-            {double(rx + rw), double(ry + rh)},  // Top-Right
-            {double(rx + rw), double(ry)},       // Bottom-Right
-            {double(rx), double(ry)}            // Bottom-Left
-        };
+    if (!foundWater) {
+        QVariantMap props = getSelectedWaterProperties();
+        rx = props.value("x", 0.0f).toFloat();
+        ry = props.value("y", 0.0f).toFloat();
+        rw = props.value("width", 300.0f).toFloat();
+        rh = props.value("height", 80.0f).toFloat();
     }
+    if (rw < 10.0f) rw = 10.0f;
+    if (rh < 10.0f) rh = 10.0f;
+
+    m_waterEditPoints = {
+        {double(rx), double(ry + rh)},       // 0: Top-Left
+        {double(rx + rw), double(ry + rh)},  // 1: Top-Right
+        {double(rx + rw), double(ry)},       // 2: Bottom-Right
+        {double(rx), double(ry)}            // 3: Bottom-Left
+    };
 
     float obj_mat[16];
     calc_object_world_matrix(obj, obj_mat);
@@ -4463,10 +4901,51 @@ bool RubyQuickViewport::beginWaterMeshEdit() {
     return true;
 }
 
+std::vector<int> RubyQuickViewport::getWaterSheetIndices(int masterObjIdx) const {
+    std::vector<int> indices;
+    if (masterObjIdx < 0 || masterObjIdx >= int(m_scene.objects.size()))
+        return indices;
+
+    const auto& target = m_scene.objects[masterObjIdx];
+    std::string masterName = target.name;
+    if (target.is_secondary_water_sheet && !target.water_master_name.empty()) {
+        masterName = target.water_master_name;
+    } else {
+        std::string parsedMaster;
+        if (rubywater::is_secondary_name(target.name, &parsedMaster)) {
+            masterName = parsedMaster;
+        }
+    }
+
+    int trueMasterIdx = masterObjIdx;
+    for (size_t mi = 0; mi < m_scene.objects.size(); ++mi) {
+        if (m_scene.objects[mi].name == masterName) {
+            trueMasterIdx = static_cast<int>(mi);
+            break;
+        }
+    }
+
+    indices.push_back(trueMasterIdx);
+    for (size_t i = 0; i < m_scene.objects.size(); ++i) {
+        if (int(i) == trueMasterIdx) continue;
+        const auto& o = m_scene.objects[i];
+        std::string parsedMaster;
+        int parsedK = 0;
+        bool isSec = (o.is_secondary_water_sheet && o.water_master_name == masterName);
+        if (!isSec && rubywater::is_secondary_name(o.name, &parsedMaster, &parsedK)) {
+            if (parsedMaster == masterName) isSec = true;
+        }
+        if (isSec) {
+            indices.push_back(static_cast<int>(i));
+        }
+    }
+    return indices;
+}
+
 bool RubyQuickViewport::liveWaterMeshPreview() {
     if (!m_waterEditActive || m_waterEditObject < 0 || m_waterEditObject >= int(m_scene.objects.size()))
         return false;
-    if (m_waterEditPoints.size() < 3) return false;
+    if (m_waterEditPoints.size() < 4) return false;
 
     double minx = 1e30, miny = 1e30, maxx = -1e30, maxy = -1e30;
     for (const auto& pt : m_waterEditPoints) {
@@ -4478,8 +4957,20 @@ bool RubyQuickViewport::liveWaterMeshPreview() {
     float rw = std::max(10.0f, float(maxx - minx));
     float rh = std::max(10.0f, float(maxy - miny));
 
+    // Strictly enforce 4 corners of rectangular bounds
+    m_waterEditPoints = {
+        {double(rx), double(ry + rh)},       // 0: Top-Left
+        {double(rx + rw), double(ry + rh)},  // 1: Top-Right
+        {double(rx + rw), double(ry)},       // 2: Bottom-Right
+        {double(rx), double(ry)}            // 3: Bottom-Left
+    };
+
+    // Update ALL sheets in the water group simultaneously!
+    std::vector<int> sheetIndices = getWaterSheetIndices(m_waterEditObject);
+    std::unordered_set<int> sheetSet(sheetIndices.begin(), sheetIndices.end());
+
     for (auto& w : m_scene.waters) {
-        if (w.object_index == m_waterEditObject) {
+        if (sheetSet.count(w.object_index)) {
             w.rect[0] = rx;
             w.rect[1] = ry;
             w.rect[2] = rw;
@@ -4489,12 +4980,14 @@ bool RubyQuickViewport::liveWaterMeshPreview() {
                 w.polygon_points.push_back(float(pt.x));
                 w.polygon_points.push_back(float(pt.y));
             }
-            break;
         }
     }
 
-    auto& obj = m_scene.objects[m_waterEditObject];
-    obj.local_aabb = av::scene_build_local_aabb(rx, ry, rx + rw, ry + rh);
+    for (int idx : sheetIndices) {
+        if (idx >= 0 && idx < int(m_scene.objects.size())) {
+            m_scene.objects[idx].local_aabb = av::scene_build_local_aabb(rx, ry, rx + rw, ry + rh);
+        }
+    }
 
     touch_scene(/*geometry_changed=*/true);
     emit selectedWaterPropertiesChanged();
@@ -4506,7 +4999,7 @@ bool RubyQuickViewport::liveWaterMeshPreview() {
 bool RubyQuickViewport::applyWaterMeshEdit() {
     if (!m_waterEditActive || m_waterEditObject < 0 || m_waterEditObject >= int(m_scene.objects.size()))
         return false;
-    if (m_waterEditPoints.size() < 3) return false;
+    if (m_waterEditPoints.size() < 4) return false;
 
     pushUndoSnapshot();
 
@@ -4519,6 +5012,13 @@ bool RubyQuickViewport::applyWaterMeshEdit() {
     float ry = float(miny);
     float rw = std::max(10.0f, float(maxx - minx));
     float rh = std::max(10.0f, float(maxy - miny));
+
+    m_waterEditPoints = {
+        {double(rx), double(ry + rh)},
+        {double(rx + rw), double(ry + rh)},
+        {double(rx + rw), double(ry)},
+        {double(rx), double(ry)}
+    };
 
     auto& obj = m_scene.objects[m_waterEditObject];
 
@@ -4535,6 +5035,16 @@ bool RubyQuickViewport::applyWaterMeshEdit() {
             tile = w.tile_size;
             off_x = w.tex_offset[0];
             off_y = w.tex_offset[1];
+            if (w.sheets_front > 0) {
+                const std::string frontSheetName = rubywater::make_secondary_name(obj.name, w.sheets_front);
+                for (const auto& fw : m_scene.waters) {
+                    if (fw.object_index >= 0 && fw.object_index < int(m_scene.objects.size()) &&
+                        m_scene.objects[fw.object_index].name == frontSheetName) {
+                        memcpy(front, fw.front_color, sizeof(front));
+                        break;
+                    }
+                }
+            }
             break;
         }
     }
@@ -4578,7 +5088,7 @@ bool RubyQuickViewport::applyWaterMeshEdit() {
                         proto::Reader csc(wf.bytes_val);
                         proto::Field cf;
                         while (csc.read_field(cf)) {
-                            if (cf.field_number == 4 && cf.wire_type == proto::WIRE_VARINT) {
+                            if ((cf.field_number == 4 || cf.field_number == 5) && cf.wire_type == proto::WIRE_VARINT) {
                                 if (cf.varint_val != 0) isDeadly = true;
                             }
                         }
@@ -4588,30 +5098,82 @@ bool RubyQuickViewport::applyWaterMeshEdit() {
         }
     }
 
+    // Preserve existing component IDs if present
+    int waterCompId = 101;
+    int boundsCompId = 103;
+    int texCompId = 106;
+    int dmgCompId = 109;
+    for (const auto& c : obj.components) {
+        if (c.type_name == "WaterMesh" || c.payload_field == 114) {
+            waterCompId = c.type_id;
+        } else if (c.type_name.find("Shape") != std::string::npos || c.payload_field == 120 || c.payload_field == 121) {
+            boundsCompId = c.type_id;
+        } else if (c.type_name.find("Texture") != std::string::npos || c.payload_field == 113) {
+            texCompId = c.type_id;
+        } else if (c.type_name == "Damage" || c.payload_field == 122) {
+            dmgCompId = c.type_id;
+        }
+    }
+
+    int sheets_front = 0;
+    int sheets_back = 0;
+    for (const auto& w : m_scene.waters) {
+        if (w.object_index == m_waterEditObject) {
+            sheets_front = w.sheets_front;
+            sheets_back = w.sheets_back;
+            break;
+        }
+    }
+
     std::vector<av::SceneComponent> retained;
     retained.reserve(obj.components.size());
     for (const auto& c : obj.components) {
         if (c.type_name == "WaterMesh" || c.payload_field == 114) continue;
-        if (c.type_id == 103 && (c.type_name.find("Shape") != std::string::npos || c.payload_field == 120 || c.payload_field == 121)) continue;
-        if (c.type_id == 106 && (c.type_name.find("Texture") != std::string::npos || c.payload_field == 113)) continue;
+        if (c.type_name.find("Shape") != std::string::npos || c.payload_field == 120 || c.payload_field == 121) continue;
+        if (c.type_name.find("Texture") != std::string::npos || c.payload_field == 113) continue;
         if (c.type_name == "Damage" || c.payload_field == 122) continue;
         if (c.type_name == "MonsterEntity" || c.payload_field == 158 || c.payload_field == 152) continue;
         retained.push_back(c);
     }
 
-    retained.push_back(make_water_component(101, 103, 106, front, surface));
+    const int total_sheets = 1 + sheets_front + sheets_back;
+    const float total_depth = float(total_sheets) * 60.0f;
+    const float front_z = float(sheets_front) * 60.0f + 40.0f;
+    const float back_z = -float(sheets_back) * 60.0f - 20.0f;
+
+    rubywater::WaterMeta masterMeta;
+    masterMeta.is_secondary = 0;
+    masterMeta.sheet_index = 0;
+    masterMeta.sheets_front = static_cast<uint16_t>(sheets_front);
+    masterMeta.sheets_back = static_cast<uint16_t>(sheets_back);
+    masterMeta.total_sheets = static_cast<uint16_t>(total_sheets);
+    masterMeta.total_depth = total_depth;
+    masterMeta.front_z = front_z;
+    masterMeta.back_z = back_z;
+    masterMeta.master_name = obj.name;
+
+    const float transparentFront[4] = { front[0], front[1], front[2], 0.0f };
+    const float* masterFrontColor = (sheets_front == 0) ? front : transparentFront;
+
+    retained.push_back(make_water_component(waterCompId, boundsCompId, texCompId, masterFrontColor, surface, 40.0f, -20.0f, &masterMeta));
     if (isDeadly) {
-        retained.push_back(make_collision_shape_hazard_polygon_component(103, rx, ry, rw, rh, m_waterEditPoints));
-        retained.push_back(make_damage_component(109, minDamage, maxDamage, damageType, ignoreImmunity));
-        retained.push_back(make_monster_entity_component(110));
+        retained.push_back(make_collision_shape_hazard_polygon_component(boundsCompId, rx, ry, rw, rh, m_waterEditPoints, 40.0f, -20.0f));
+        retained.push_back(make_damage_component(dmgCompId, minDamage, maxDamage, damageType, ignoreImmunity));
     } else {
-        retained.push_back(make_shape_polygon_rect_component(103, rx, ry, rw, rh, m_waterEditPoints));
+        retained.push_back(make_shape_polygon_rect_component(boundsCompId, rx, ry, rw, rh, m_waterEditPoints));
     }
-    retained.push_back(make_texture_mapping_component(106, tex, tile, off_x, off_y));
+    retained.push_back(make_texture_mapping_component(texCompId, tex, tile, off_x, off_y));
     obj.components = std::move(retained);
+    obj.resolved_components = obj.components;
 
     obj.local_aabb = av::scene_build_local_aabb(rx, ry, rx + rw, ry + rh);
 
+    synchronizeWaterSheets(m_waterEditObject, sheets_front, sheets_back,
+                           front, surface, tex, tile, off_x, off_y,
+                           m_waterEditPoints, rx, ry, rw, rh,
+                           isDeadly, minDamage, maxDamage, damageType, ignoreImmunity);
+
+    av::scene_refresh(m_scene);
     validateAndRepairScene();
     touch_scene(/*geometry_changed=*/true);
     markDirty(true);
@@ -4651,6 +5213,7 @@ void RubyQuickViewport::discardWaterMeshEdit() {
     m_waterEditPoints.clear();
     m_waterDragging = false;
     m_waterDragPoint = -1;
+    m_waterDragEdge = -1;
     m_waterPanning = false;
 
     if (m_waterSavedCamValid) {
@@ -4678,10 +5241,10 @@ void RubyQuickViewport::resetWaterEditToRect() {
         miny = std::min(miny, pt.y); maxy = std::max(maxy, pt.y);
     }
     m_waterEditPoints = {
-        {minx, maxy}, // TL
-        {maxx, maxy}, // TR
-        {maxx, miny}, // BR
-        {minx, miny}  // BL
+        {minx, maxy}, // 0: TL
+        {maxx, maxy}, // 1: TR
+        {maxx, miny}, // 2: BR
+        {minx, miny}  // 3: BL
     };
     m_selectedWaterVertex = 0;
     liveWaterMeshPreview();
@@ -4710,43 +5273,240 @@ QVariantList RubyQuickViewport::getWaterEditVertices() const {
     return list;
 }
 
+double RubyQuickViewport::waterEditWidth() const {
+    if (!m_waterEditActive || m_waterEditPoints.size() != 4) {
+        if (m_hasScene && m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+            for (const auto& w : m_scene.waters) {
+                if (w.object_index == m_selectedObject) return w.rect[2];
+            }
+        }
+        return 0.0;
+    }
+    double minx = std::min(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double maxx = std::max(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    return std::max(10.0, maxx - minx);
+}
+
+double RubyQuickViewport::waterEditHeight() const {
+    if (!m_waterEditActive || m_waterEditPoints.size() != 4) {
+        if (m_hasScene && m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+            for (const auto& w : m_scene.waters) {
+                if (w.object_index == m_selectedObject) return w.rect[3];
+            }
+        }
+        return 0.0;
+    }
+    double miny = std::min(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+    double maxy = std::max(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+    return std::max(10.0, maxy - miny);
+}
+
+double RubyQuickViewport::waterEditSurfaceY() const {
+    if (!m_waterEditActive || m_waterEditPoints.size() != 4) return 0.0;
+    return std::max(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+}
+
+double RubyQuickViewport::waterEditBedY() const {
+    if (!m_waterEditActive || m_waterEditPoints.size() != 4) return 0.0;
+    return std::min(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+}
+
+void RubyQuickViewport::dragWaterCorner(int corner, double targetX, double targetY) {
+    if (m_waterEditPoints.size() != 4) return;
+    double minX = std::min(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double maxX = std::max(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double minY = std::min(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+    double maxY = std::max(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+
+    switch (corner) {
+    case 0: // Top-Left
+        minX = std::min(targetX, maxX - 10.0);
+        maxY = std::max(targetY, minY + 10.0);
+        break;
+    case 1: // Top-Right
+        maxX = std::max(targetX, minX + 10.0);
+        maxY = std::max(targetY, minY + 10.0);
+        break;
+    case 2: // Bottom-Right
+        maxX = std::max(targetX, minX + 10.0);
+        minY = std::min(targetY, maxY - 10.0);
+        break;
+    case 3: // Bottom-Left
+        minX = std::min(targetX, maxX - 10.0);
+        minY = std::min(targetY, maxY - 10.0);
+        break;
+    default:
+        break;
+    }
+
+    m_waterEditPoints = {
+        {minX, maxY}, // TL
+        {maxX, maxY}, // TR
+        {maxX, minY}, // BR
+        {minX, minY}  // BL
+    };
+}
+
+void RubyQuickViewport::dragWaterEdge(int edge, double targetX, double targetY) {
+    if (m_waterEditPoints.size() != 4) return;
+    double minX = std::min(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double maxX = std::max(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double minY = std::min(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+    double maxY = std::max(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+
+    switch (edge) {
+    case 0: // Top / Surface edge
+        maxY = std::max(targetY, minY + 10.0);
+        break;
+    case 1: // Right edge
+        maxX = std::max(targetX, minX + 10.0);
+        break;
+    case 2: // Bottom / Bed edge
+        minY = std::min(targetY, maxY - 10.0);
+        break;
+    case 3: // Left edge
+        minX = std::min(targetX, maxX - 10.0);
+        break;
+    default:
+        break;
+    }
+
+    m_waterEditPoints = {
+        {minX, maxY}, // TL
+        {maxX, maxY}, // TR
+        {maxX, minY}, // BR
+        {minX, minY}  // BL
+    };
+}
+
+void RubyQuickViewport::adjustWaterWidth(float delta) {
+    if (!m_waterEditActive || m_waterEditPoints.size() != 4) return;
+    double minX = std::min(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double maxX = std::max(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double minY = std::min(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+    double maxY = std::max(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+
+    double halfDelta = double(delta) * 0.5;
+    if ((maxX + halfDelta) - (minX - halfDelta) < 10.0) return;
+    minX -= halfDelta;
+    maxX += halfDelta;
+
+    m_waterEditPoints = {
+        {minX, maxY},
+        {maxX, maxY},
+        {maxX, minY},
+        {minX, minY}
+    };
+    liveWaterMeshPreview();
+    emit waterEditVerticesChanged();
+}
+
+void RubyQuickViewport::adjustWaterHeight(float delta) {
+    if (!m_waterEditActive || m_waterEditPoints.size() != 4) return;
+    double minX = std::min(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double maxX = std::max(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double minY = std::min(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+    double maxY = std::max(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+
+    if ((maxY + double(delta)) - minY < 10.0) return;
+    maxY += double(delta);
+
+    m_waterEditPoints = {
+        {minX, maxY},
+        {maxX, maxY},
+        {maxX, minY},
+        {minX, minY}
+    };
+    liveWaterMeshPreview();
+    emit waterEditVerticesChanged();
+}
+
+void RubyQuickViewport::adjustWaterSurface(float delta) {
+    adjustWaterHeight(delta);
+}
+
+void RubyQuickViewport::adjustWaterBed(float delta) {
+    if (!m_waterEditActive || m_waterEditPoints.size() != 4) return;
+    double minX = std::min(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double maxX = std::max(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double minY = std::min(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+    double maxY = std::max(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+
+    if (maxY - (minY + double(delta)) < 10.0) return;
+    minY += double(delta);
+
+    m_waterEditPoints = {
+        {minX, maxY},
+        {maxX, maxY},
+        {maxX, minY},
+        {minX, minY}
+    };
+    liveWaterMeshPreview();
+    emit waterEditVerticesChanged();
+}
+
+void RubyQuickViewport::setWaterDimensions(float width, float height) {
+    if (!m_waterEditActive || m_waterEditPoints.size() != 4) return;
+    double minX = std::min(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double minY = std::min(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+    double w = std::max(10.0, double(width));
+    double h = std::max(10.0, double(height));
+
+    m_waterEditPoints = {
+        {minX, minY + h},
+        {minX + w, minY + h},
+        {minX + w, minY},
+        {minX, minY}
+    };
+    liveWaterMeshPreview();
+    emit waterEditVerticesChanged();
+}
+
 void RubyQuickViewport::moveWaterVertex(int index, float worldDx, float worldDy) {
-    if (!m_waterEditActive || index < 0 || index >= int(m_waterEditPoints.size())) return;
-    m_waterEditPoints[index].x += worldDx;
-    m_waterEditPoints[index].y += worldDy;
+    if (!m_waterEditActive || m_waterEditPoints.size() != 4 || index < 0 || index >= 4) return;
+    double minX = std::min(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double maxX = std::max(m_waterEditPoints[0].x, m_waterEditPoints[2].x);
+    double minY = std::min(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+    double maxY = std::max(m_waterEditPoints[0].y, m_waterEditPoints[2].y);
+
+    switch (index) {
+    case 0: // Top-Left
+        minX = std::min(minX + double(worldDx), maxX - 10.0);
+        maxY = std::max(maxY + double(worldDy), minY + 10.0);
+        break;
+    case 1: // Top-Right
+        maxX = std::max(maxX + double(worldDx), minX + 10.0);
+        maxY = std::max(maxY + double(worldDy), minY + 10.0);
+        break;
+    case 2: // Bottom-Right
+        maxX = std::max(maxX + double(worldDx), minX + 10.0);
+        minY = std::min(minY + double(worldDy), maxY - 10.0);
+        break;
+    case 3: // Bottom-Left
+        minX = std::min(minX + double(worldDx), maxX - 10.0);
+        minY = std::min(minY + double(worldDy), maxY - 10.0);
+        break;
+    default:
+        break;
+    }
+
+    m_waterEditPoints = {
+        {minX, maxY},
+        {maxX, maxY},
+        {maxX, minY},
+        {minX, minY}
+    };
     liveWaterMeshPreview();
     emit waterEditVerticesChanged();
 }
 
-void RubyQuickViewport::insertWaterVertex(int edgeIndex, float worldX, float worldY) {
-    if (!m_waterEditActive || m_waterEditPoints.empty()) return;
-    int i0 = (edgeIndex >= 0 && edgeIndex < int(m_waterEditPoints.size())) ? edgeIndex : 0;
-    boulder::PolygonPoint pt;
-    if (worldX != 0.0f || worldY != 0.0f) {
-        pt.x = worldX;
-        pt.y = worldY;
-    } else {
-        int i1 = (i0 + 1) % int(m_waterEditPoints.size());
-        pt.x = (m_waterEditPoints[i0].x + m_waterEditPoints[i1].x) * 0.5;
-        pt.y = (m_waterEditPoints[i0].y + m_waterEditPoints[i1].y) * 0.5;
-    }
-    m_waterEditPoints.insert(m_waterEditPoints.begin() + i0 + 1, pt);
-    m_selectedWaterVertex = i0 + 1;
-    liveWaterMeshPreview();
-    emit waterEditVerticesChanged();
-    emit selectedWaterVertexChanged();
+void RubyQuickViewport::insertWaterVertex(int /*edgeIndex*/, float /*worldX*/, float /*worldY*/) {
+    // Water mesh in Swordigo is strictly a 4-vertex rectangle defined by Bounds [x, y, w, h].
+    // Arbitrary freeform polygon vertices are not supported by the engine.
 }
 
-void RubyQuickViewport::deleteWaterVertex(int index) {
-    if (!m_waterEditActive || m_waterEditPoints.size() <= 3) return;
-    if (index < 0 || index >= int(m_waterEditPoints.size())) return;
-    m_waterEditPoints.erase(m_waterEditPoints.begin() + index);
-    if (m_selectedWaterVertex >= int(m_waterEditPoints.size())) {
-        m_selectedWaterVertex = int(m_waterEditPoints.size()) - 1;
-    }
-    liveWaterMeshPreview();
-    emit waterEditVerticesChanged();
-    emit selectedWaterVertexChanged();
+void RubyQuickViewport::deleteWaterVertex(int /*index*/) {
+    // Water mesh must maintain exactly 4 bounding corners.
 }
 
 void RubyQuickViewport::selectWaterVertex(int index) {
@@ -4773,10 +5533,7 @@ void RubyQuickViewport::selectPrevWaterVertex() {
 
 void RubyQuickViewport::nudgeSelectedWaterVertex(float dx, float dy) {
     if (!m_waterEditActive || m_selectedWaterVertex < 0 || m_selectedWaterVertex >= int(m_waterEditPoints.size())) return;
-    m_waterEditPoints[m_selectedWaterVertex].x += dx;
-    m_waterEditPoints[m_selectedWaterVertex].y += dy;
-    liveWaterMeshPreview();
-    emit waterEditVerticesChanged();
+    moveWaterVertex(m_selectedWaterVertex, dx, dy);
 }
 
 bool RubyQuickViewport::waterLocalToScreen(double lx, double ly, QPointF& out) const {
@@ -4985,14 +5742,43 @@ void RubyQuickViewport::deleteObject(int idx) {
     if (m_meshEditActive && m_meshEditObject == idx) {
         discardMeshEdit();
     }
+    if (m_waterEditActive && m_waterEditObject == idx) {
+        discardWaterMeshEdit();
+    }
 
-    av::scene_delete_object(m_scene, static_cast<size_t>(idx));
+    std::string masterName = m_scene.objects[idx].name;
+    bool isSec = m_scene.objects[idx].is_secondary_water_sheet;
+    if (isSec && !m_scene.objects[idx].water_master_name.empty()) {
+        masterName = m_scene.objects[idx].water_master_name;
+    }
+
+    std::vector<std::string> namesToDelete;
+    namesToDelete.push_back(m_scene.objects[idx].name);
+
+    for (const auto& obj : m_scene.objects) {
+        if (obj.is_secondary_water_sheet && obj.water_master_name == masterName) {
+            namesToDelete.push_back(obj.name);
+        } else {
+            std::string parsedMaster;
+            if (rubywater::is_secondary_name(obj.name, &parsedMaster) && parsedMaster == masterName) {
+                namesToDelete.push_back(obj.name);
+            }
+        }
+    }
+
+    for (const auto& name : namesToDelete) {
+        for (size_t i = 0; i < m_scene.objects.size(); ++i) {
+            if (m_scene.objects[i].name == name) {
+                av::scene_delete_object(m_scene, i);
+                break;
+            }
+        }
+    }
+
     validateAndRepairScene();
 
-    if (m_selectedObject == idx) {
+    if (m_selectedObject >= int(m_scene.objects.size())) {
         m_selectedObject = -1;
-    } else if (m_selectedObject > idx) {
-        --m_selectedObject;
     }
     m_lastNudgeMs = 0;
     touch_scene(/*geometry_changed=*/true);
@@ -5658,6 +6444,7 @@ bool RubyQuickViewport::regenerateGroundMesh() {
         params.horiz_noise = 0.0;
         params.emitted_horiz_noise = m_meshEditNoise;
         params.depth_source = boulderx::Params::DepthSource::Outline;
+        params.z = m_meshEditZ;
         params.texture_scale = m_meshEditTextureScale;
         params.surface_width = gm.surface_width;
         params.hat_height = gm.hat_height;
@@ -5870,6 +6657,82 @@ bool RubyQuickViewport::applyMeshEdit() {
     emit meshEditVerticesChanged();
     update();
     return true;
+}
+
+double RubyQuickViewport::meshEditZ() const {
+    if (m_meshEditActive) return m_meshEditZ;
+    if (canMeshEdit() && m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        return double(m_scene.objects[m_selectedObject].pos_z);
+    }
+    return m_meshEditZ;
+}
+
+void RubyQuickViewport::setMeshEditZ(double z) {
+    if (std::abs(m_meshEditZ - z) < 1e-4) return;
+    m_meshEditZ = z;
+    if (m_meshEditActive && m_meshEditObject >= 0 && m_meshEditObject < int(m_scene.objects.size())) {
+        m_scene.objects[m_meshEditObject].pos_z = float(m_meshEditZ);
+        m_scene.objects[m_meshEditObject].resolved_components = m_scene.objects[m_meshEditObject].components;
+        regenerateGroundMesh();
+    } else if (canMeshEdit() && m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        pushUndoSnapshot();
+        m_scene.objects[m_selectedObject].pos_z = float(m_meshEditZ);
+        touch_scene(/*geometry_changed=*/false);
+    }
+    emit meshEditZChanged();
+    emit objectTransformChanged();
+    markDirty(true);
+    update();
+}
+
+void RubyQuickViewport::adjustMeshEditZ(double delta) {
+    if (m_meshEditActive) {
+        setMeshEditZ(m_meshEditZ + delta);
+    } else if (canMeshEdit() && m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        setMeshEditZ(double(m_scene.objects[m_selectedObject].pos_z) + delta);
+    }
+}
+
+void RubyQuickViewport::adjustWaterZ(double delta) {
+    if (!isSelectedWater()) return;
+    auto& obj = m_scene.objects[m_selectedObject];
+    obj.pos_z += float(delta);
+    propagateWaterCompanionDelta(m_selectedObject, 0.0f, 0.0f, float(delta));
+    pushUndoSnapshot();
+    touch_scene(/*geometry_changed=*/false);
+    emit selectedWaterPropertiesChanged();
+    emit objectTransformChanged();
+    markDirty(true);
+    update();
+}
+
+double RubyQuickViewport::selectedWaterDepth() const {
+    if (!m_hasScene || m_selectedObject < 0 || m_selectedObject >= int(m_scene.objects.size()))
+        return 60.0;
+    for (const auto& w : m_scene.waters) {
+        if (w.object_index == m_selectedObject) {
+            int totalSheets = w.total_sheets > 0 ? w.total_sheets : (1 + w.sheets_front + w.sheets_back);
+            return double(totalSheets * 60.0f);
+        }
+    }
+    return 60.0;
+}
+
+void RubyQuickViewport::setSelectedWaterDepth(double depth) {
+    if (depth < 60.0) depth = 60.0;
+    if (!isSelectedWater()) return;
+    int extra = int(std::round((depth - 60.0) / 60.0));
+    if (extra < 0) extra = 0;
+    setWaterSheets(0, extra);
+}
+
+void RubyQuickViewport::adjustWaterMeshDepth(double delta) {
+    if (!isSelectedWater()) return;
+    if (delta > 0) {
+        addWaterSheetBack();
+    } else if (delta < 0) {
+        removeWaterSheetBack();
+    }
 }
 
 // Helper: update texture name in a serialized MeshData proto message
@@ -6682,6 +7545,9 @@ void RubyQuickViewport::dragSelected(float deltaX, float deltaY, float deltaZ) {
     obj.pos_x += world_dx;
     obj.pos_y += world_dy;
     obj.pos_z += world_dz;
+    if (isSelectedWater()) {
+        propagateWaterCompanionDelta(m_selectedObject, world_dx, world_dy, world_dz);
+    }
 
     touch_scene(/*geometry_changed=*/false);
     emit objectTransformChanged();
@@ -6699,7 +7565,21 @@ void RubyQuickViewport::finishDrag() {
 // active mode. A rapid series of taps shares one undo snapshot so a nudge
 // session does not blow away the 25-entry undo stack.
 bool RubyQuickViewport::nudgeSelected(int axis, float steps) {
-    if (m_meshEditActive || m_waterEditActive || m_gizmoMode == 0) return false; // Completely disabled during mesh/water edit mode
+    if (m_meshEditActive) {
+        if (axis == 2) {
+            adjustMeshEditZ(double(steps * 5.0f));
+            return true;
+        }
+        return false;
+    }
+    if (m_waterEditActive) {
+        if (axis == 2) {
+            adjustWaterZ(double(steps * 5.0f));
+            return true;
+        }
+        return false;
+    }
+    if (m_gizmoMode == 0) return false;
     if (axis < 0 || axis > 2) return false;
     if (qFuzzyIsNull(steps)) return false;
     if (m_selectedObject < 0 || m_selectedObject >= int(m_scene.objects.size())) return false;
@@ -6719,9 +7599,16 @@ bool RubyQuickViewport::nudgeSelected(int axis, float steps) {
 
     switch (m_gizmoMode) {
     case 1: // Move
-        if (axis == 0)      obj.pos_x += steps * kMoveStep;
-        else if (axis == 1) obj.pos_y += steps * kMoveStep;
-        else                obj.pos_z += steps * kMoveStep;
+        if (axis == 0) {
+            obj.pos_x += steps * kMoveStep;
+            if (isSelectedWater()) propagateWaterCompanionDelta(m_selectedObject, steps * kMoveStep, 0.0f, 0.0f);
+        } else if (axis == 1) {
+            obj.pos_y += steps * kMoveStep;
+            if (isSelectedWater()) propagateWaterCompanionDelta(m_selectedObject, 0.0f, steps * kMoveStep, 0.0f);
+        } else {
+            obj.pos_z += steps * kMoveStep;
+            if (isSelectedWater()) propagateWaterCompanionDelta(m_selectedObject, 0.0f, 0.0f, steps * kMoveStep);
+        }
         break;
 
     case 2: // Rotate — Swordigo Euler coordinates:
@@ -6847,6 +7734,9 @@ void RubyQuickViewport::applyTransform(float px, float py, float pz, float rx, f
     if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
         pushUndoSnapshot();
         auto& obj = m_scene.objects[m_selectedObject];
+        const float dx = px - obj.pos_x;
+        const float dy = py - obj.pos_y;
+        const float dz = pz - obj.pos_z;
         obj.pos_x = px;
         obj.pos_y = py;
         obj.pos_z = pz;
@@ -6857,6 +7747,9 @@ void RubyQuickViewport::applyTransform(float px, float py, float pz, float rx, f
         obj.scale_x = sx;
         obj.scale_y = sy;
         obj.scale_z = sz;
+        if (isSelectedWater()) {
+            propagateWaterCompanionDelta(m_selectedObject, dx, dy, dz);
+        }
         touch_scene(/*geometry_changed=*/false);
         markDirty(true);
         emit objectTransformChanged();
@@ -6867,7 +7760,23 @@ void RubyQuickViewport::applyTransform(float px, float py, float pz, float rx, f
 void RubyQuickViewport::setObjectName(const QString& name) {
     if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
         pushUndoSnapshot();
-        m_scene.objects[m_selectedObject].name = name.toStdString();
+        const std::string oldName = m_scene.objects[m_selectedObject].name;
+        const std::string newName = name.toStdString();
+        m_scene.objects[m_selectedObject].name = newName;
+
+        for (auto& obj : m_scene.objects) {
+            if (obj.is_secondary_water_sheet && (obj.water_master_name == oldName || rubywater::is_secondary_name(obj.name))) {
+                std::string parsedMaster;
+                if (rubywater::is_secondary_name(obj.name, &parsedMaster) && parsedMaster == oldName) {
+                    size_t p = obj.name.rfind("__subz");
+                    if (p != std::string::npos) {
+                        obj.name = newName + obj.name.substr(p);
+                    }
+                }
+                obj.water_master_name = newName;
+            }
+        }
+
         touch_scene(/*geometry_changed=*/false);
         markDirty(true);
         m_objectModel.updateFromScene(m_scene);
@@ -6974,6 +7883,7 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
             if (m_waterDragging) {
                 m_waterDragging = false;
                 m_waterDragPoint = -1;
+                m_waterDragEdge = -1;
                 liveWaterMeshPreview();
                 emit waterEditVerticesChanged();
                 update();
@@ -7113,6 +8023,7 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
                 selectWaterVertex(hitVert);
                 m_waterDragging = true;
                 m_waterDragPoint = hitVert;
+                m_waterDragEdge = -1;
 
                 float origin[3], dir[3];
                 waterScreenRay(pos, origin, dir);
@@ -7136,9 +8047,9 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
             double hitLx = 0, hitLy = 0;
             int hitEdge = waterHitTestEdge(pos, hitLx, hitLy, 32.0f);
             if (hitEdge >= 0) {
-                insertWaterVertex(hitEdge, float(hitLx), float(hitLy));
                 m_waterDragging = true;
-                m_waterDragPoint = hitEdge + 1;
+                m_waterDragPoint = -1;
+                m_waterDragEdge = hitEdge;
                 m_waterDragOffX = 0.0;
                 m_waterDragOffY = 0.0;
                 m_touchActive = true;
@@ -7253,14 +8164,18 @@ void RubyQuickViewport::touchEvent(QTouchEvent* event) {
         }
 
         if (m_waterEditActive) {
-            if (m_waterDragging && m_waterDragPoint >= 0 && m_waterDragPoint < int(m_waterEditPoints.size())) {
+            if (m_waterDragging) {
                 float origin[3], dir[3];
                 waterScreenRay(curPos, origin, dir);
                 double lx = 0, ly = 0;
                 if (waterRayObjectPlane(origin, dir, lx, ly)) {
-                    m_waterEditPoints[m_waterDragPoint].x = lx + m_waterDragOffX;
-                    m_waterEditPoints[m_waterDragPoint].y = ly + m_waterDragOffY;
-                    liveWaterMeshPreview();
+                    if (m_waterDragPoint >= 0 && m_waterDragPoint < int(m_waterEditPoints.size())) {
+                        dragWaterCorner(m_waterDragPoint, lx + m_waterDragOffX, ly + m_waterDragOffY);
+                        liveWaterMeshPreview();
+                    } else if (m_waterDragEdge >= 0 && m_waterDragEdge < 4) {
+                        dragWaterEdge(m_waterDragEdge, lx, ly);
+                        liveWaterMeshPreview();
+                    }
                 }
                 event->accept();
                 return;
@@ -7464,6 +8379,7 @@ void RubyQuickViewport::mousePressEvent(QMouseEvent* event) {
             selectWaterVertex(hitVert);
             m_waterDragging = true;
             m_waterDragPoint = hitVert;
+            m_waterDragEdge = -1;
 
             float origin[3], dir[3];
             waterScreenRay(pos, origin, dir);
@@ -7483,9 +8399,9 @@ void RubyQuickViewport::mousePressEvent(QMouseEvent* event) {
         double hitLx = 0, hitLy = 0;
         int hitEdge = waterHitTestEdge(pos, hitLx, hitLy, 32.0f);
         if (hitEdge >= 0) {
-            insertWaterVertex(hitEdge, float(hitLx), float(hitLy));
             m_waterDragging = true;
-            m_waterDragPoint = hitEdge + 1;
+            m_waterDragPoint = -1;
+            m_waterDragEdge = hitEdge;
             m_waterDragOffX = 0.0;
             m_waterDragOffY = 0.0;
             event->accept();
@@ -7550,14 +8466,18 @@ void RubyQuickViewport::mouseMoveEvent(QMouseEvent* event) {
 
     if (m_waterEditActive) {
         QPointF pos = event->position();
-        if (m_waterDragging && m_waterDragPoint >= 0 && m_waterDragPoint < int(m_waterEditPoints.size())) {
+        if (m_waterDragging) {
             float origin[3], dir[3];
             waterScreenRay(pos, origin, dir);
             double lx = 0, ly = 0;
             if (waterRayObjectPlane(origin, dir, lx, ly)) {
-                m_waterEditPoints[m_waterDragPoint].x = lx + m_waterDragOffX;
-                m_waterEditPoints[m_waterDragPoint].y = ly + m_waterDragOffY;
-                liveWaterMeshPreview();
+                if (m_waterDragPoint >= 0 && m_waterDragPoint < int(m_waterEditPoints.size())) {
+                    dragWaterCorner(m_waterDragPoint, lx + m_waterDragOffX, ly + m_waterDragOffY);
+                    liveWaterMeshPreview();
+                } else if (m_waterDragEdge >= 0 && m_waterDragEdge < 4) {
+                    dragWaterEdge(m_waterDragEdge, lx, ly);
+                    liveWaterMeshPreview();
+                }
             }
             event->accept();
             return;
@@ -7620,6 +8540,7 @@ void RubyQuickViewport::mouseReleaseEvent(QMouseEvent* event) {
         if (m_waterDragging) {
             m_waterDragging = false;
             m_waterDragPoint = -1;
+            m_waterDragEdge = -1;
             liveWaterMeshPreview();
             update();
         }

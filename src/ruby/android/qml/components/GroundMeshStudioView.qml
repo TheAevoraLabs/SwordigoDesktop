@@ -58,6 +58,7 @@ Item {
     property real minDepth: -45.0
     property real maxDepth: 45.0
     property real surfaceWidth: 80.0
+    property real layerZ: 0.0
     property string topTexture: "fire_grass"
     property string frontTexture: "graveyard_ground"
 
@@ -1662,6 +1663,22 @@ Item {
                     }
                 }
 
+                Row {
+                    width: parent.width
+                    spacing: Theme.dp(6)
+                    Text {
+                        text: qsTr("Layer Z")
+                        color: Theme.textMuted
+                        font.pixelSize: Theme.dp(Theme.fontSm)
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    ThemedField {
+                        width: Theme.dp(72)
+                        text: "" + root.layerZ
+                        onEditingFinished: root.layerZ = parseFloat(text) || 0.0
+                    }
+                }
+
                 Rectangle { height: 1; width: parent.width; color: Theme.borderSubtle }
 
                 // ── Textures ────────────────────────────────────────────────
@@ -1903,6 +1920,7 @@ Item {
             "frontTexture": root.frontTexture,
             "meshType": root.meshType,
             "randomSeed": root.randomSeed,
+            "z": root.layerZ,
             "generator": root.generatorId,
             // Read back out of the sheet, never invented here: see domeHats.
             "domeHats": root.domeHats,
@@ -1946,6 +1964,7 @@ Item {
         root.randomSeed = res.randomSeed
         root.topTexture = res.topTexture
         root.frontTexture = res.frontTexture
+        if (res.z !== undefined) root.layerZ = res.z
         // Domes are geometry this view cannot draw, so they are held verbatim for
         // the next export instead of being regenerated.
         root.domeHats = res.domeHats ? res.domeHats : []

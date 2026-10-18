@@ -223,10 +223,9 @@ void WaterRenderer::render(const std::vector<av::SceneData::SceneWater>& waters,
         const int m = cols + 1;
         const int num_verts = m * 4;
 
-        // Thickness: local Z +40.0f for front face, -20.0f for back face
-        // Directly matches: 1109393408 (0x42200000 = +40.f) and -1046478848 (0xC1A00000 = -20.f)
-        const float front_z = 40.0f;
-        const float back_z  = -20.0f;
+        // Thickness: local Z front_z for front face, back_z for back face
+        const float front_z = (w.front_z == 0.0f && w.back_z == 0.0f) ? 40.0f : w.front_z;
+        const float back_z  = (w.front_z == 0.0f && w.back_z == 0.0f) ? -20.0f : w.back_z;
 
         std::vector<float> verts(static_cast<size_t>(num_verts) * 5, 0.0f);
         // cols * 6 indices for front face, cols * 6 indices for top surface face

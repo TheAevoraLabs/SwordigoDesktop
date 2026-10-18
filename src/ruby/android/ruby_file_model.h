@@ -20,6 +20,7 @@ struct FileItem {
     QString fileSizeStr;
     QString fileDateStr;
     bool isPinned = false;
+    bool isSelected = false;
 
     // Sort keys, kept alongside the display strings so the model can re-sort
     // without re-stat()ing the filesystem (mirrors MobileAssetBrowser's use of
@@ -52,6 +53,15 @@ class RubyFileModel : public QAbstractListModel {
     Q_PROPERTY(bool isLoading READ isLoading NOTIFY isLoadingChanged)
     Q_PROPERTY(bool isResourceRoot READ isResourceRoot NOTIFY resourceRootChanged)
     Q_PROPERTY(QVariantList recentFiles READ recentFiles NOTIFY recentFilesChanged)
+    // ── Index FM / HyprFM deep search & metrics ────────────────────────
+    Q_PROPERTY(bool isSearching READ isSearching NOTIFY isSearchingChanged)
+    Q_PROPERTY(bool isSearchMode READ isSearchMode NOTIFY isSearchModeChanged)
+    Q_PROPERTY(int searchResultCount READ searchResultCount NOTIFY searchResultCountChanged)
+    Q_PROPERTY(QString availableStorageStr READ availableStorageStr NOTIFY storageInfoChanged)
+    Q_PROPERTY(QString totalStorageStr READ totalStorageStr NOTIFY storageInfoChanged)
+    Q_PROPERTY(qreal storageUsagePercent READ storageUsagePercent NOTIFY storageInfoChanged)
+    Q_PROPERTY(QString currentFolderSizeStr READ currentFolderSizeStr NOTIFY folderInfoChanged)
+    Q_PROPERTY(int selectedCount READ selectedCount NOTIFY selectionChanged)
 
 public:
     enum FileRoles {
@@ -61,7 +71,8 @@ public:
         IsDirRole,
         FileSizeStrRole,
         FileDateStrRole,
-        IsPinnedRole
+        IsPinnedRole,
+        IsSelectedRole
     };
 
     explicit RubyFileModel(QObject* parent = nullptr);
@@ -71,7 +82,13 @@ public:
     QHash<int, QByteArray> roleNames() const override;
 
     QString currentPath() const { return m_currentDir.absolutePath(); }
-    QString folderName() const { return m_currentDir.dirName(); }
+    QString folderName() const {
+        QString name = m_currentDir.dirName();
+        if (name == QLatin1String("0") || name.isEmpty() || name == QLatin1String("/")) {
+            return QStringLiteral("Internal Storage");
+        }
+        return name;
+    }
     int count() const { return m_items.size(); }
     int dirCount() const { return m_dirCount; }
     int fileCount() const { return m_fileCount; }
@@ -84,10 +101,19 @@ public:
     bool sortAscending() const { return m_sortAscending; }
     bool showHidden() const { return m_showHidden; }
 
-    bool canPaste() const { return !m_clipboardPath.isEmpty(); }
+    bool canPaste() const { return !m_clipboardPath.isEmpty() || !m_clipboardPaths.isEmpty(); }
     QString clipboardPath() const { return m_clipboardPath; }
     bool clipboardIsCut() const { return m_clipboardIsCut; }
     bool isLoading() const { return m_isLoading; }
+
+    bool isSearching() const { return m_isSearching; }
+    bool isSearchMode() const { return m_isSearchMode; }
+    int searchResultCount() const { return m_searchResultCount; }
+    QString availableStorageStr() const { return m_availableStorageStr; }
+    QString totalStorageStr() const { return m_totalStorageStr; }
+    qreal storageUsagePercent() const { return m_storageUsagePercent; }
+    QString currentFolderSizeStr() const { return m_currentFolderSizeStr; }
+    int selectedCount() const { return m_selectedPaths.size(); }
 
     Q_INVOKABLE void setCategory(const QString& category);
     Q_INVOKABLE void setSortMode(const QString& mode);
@@ -106,6 +132,31 @@ public:
     Q_INVOKABLE QString getTemplateBoilerplate(const QString& templateId) const;
     Q_INVOKABLE void togglePin(const QString& path);
     Q_INVOKABLE void copyToClipboard(const QString& text);
+
+    // ── Multi-Selection & Batch Operations (Index FM SelectionBar) ─────
+    Q_INVOKABLE void setItemSelected(const QString& path, bool selected);
+    Q_INVOKABLE void toggleItemSelected(const QString& path);
+    Q_INVOKABLE bool isItemSelected(const QString& path) const;
+    Q_INVOKABLE void selectAll();
+    Q_INVOKABLE void clearSelection();
+    Q_INVOKABLE QStringList getSelectedPaths() const;
+    Q_INVOKABLE QString getSelectedTotalBytesStr() const;
+
+    Q_INVOKABLE bool deleteMultiple(const QStringList& paths);
+    Q_INVOKABLE void copyMultiple(const QStringList& paths);
+    Q_INVOKABLE void cutMultiple(const QStringList& paths);
+    Q_INVOKABLE bool compressMultiple(const QStringList& paths, const QString& outZipPath = QString());
+
+    // ── Deep Recursive Search (Index & HyprFM SearchEngine) ───────────
+    Q_INVOKABLE void searchRecursive(const QString& query);
+    Q_INVOKABLE void cancelSearch();
+    Q_INVOKABLE void clearSearch();
+
+    // ── Inspection, Storage Metrics & File Preview (Index FilePreviewer) ─
+    Q_INVOKABLE void refreshStorageInfo();
+    Q_INVOKABLE QString calculateMd5(const QString& path);
+    Q_INVOKABLE QString readFileSnippet(const QString& path, int maxLines = 150);
+    Q_INVOKABLE QVariantMap getDetailedFileProperties(const QString& path);
 
     // ── Clipboard (Cut / Copy / Paste) ──────────────────────────────────
     Q_INVOKABLE void cutItem(const QString& path);
@@ -162,6 +213,12 @@ signals:
     void resourceRootChanged();
     void statusMessage(const QString& message);
     void recentFilesChanged();
+    void isSearchingChanged();
+    void isSearchModeChanged();
+    void searchResultCountChanged();
+    void storageInfoChanged();
+    void folderInfoChanged();
+    void selectionChanged();
 
 private:
     void reload();
@@ -184,6 +241,20 @@ private:
     QDir m_lastLoadedDir;
     bool m_lastShowHidden = false;
     QSet<QString> m_pinnedPaths;
+
+    QSet<QString> m_selectedPaths;
+    QStringList m_clipboardPaths;
+
+    bool m_isSearching = false;
+    bool m_isSearchMode = false;
+    int m_searchResultCount = 0;
+    std::atomic<uint64_t> m_searchGeneration{0};
+
+    QString m_availableStorageStr;
+    QString m_totalStorageStr;
+    qreal m_storageUsagePercent = 0.0;
+    QString m_currentFolderSizeStr;
+    std::atomic<uint64_t> m_dirInfoGeneration{0};
 
     QString m_category = QStringLiteral("all");
     QString m_sortMode = QStringLiteral("name");

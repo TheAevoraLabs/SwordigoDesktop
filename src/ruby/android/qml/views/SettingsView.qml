@@ -7,6 +7,7 @@ Item {
     id: root
 
     Flickable {
+        id: settingsFlickable
         anchors.fill: parent
         contentHeight: settingsCol.implicitHeight + Theme.dp(Theme.spacingXl) * 2
         clip: true
@@ -16,7 +17,8 @@ Item {
             id: settingsCol
             x: Theme.dp(Theme.paddingScreen)
             width: parent.width - Theme.dp(Theme.paddingScreen) * 2
-            topPadding: Theme.dp(Theme.spacingLg)
+            topPadding: Theme.dp(Theme.spacingMd)
+            bottomPadding: Theme.dp(Theme.spacingXl)
             spacing: Theme.dp(Theme.spacingLg)
 
             // ── Screen Title ────────────────────────────────────────────────
@@ -32,213 +34,156 @@ Item {
                 }
 
                 Text {
-                    text: qsTr("Personalize profile, workspace, viewport & modding compiler")
+                    text: qsTr("Workspace, Viewport & Compiler Configuration")
                     font.pixelSize: Theme.dp(Theme.fontSm)
                     color: Theme.textSecondary
                 }
             }
 
-            // ── Section 1: Modder Profile & Identity Hero Card ──────────────
+            // ── 1. User Identity & Avatar Card (Clean M3, Zero AI Slop) ─────
             Rectangle {
                 width: parent.width
-                height: profileCol.implicitHeight + Theme.dp(Theme.spacingLg) * 2
+                implicitHeight: profileRow.implicitHeight + Theme.dp(Theme.spacingLg) * 2
                 radius: Theme.radiusCard
                 color: Theme.surface1
-                border.color: Theme.border
-                border.width: 1
 
-                Column {
-                    id: profileCol
-                    anchors.left: parent.left
-                    anchors.right: parent.right
-                    anchors.top: parent.top
+                Row {
+                    id: profileRow
+                    anchors.fill: parent
                     anchors.margins: Theme.dp(Theme.spacingLg)
                     spacing: Theme.dp(Theme.spacingMd)
 
-                    Row {
-                        width: parent.width
-                        spacing: Theme.dp(Theme.spacingLg)
+                    // Avatar with interactive quick shuffle
+                    Item {
+                        width: Theme.dp(56)
+                        height: Theme.dp(56)
+                        anchors.verticalCenter: parent.verticalCenter
 
-                        // Big Avatar with Glow Ring
-                        Item {
-                            width: Theme.dp(64)
-                            height: Theme.dp(64)
-                            anchors.verticalCenter: parent.verticalCenter
+                        Rectangle {
+                            anchors.fill: parent
+                            radius: width / 2
+                            color: Theme.surface2
+                            border.width: 0
+                            clip: true
 
-                            Rectangle {
-                                anchors.centerIn: parent
-                                width: parent.width + Theme.dp(8)
-                                height: parent.height + Theme.dp(8)
-                                radius: width / 2
-                                color: Theme.alpha(Theme.accentStart, 0.25)
-                            }
-
-                            Rectangle {
+                            // Avatar image preview
+                            Image {
+                                id: avatarPreview
                                 anchors.fill: parent
-                                radius: width / 2
-                                color: "#1A1622"
-                                border.color: Theme.accentEnd
-                                border.width: Theme.dp(2)
-
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: {
-                                        var n = (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.userName : "R"
-                                        return n.length > 0 ? n.charAt(0).toUpperCase() : "R"
-                                    }
-                                    font.pixelSize: Theme.dp(24)
-                                    font.weight: Font.Bold
-                                    font.family: Theme.monoFamily
-                                    color: Theme.accentInk
-                                }
+                                anchors.margins: Theme.dp(3)
+                                source: (typeof rubySettings !== "undefined" && rubySettings && rubySettings.avatarImage)
+                                        ? rubySettings.avatarImage : ""
+                                visible: source.toString().length > 0
+                                fillMode: Image.PreserveAspectFit
+                                smooth: true
                             }
 
-                            // Active Online Dot
-                            Rectangle {
-                                anchors.right: parent.right
-                                anchors.bottom: parent.bottom
-                                width: Theme.dp(14)
-                                height: Theme.dp(14)
-                                radius: width / 2
-                                color: "#10B981"
-                                border.color: Theme.surface1
-                                border.width: Theme.dp(2.5)
+                            // Monogram Fallback
+                            Text {
+                                anchors.centerIn: parent
+                                visible: avatarPreview.source.toString().length === 0
+                                text: {
+                                    var n = (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.userName : "R"
+                                    return n.length > 0 ? n.charAt(0).toUpperCase() : "R"
+                                }
+                                font.pixelSize: Theme.dp(22)
+                                font.weight: Font.Bold
+                                font.family: Theme.monoFamily
+                                color: Theme.accentInk
                             }
                         }
 
-                        // Identity Info
-                        Column {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - Theme.dp(64) - Theme.dp(Theme.spacingLg)
-                            spacing: Theme.dp(4)
+                        // Small camera/shuffle badge overlay
+                        Rectangle {
+                            anchors.right: parent.right
+                            anchors.bottom: parent.bottom
+                            width: Theme.dp(20)
+                            height: Theme.dp(20)
+                            radius: Theme.dp(10)
+                            color: Theme.accentInk
 
-                            Row {
-                                spacing: Theme.dp(6)
+                            Icon {
+                                anchors.centerIn: parent
+                                name: "image"
+                                size: Theme.dp(11)
+                                color: Theme.onAccent
+                            }
 
-                                Text {
-                                    text: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.userName : "Ruby Dev"
-                                    font.pixelSize: Theme.dp(17)
-                                    font.weight: Font.Bold
-                                    color: Theme.textPrimary
-                                    elide: Text.ElideRight
-                                    maximumLineCount: 1
-                                }
-
-                                Rectangle {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    height: Theme.dp(18)
-                                    width: devTag.implicitWidth + Theme.dp(8)
-                                    radius: Theme.radiusPill
-                                    color: Theme.alpha(Theme.accentInk, 0.16)
-                                    border.color: Theme.alpha(Theme.accentEnd, 0.4)
-                                    border.width: 1
-
-                                    Text {
-                                        id: devTag
-                                        anchors.centerIn: parent
-                                        text: "RUBY DEV"
-                                        font.pixelSize: Theme.dp(9)
-                                        font.weight: Font.Bold
-                                        color: Theme.accentInk
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    if (typeof rubySettings !== "undefined" && rubySettings) {
+                                        rubySettings.randomizeAvatarImage()
                                     }
                                 }
                             }
+                        }
 
-                            Text {
-                                text: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.userTitle : "Swordigo Modder"
-                                font.pixelSize: Theme.dp(Theme.fontSm)
-                                color: Theme.textSecondary
-                            }
-
-                            Text {
-                                text: {
-                                    var count = (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.nameDatabaseCount : 200;
-                                    return qsTr("%1 Community Names Pool").arg(count);
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (typeof rubySettings !== "undefined" && rubySettings) {
+                                    rubySettings.randomizeAvatarImage()
                                 }
-                                font.pixelSize: Theme.dp(10)
-                                color: Theme.textMuted
                             }
                         }
                     }
 
-                    // Profile Actions: Change Name & Randomize
+                    // User name & workspace text
+                    Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - Theme.dp(56) - Theme.dp(78) - Theme.dp(Theme.spacingMd) * 2
+                        spacing: Theme.dp(3)
+
+                        Text {
+                            text: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.userName : "Ruby Dev"
+                            font.pixelSize: Theme.dp(17)
+                            font.weight: Font.Bold
+                            color: Theme.textPrimary
+                            elide: Text.ElideRight
+                            width: parent.width
+                        }
+
+                        Text {
+                            text: (typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.folderName && rubyFileModel.folderName.length > 0)
+                                  ? rubyFileModel.folderName : "Local Workspace"
+                            font.pixelSize: Theme.dp(Theme.fontXs)
+                            font.family: Theme.monoFamily
+                            color: Theme.textSecondary
+                            elide: Text.ElideRight
+                            width: parent.width
+                        }
+                    }
+
+                    // Compact action buttons: Edit Name, Small Randomize Name & Random Image
                     Row {
-                        width: parent.width
-                        spacing: Theme.dp(Theme.spacingSm)
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: Theme.dp(6)
 
-                        Rectangle {
-                            height: Theme.dp(36)
-                            width: (parent.width - Theme.dp(Theme.spacingSm)) / 2
-                            radius: Theme.radiusSm
-                            color: editNameMouse.pressed ? Theme.surface3 : Theme.surface2
-                            border.color: Theme.border
-                            border.width: 1
-
-                            Row {
-                                anchors.centerIn: parent
-                                spacing: Theme.dp(6)
-
-                                Icon {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    name: "pencil"
-                                    size: Theme.dp(14)
-                                    color: Theme.textPrimary
-                                }
-
-                                Text {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: qsTr("Edit Name")
-                                    font.pixelSize: Theme.dp(12)
-                                    font.weight: Font.DemiBold
-                                    color: Theme.textPrimary
-                                }
-                            }
-
-                            MouseArea {
-                                id: editNameMouse
-                                anchors.fill: parent
-                                onClicked: {
-                                    var cur = (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.userName : "Ruby Dev";
-                                    nameEditDialog.openWith(cur);
-                                }
+                        // Edit Name Button
+                        IconButton {
+                            iconName: "pencil"
+                            buttonSize: Theme.dp(34)
+                            iconSize: Theme.dp(16)
+                            square: true
+                            onClicked: {
+                                var cur = (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.userName : "Ruby Dev"
+                                nameEditDialog.openWith(cur)
                             }
                         }
 
-                        Rectangle {
-                            height: Theme.dp(36)
-                            width: (parent.width - Theme.dp(Theme.spacingSm)) / 2
-                            radius: Theme.radiusSm
-                            color: randMouse.pressed ? Theme.accentEnd : Theme.accentSoft
-                            border.color: Theme.alpha(Theme.accentEnd, 0.4)
-                            border.width: 1
-
-                            Row {
-                                anchors.centerIn: parent
-                                spacing: Theme.dp(6)
-
-                                Icon {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    name: "refresh"
-                                    size: Theme.dp(14)
-                                    color: Theme.accentInk
-                                }
-
-                                Text {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: qsTr("Randomize")
-                                    font.pixelSize: Theme.dp(12)
-                                    font.weight: Font.DemiBold
-                                    color: Theme.accentInk
-                                }
-                            }
-
-                            MouseArea {
-                                id: randMouse
-                                anchors.fill: parent
-                                onClicked: {
-                                    if (typeof rubySettings !== "undefined" && rubySettings) {
-                                        rubySettings.randomizeUserName();
-                                    }
+                        // Compact Randomize Name Button (Small dice/refresh icon)
+                        IconButton {
+                            iconName: "refresh"
+                            tint: Theme.accentInk
+                            plate: Theme.alpha(Theme.accentInk, 0.14)
+                            plateEdge: Theme.alpha(Theme.accentInk, 0.32)
+                            buttonSize: Theme.dp(34)
+                            iconSize: Theme.dp(16)
+                            square: true
+                            onClicked: {
+                                if (typeof rubySettings !== "undefined" && rubySettings) {
+                                    rubySettings.randomizeUserName()
                                 }
                             }
                         }
@@ -246,7 +191,245 @@ Item {
                 }
             }
 
-            // ── Section 2: Workspace & Storage ──────────────────────────────
+            // ── 2. Appearance & Visual Themes (Clean M3 Segmented Selector) ─
+            SectionCard {
+                width: parent.width
+                label: qsTr("Visual Theme & Palette")
+                accentIcon: "sliders"
+
+                Text {
+                    width: parent.width
+                    text: qsTr("Studio theme and contrast tone applied across all views, file explorers, and tools.")
+                    font.pixelSize: Theme.dp(Theme.fontSm)
+                    color: Theme.textSecondary
+                    wrapMode: Text.WordWrap
+                }
+
+                // Grid of Theme Swatches
+                Grid {
+                    width: parent.width
+                    columns: parent.width > Theme.dp(440) ? 3 : 2
+                    spacing: Theme.dp(Theme.spacingSm)
+
+                    Repeater {
+                        model: Theme.availableThemes
+
+                        Rectangle {
+                            width: (parent.width - Theme.dp(Theme.spacingSm) * (parent.columns - 1)) / parent.columns
+                            height: Theme.dp(72)
+                            radius: Theme.radiusMd
+                            color: isSelected ? Theme.surface2 : Theme.surface1
+                            readonly property bool isSelected: Theme.activeThemeId === modelData.id
+                            border.color: isSelected ? modelData.accent : Theme.borderSubtle
+                            border.width: isSelected ? 1.5 : 1
+
+                            Row {
+                                anchors.fill: parent
+                                anchors.margins: Theme.dp(10)
+                                spacing: Theme.dp(10)
+
+                                // Mini Palette Preview (3 circular dots)
+                                Column {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: Theme.dp(3)
+
+                                    Row {
+                                        spacing: Theme.dp(3)
+                                        Rectangle { width: Theme.dp(12); height: Theme.dp(12); radius: Theme.dp(6); color: modelData.bg; border.color: Theme.border; border.width: 1 }
+                                        Rectangle { width: Theme.dp(12); height: Theme.dp(12); radius: Theme.dp(6); color: modelData.card; border.color: Theme.border; border.width: 1 }
+                                    }
+                                    Rectangle { width: Theme.dp(27); height: Theme.dp(8); radius: Theme.dp(4); color: modelData.accent }
+                                }
+
+                                Column {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: parent.width - Theme.dp(38)
+                                    spacing: Theme.dp(1)
+
+                                    Text {
+                                        text: modelData.name
+                                        font.pixelSize: Theme.dp(Theme.fontSm)
+                                        font.weight: isSelected ? Font.Bold : Font.Medium
+                                        color: isSelected ? modelData.accent : Theme.textPrimary
+                                        elide: Text.ElideRight
+                                        width: parent.width
+                                    }
+
+                                    Text {
+                                        text: isSelected ? qsTr("Active") : modelData.id.toUpperCase()
+                                        font.pixelSize: Theme.dp(Theme.fontXs)
+                                        font.family: Theme.monoFamily
+                                        color: isSelected ? Theme.accentInk : Theme.textMuted
+                                    }
+                                }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    if (typeof rubySettings !== "undefined" && rubySettings && rubySettings.hapticsEnabled) {
+                                        if (typeof androidContext !== "undefined" && androidContext && typeof androidContext.vibrate === "function") {
+                                            androidContext.vibrate(20)
+                                        }
+                                    }
+                                    Theme.setTheme(modelData.id)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── 3. 3D Scene Viewport & Graphics ─────────────────────────────
+            SectionCard {
+                width: parent.width
+                label: qsTr("3D Viewport & Rendering")
+                accentIcon: "view3d"
+
+                SettingRow {
+                    title: qsTr("Ground Reference Grid")
+                    description: qsTr("Render coordinate grid below entities in 3D viewport")
+                    leadingIcon: "grid"
+                    hasSwitch: true
+                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.showGrid : true
+                    onCheckedChanged: {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.showGrid = checked
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: qsTr("Wireframe Mesh Overlay")
+                    description: qsTr("Render polygonal wireframe edges on 3D geometry")
+                    leadingIcon: "cube"
+                    hasSwitch: true
+                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.wireframeMode : false
+                    onCheckedChanged: {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.wireframeMode = checked
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: qsTr("Multisample Anti-Aliasing (MSAA)")
+                    description: qsTr("4x hardware multisampling for smooth geometric edges")
+                    leadingIcon: "layers"
+                    hasSwitch: true
+                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.msaaEnabled : true
+                    onCheckedChanged: {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.msaaEnabled = checked
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: qsTr("Snap Camera on Node Select")
+                    description: qsTr("Smoothly focus camera target when selecting an entity")
+                    leadingIcon: "target"
+                    hasSwitch: true
+                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.snapCamera : true
+                    onCheckedChanged: {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.snapCamera = checked
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: qsTr("Hold to Select Objects")
+                    description: qsTr("Require a deliberate 0.5s press-and-hold to select in 3D scene")
+                    leadingIcon: "hand"
+                    hasSwitch: true
+                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.holdToSelect : false
+                    onCheckedChanged: {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.holdToSelect = checked
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: qsTr("Ground Mesh Generator")
+                    description: qsTr("Engine used to generate procedural ground meshes on edits")
+                    leadingIcon: "cube"
+                    choiceOptions: [
+                        { value: "boulder", label: qsTr("Boulder") },
+                        { value: "boulderx", label: qsTr("Zenith (2011)") },
+                        { value: "zypher", label: qsTr("Zypher (Gen 3)") }
+                    ]
+                    choiceValue: (typeof rubySettings !== "undefined" && rubySettings)
+                                 ? rubySettings.groundGenerator : "zypher"
+                    onChoiceSelected: (value) => {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.groundGenerator = value
+                        }
+                    }
+                }
+            }
+
+            // ── 4. Modding Pipeline & Compiler ──────────────────────────────
+            SectionCard {
+                width: parent.width
+                label: qsTr("Modding Pipeline & Compiler")
+                accentIcon: "tune"
+
+                SettingRow {
+                    title: qsTr("Auto-Compile Protobuf on Save")
+                    description: qsTr("Compile .scl and .scene FileRift markup directly to binary Protobuf")
+                    leadingIcon: "code"
+                    hasSwitch: true
+                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.autoCompileProtobuf : true
+                    onCheckedChanged: {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.autoCompileProtobuf = checked
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: qsTr("Flip Vertical UV (OpenGL)")
+                    description: qsTr("Invert V texture coordinate when converting glTF/FBX/OBJ models to POD")
+                    leadingIcon: "image"
+                    hasSwitch: true
+                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.flipUvOnExport : true
+                    onCheckedChanged: {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.flipUvOnExport = checked
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: qsTr("FileRift Syntax Highlighting")
+                    description: qsTr("Apply syntax color grammar in script editor")
+                    leadingIcon: "braces"
+                    hasSwitch: true
+                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.syntaxHighlighting : true
+                    onCheckedChanged: {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.syntaxHighlighting = checked
+                        }
+                    }
+                }
+
+                SettingRow {
+                    title: qsTr("Code Gutter Line Numbers")
+                    description: qsTr("Show numbered gutter column in script editor")
+                    leadingIcon: "rule"
+                    hasSwitch: true
+                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.lineNumbers : true
+                    onCheckedChanged: {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.lineNumbers = checked
+                        }
+                    }
+                }
+            }
+
+            // ── 5. Workspace & Storage ──────────────────────────────────────
             SectionCard {
                 width: parent.width
                 label: qsTr("Workspace & Storage")
@@ -263,8 +446,6 @@ Item {
                     height: Theme.dp(44)
                     radius: Theme.radiusSm
                     color: Theme.surface2
-                    border.color: Theme.borderSubtle
-                    border.width: 1
 
                     Row {
                         anchors.fill: parent
@@ -285,6 +466,7 @@ Item {
                             text: (typeof rubyFileModel !== "undefined" && rubyFileModel) ? rubyFileModel.currentPath : "/storage/emulated/0"
                             color: Theme.textPrimary
                             font.pixelSize: Theme.dp(Theme.fontSm)
+                            font.family: Theme.monoFamily
                             elide: Text.ElideMiddle
                         }
                     }
@@ -293,200 +475,42 @@ Item {
                 SettingRow {
                     title: qsTr("Clear Recent Assets History")
                     description: {
-                        var count = (typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.recentFiles) ? rubyFileModel.recentFiles.length : 0;
-                        return qsTr("Clear %1 remembered files from Home dashboard").arg(count);
+                        var count = (typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.recentFiles) ? rubyFileModel.recentFiles.length : 0
+                        return qsTr("Clear %1 remembered files from Home dashboard").arg(count)
                     }
                     leadingIcon: "trash"
                     onClicked: clearRecentsDialog.open()
                 }
             }
 
-            // ── Section 3: 3D Scene Viewport & Graphics ─────────────────────
+            // ── 6. Preferences & System ─────────────────────────────────────
             SectionCard {
                 width: parent.width
-                label: qsTr("3D Viewport & Rendering")
-                accentIcon: "view3d"
-
-                SettingRow {
-                    title: qsTr("Ground Reference Grid")
-                    description: qsTr("Draw coordinate reference grid below entities in 3D viewport")
-                    leadingIcon: "grid"
-                    hasSwitch: true
-                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.showGrid : true
-                    onCheckedChanged: {
-                        if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.showGrid = checked;
-                        }
-                    }
-                }
-
-                SettingRow {
-                    title: qsTr("Wireframe Mesh Overlay")
-                    description: qsTr("Render polygonal wireframe edges on 3D entities")
-                    leadingIcon: "cube"
-                    hasSwitch: true
-                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.wireframeMode : false
-                    onCheckedChanged: {
-                        if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.wireframeMode = checked;
-                        }
-                    }
-                }
-
-                SettingRow {
-                    title: qsTr("Multisample Anti-Aliasing (MSAA)")
-                    description: qsTr("4x hardware multisampling for clean geometry edges on GLES 3.0")
-                    leadingIcon: "layers"
-                    hasSwitch: true
-                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.msaaEnabled : true
-                    onCheckedChanged: {
-                        if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.msaaEnabled = checked;
-                        }
-                    }
-                }
-
-                SettingRow {
-                    title: qsTr("Snap Camera on Node Select")
-                    description: qsTr("Smoothly focus camera target when selecting an entity in hierarchy")
-                    leadingIcon: "target"
-                    hasSwitch: true
-                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.snapCamera : true
-                    onCheckedChanged: {
-                        if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.snapCamera = checked;
-                        }
-                    }
-                }
-
-                SettingRow {
-                    title: qsTr("Hold to Select Objects")
-                    description: qsTr("Require a deliberate 0.5s press-and-hold on entities to select them in the 3D scene, preventing accidental taps")
-                    leadingIcon: "hand"
-                    hasSwitch: true
-                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.holdToSelect : false
-                    onCheckedChanged: {
-                        if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.holdToSelect = checked;
-                        }
-                    }
-                }
-
-                // Which generator rebuilds a ground mesh when a mesh edit is
-                // committed. Applies to the next regeneration, not the next
-                // launch. BoulderX is Caver-faithful (concave outlines, arcs,
-                // per-node depth, and boulder's dome hats) and falls back to
-                // Boulder only for a shape it cannot build at all — a degenerate
-                // outline, or one that does not triangulate — which the mesh-edit
-                // HUD reports.
-                SettingRow {
-                    title: qsTr("Ground Mesh Generator")
-                    description: qsTr("Which generator rebuilds a ground mesh when you commit an edit. Zypher (Gen 3) is the modern 3D procedural engine; Zenith is 2011 engine-faithful; Boulder is the legacy flat slab.")
-                    leadingIcon: "cube"
-                    choiceOptions: [
-                        { value: "boulder", label: qsTr("Boulder") },
-                        { value: "boulderx", label: qsTr("Zenith") },
-                        { value: "zypher", label: qsTr("Zypher (Gen 3)") }
-                    ]
-                    // Falls back to the same generator boulderx::ground_generator()
-                    // defaults to, so a missing bridge cannot report the other one.
-                    choiceValue: (typeof rubySettings !== "undefined" && rubySettings)
-                                 ? rubySettings.groundGenerator : "boulder"
-                    onChoiceSelected: (value) => {
-                        if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.groundGenerator = value;
-                        }
-                    }
-                }
-            }
-
-            // ── Section 4: Modding Compiler & Pipeline ──────────────────────
-            SectionCard {
-                width: parent.width
-                label: qsTr("Modding Pipeline & Compiler")
-                accentIcon: "tune"
-
-                SettingRow {
-                    title: qsTr("Auto-Compile Protobuf on Save")
-                    description: qsTr("Compile .scl and .scene FileRift markup directly to binary Protobuf")
-                    leadingIcon: "code"
-                    hasSwitch: true
-                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.autoCompileProtobuf : true
-                    onCheckedChanged: {
-                        if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.autoCompileProtobuf = checked;
-                        }
-                    }
-                }
-
-                SettingRow {
-                    title: qsTr("Flip Vertical UV (OpenGL)")
-                    description: qsTr("Invert V texture coordinate when converting glTF/FBX/OBJ models to POD")
-                    leadingIcon: "image"
-                    hasSwitch: true
-                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.flipUvOnExport : true
-                    onCheckedChanged: {
-                        if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.flipUvOnExport = checked;
-                        }
-                    }
-                }
-
-                SettingRow {
-                    title: qsTr("FileRift Syntax Highlighting")
-                    description: qsTr("Apply syntax color grammar in code and script editor")
-                    leadingIcon: "braces"
-                    hasSwitch: true
-                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.syntaxHighlighting : true
-                    onCheckedChanged: {
-                        if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.syntaxHighlighting = checked;
-                        }
-                    }
-                }
-
-                SettingRow {
-                    title: qsTr("Code Gutter Line Numbers")
-                    description: qsTr("Show numbered gutter column in script editor")
-                    leadingIcon: "rule"
-                    hasSwitch: true
-                    checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.lineNumbers : true
-                    onCheckedChanged: {
-                        if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.lineNumbers = checked;
-                        }
-                    }
-                }
-            }
-
-            // ── Section 5: Experience & Preferences ─────────────────────────
-            SectionCard {
-                width: parent.width
-                label: qsTr("Preferences & Haptics")
+                label: qsTr("Preferences & System")
                 accentIcon: "heart"
 
                 SettingRow {
                     title: qsTr("Haptic Touch Feedback")
-                    description: qsTr("Provide tactile vibrations on button taps and 3D gizmo interactions")
+                    description: qsTr("Provide tactile vibrations on button taps and 3D gizmos")
                     leadingIcon: "sliders"
                     hasSwitch: true
                     checked: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.hapticsEnabled : true
                     onCheckedChanged: {
                         if (typeof rubySettings !== "undefined" && rubySettings) {
-                            rubySettings.hapticsEnabled = checked;
+                            rubySettings.hapticsEnabled = checked
                         }
                     }
                 }
 
                 SettingRow {
                     title: qsTr("Reset All Settings")
-                    description: qsTr("Restore all viewport, compiler, and IDE options to defaults")
+                    description: qsTr("Restore all viewport, compiler, and modding preferences to defaults")
                     leadingIcon: "refresh"
                     onClicked: resetSettingsDialog.open()
                 }
             }
 
-            // ── Section 6: About & Community ────────────────────────────────
+            // ── 7. About & Credits ──────────────────────────────────────────
             SectionCard {
                 width: parent.width
                 label: qsTr("About Ruby Touch (Ruby Mobile)")
@@ -499,7 +523,7 @@ Item {
                     Icon {
                         anchors.verticalCenter: parent.verticalCenter
                         name: "ruby"
-                        size: Theme.dp(24)
+                        size: Theme.dp(26)
                         color: Theme.accentInk
                     }
 
@@ -508,15 +532,18 @@ Item {
                         spacing: Theme.dp(2)
 
                         Text {
-                            text: (typeof rubySettings !== "undefined" && rubySettings && rubySettings.appName) ? rubySettings.appName : qsTr("Ruby Touch (Ruby Mobile)")
+                            text: (typeof rubySettings !== "undefined" && rubySettings && rubySettings.appName)
+                                  ? rubySettings.appName : qsTr("Ruby Touch (Ruby Mobile)")
                             font.pixelSize: Theme.dp(16)
                             font.weight: Font.Bold
                             color: Theme.textPrimary
                         }
 
                         Text {
-                            text: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.appVersion : "v1.4"
+                            text: (typeof rubySettings !== "undefined" && rubySettings)
+                                  ? (rubySettings.appVersion + " • Qt 6.6.3 Android C++20") : "v1.4.4"
                             font.pixelSize: Theme.dp(11)
+                            font.family: Theme.monoFamily
                             color: Theme.textMuted
                         }
                     }
@@ -524,7 +551,7 @@ Item {
 
                 Text {
                     width: parent.width
-                    text: qsTr("The standalone Swordigo 3D level editor, model converter, and FileRift toolchain for Android.\nBuilt with Qt Quick 6.6.3 and native C++20 engine backends.")
+                    text: qsTr("The standalone Swordigo 3D level editor, model converter, and FileRift toolchain for Android.\nResearch and preservation platform for the modding community.")
                     font.pixelSize: Theme.dp(Theme.fontSm)
                     color: Theme.textSecondary
                     lineHeight: 1.35
@@ -533,7 +560,7 @@ Item {
 
                 Text {
                     width: parent.width
-                    text: qsTr("Crafted for the Swordigo Modding Community\nby The Aevora Labs & Quantum Creeper.")
+                    text: qsTr("Crafted for the Swordigo Modding Community by The Aevora Labs & Quantum Creeper.")
                     font.pixelSize: Theme.dp(Theme.fontSm)
                     font.weight: Font.Medium
                     color: Theme.accentInk
@@ -544,33 +571,6 @@ Item {
                     width: parent.width
                     height: 1
                     color: Theme.borderSubtle
-                }
-
-                // ── Provenance ──────────────────────────────────────────────
-                // Read from rubySettings so the desktop and mobile About panels
-                // cannot disagree about who wrote this or under what licence.
-                Row {
-                    width: parent.width
-                    spacing: Theme.dp(Theme.spacingSm)
-
-                    Text {
-                        text: qsTr("COPYRIGHT")
-                        width: Theme.dp(88)
-                        font.pixelSize: Theme.dp(Theme.fontXs)
-                        font.weight: Font.Bold
-                        font.letterSpacing: 1.1
-                        color: Theme.textMuted
-                        topPadding: Theme.dp(2)
-                    }
-
-                    Text {
-                        text: "\u00A9 " + ((typeof rubySettings !== "undefined" && rubySettings)
-                                           ? rubySettings.copyrightHolder : "MrSinup")
-                        width: parent.width - Theme.dp(88) - Theme.dp(Theme.spacingSm)
-                        font.pixelSize: Theme.dp(Theme.fontSm)
-                        color: Theme.textPrimary
-                        wrapMode: Text.WordWrap
-                    }
                 }
 
                 Row {
@@ -584,65 +584,16 @@ Item {
                         font.weight: Font.Bold
                         font.letterSpacing: 1.1
                         color: Theme.textMuted
-                        topPadding: Theme.dp(2)
                     }
 
                     Text {
                         width: parent.width - Theme.dp(88) - Theme.dp(Theme.spacingSm)
-                        text: ((typeof rubySettings !== "undefined" && rubySettings)
-                               ? rubySettings.licenseName : "GNU General Public License v3.0")
-                        font.pixelSize: Theme.dp(Theme.fontSm)
-                        color: Theme.textPrimary
-                        wrapMode: Text.WordWrap
-                    }
-                }
-
-                Row {
-                    width: parent.width
-                    spacing: Theme.dp(Theme.spacingSm)
-
-                    Text {
-                        text: qsTr("PUBLISHED BY")
-                        width: Theme.dp(88)
-                        font.pixelSize: Theme.dp(Theme.fontXs)
-                        font.weight: Font.Bold
-                        font.letterSpacing: 1.1
-                        color: Theme.textMuted
-                        topPadding: Theme.dp(2)
-                    }
-
-                    Text {
                         text: (typeof rubySettings !== "undefined" && rubySettings)
-                              ? rubySettings.vendorName : "Aevora Labs"
-                        width: parent.width - Theme.dp(88) - Theme.dp(Theme.spacingSm)
+                              ? rubySettings.licenseName : "GNU General Public License v3.0"
                         font.pixelSize: Theme.dp(Theme.fontSm)
                         color: Theme.textPrimary
                         wrapMode: Text.WordWrap
                     }
-                }
-
-                Text {
-                    width: parent.width
-                    text: qsTr("This program is free software: you can redistribute it and/or modify it "
-                               + "under the terms of the GNU General Public License as published by the "
-                               + "Free Software Foundation, either version 3 of the License, or (at your "
-                               + "option) any later version. It is distributed in the hope that it will "
-                               + "be useful, but WITHOUT ANY WARRANTY; without even the implied warranty "
-                               + "of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.")
-                    font.pixelSize: Theme.dp(Theme.fontXs)
-                    color: Theme.textMuted
-                    lineHeight: 1.35
-                    wrapMode: Text.WordWrap
-                }
-
-                Text {
-                    width: parent.width
-                    text: qsTr("Swordigo is \u00A9 Ville M\u00E4kynen / Touch Foo. Ruby Touch (Ruby Mobile) ships no original "
-                               + "assets or binaries and is a research and preservation effort only.")
-                    font.pixelSize: Theme.dp(Theme.fontXs)
-                    color: Theme.textMuted
-                    lineHeight: 1.35
-                    wrapMode: Text.WordWrap
                 }
             }
         }
@@ -657,7 +608,7 @@ Item {
         acceptText: qsTr("Save Name")
         onAccepted: (val) => {
             if (typeof rubySettings !== "undefined" && rubySettings) {
-                rubySettings.userName = val;
+                rubySettings.userName = val
             }
         }
     }
@@ -670,7 +621,7 @@ Item {
         danger: true
         onConfirmed: {
             if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
-                rubyFileModel.clearRecentFiles();
+                rubyFileModel.clearRecentFiles()
             }
         }
     }
@@ -683,7 +634,7 @@ Item {
         danger: true
         onConfirmed: {
             if (typeof rubySettings !== "undefined" && rubySettings) {
-                rubySettings.resetToDefaults();
+                rubySettings.resetToDefaults()
             }
         }
     }

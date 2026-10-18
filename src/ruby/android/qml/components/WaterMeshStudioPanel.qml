@@ -201,14 +201,22 @@ Rectangle {
         root.internalColorSync = false;
     }
 
-    function setHazardProperty(prop, value) {
+    function setHazardProperties(propsMap) {
         if (!root.host || !root.host.isSelectedWater) return;
         var p = root.host.getSelectedWaterProperties();
-        p[prop] = value;
+        for (var k in propsMap) {
+            p[k] = propsMap[k];
+        }
         root.host.setSelectedWaterProperties(p);
         root.refreshProperties();
         if (typeof screenOrientation !== "undefined" && screenOrientation)
             screenOrientation.vibrateTouch(15);
+    }
+
+    function setHazardProperty(prop, value) {
+        var m = {};
+        m[prop] = value;
+        setHazardProperties(m);
     }
 
     function applyFluidSwatch(swatch) {
@@ -399,14 +407,14 @@ Rectangle {
             // 1. Dimensions & Bounds
             SectionCard {
                 width: parent.width
-                label: qsTr("Dimensions & Position")
+                label: qsTr("Mesh Dimensions & Extrusion")
                 accentIcon: "cube"
 
                 Column {
                     width: parent.width
                     spacing: Theme.dp(Theme.spacingSm)
 
-                    // Width & Depth steppers
+                    // 1. Primary Mesh Dimensions: Width, Height, and Mesh Z Depth
                     RowLayout {
                         width: parent.width
                         spacing: Theme.dp(Theme.spacingSm)
@@ -442,12 +450,12 @@ Rectangle {
                             }
                         }
 
-                        // Depth
+                        // Height (Extents)
                         ColumnLayout {
                             Layout.fillWidth: true
                             spacing: Theme.dp(2)
 
-                            FieldLabel { text: qsTr("Depth (Height)") }
+                            FieldLabel { text: qsTr("Height") }
                             RowLayout {
                                 spacing: Theme.dp(4)
                                 IconButton {
@@ -472,9 +480,10 @@ Rectangle {
                                 }
                             }
                         }
+
                     }
 
-                    // Position X & Y steppers
+                    // 2. Object World Position (Pos X, Pos Y, and World Layer Z)
                     RowLayout {
                         width: parent.width
                         spacing: Theme.dp(Theme.spacingSm)
@@ -484,13 +493,13 @@ Rectangle {
                             Layout.fillWidth: true
                             spacing: Theme.dp(2)
 
-                            FieldLabel { text: qsTr("Position X") }
+                            FieldLabel { text: qsTr("World Pos X") }
                             RowLayout {
                                 spacing: Theme.dp(4)
                                 IconButton {
                                     iconName: "minus"
-                                    buttonSize: Theme.dp(30)
-                                    iconSize: Theme.dp(12)
+                                    buttonSize: Theme.dp(28)
+                                    iconSize: Theme.dp(11)
                                     onClicked: root.adjustDimension("x", -20)
                                 }
                                 Text {
@@ -503,8 +512,8 @@ Rectangle {
                                 }
                                 IconButton {
                                     iconName: "plus"
-                                    buttonSize: Theme.dp(30)
-                                    iconSize: Theme.dp(12)
+                                    buttonSize: Theme.dp(28)
+                                    iconSize: Theme.dp(11)
                                     onClicked: root.adjustDimension("x", 20)
                                 }
                             }
@@ -515,13 +524,13 @@ Rectangle {
                             Layout.fillWidth: true
                             spacing: Theme.dp(2)
 
-                            FieldLabel { text: qsTr("Position Y") }
+                            FieldLabel { text: qsTr("World Pos Y") }
                             RowLayout {
                                 spacing: Theme.dp(4)
                                 IconButton {
                                     iconName: "minus"
-                                    buttonSize: Theme.dp(30)
-                                    iconSize: Theme.dp(12)
+                                    buttonSize: Theme.dp(28)
+                                    iconSize: Theme.dp(11)
                                     onClicked: root.adjustDimension("y", -20)
                                 }
                                 Text {
@@ -534,10 +543,229 @@ Rectangle {
                                 }
                                 IconButton {
                                     iconName: "plus"
-                                    buttonSize: Theme.dp(30)
-                                    iconSize: Theme.dp(12)
+                                    buttonSize: Theme.dp(28)
+                                    iconSize: Theme.dp(11)
                                     onClicked: root.adjustDimension("y", 20)
                                 }
+                            }
+                        }
+
+                        // Layer Z (World Translation)
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.dp(2)
+
+                            FieldLabel { text: qsTr("World Layer Z") }
+                            RowLayout {
+                                spacing: Theme.dp(4)
+                                IconButton {
+                                    iconName: "minus"
+                                    buttonSize: Theme.dp(28)
+                                    iconSize: Theme.dp(11)
+                                    onClicked: root.adjustDimension("posZ", -5)
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    text: Number(root.currentProps.posZ !== undefined ? root.currentProps.posZ : (root.currentProps.z || 0)).toFixed(0)
+                                    font.pixelSize: Theme.dp(Theme.fontSm)
+                                    font.weight: Font.Bold
+                                    color: "#a855f7"
+                                }
+                                IconButton {
+                                    iconName: "plus"
+                                    buttonSize: Theme.dp(28)
+                                    iconSize: Theme.dp(11)
+                                    onClicked: root.adjustDimension("posZ", 5)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3D Fluid Extension (Recursive Sheeting)
+            SectionCard {
+                width: parent.width
+                label: qsTr("3D Fluid Extension (Sheets)")
+                accentIcon: "layers"
+
+                Column {
+                    width: parent.width
+                    spacing: Theme.dp(Theme.spacingSm)
+
+                    // Total fluid depth badge
+                    Rectangle {
+                        width: parent.width
+                        height: Theme.dp(28)
+                        radius: Theme.radiusSm
+                        color: Theme.alpha("#06b6d4", 0.15)
+                        border.color: Theme.alpha("#06b6d4", 0.4)
+                        border.width: 1
+
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: Theme.dp(10)
+                            anchors.rightMargin: Theme.dp(10)
+
+                            Text {
+                                text: qsTr("TOTAL FLUID DEPTH")
+                                font.pixelSize: Theme.dp(9)
+                                font.weight: Font.Bold
+                                color: Theme.alpha("#06b6d4", 0.8)
+                            }
+
+                            Item { Layout.fillWidth: true }
+
+                            Text {
+                                text: {
+                                    var sf = Number(root.currentProps.sheetsFront || 0);
+                                    var sb = Number(root.currentProps.sheetsBack || 0);
+                                    var tot = 1 + sf + sb;
+                                    return qsTr("%1 Sheets (%2 u)").arg(tot).arg(tot * 60);
+                                }
+                                font.pixelSize: Theme.dp(11)
+                                font.weight: Font.Bold
+                                color: "#06b6d4"
+                            }
+                        }
+                    }
+
+                    // Front & Back Sheets Steppers
+                    RowLayout {
+                        width: parent.width
+                        spacing: Theme.dp(Theme.spacingSm)
+
+                        // Front Extension (+Z) Stepper
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.dp(2)
+
+                            FieldLabel { text: qsTr("Front Sheets (+Z)") }
+                            RowLayout {
+                                spacing: Theme.dp(4)
+                                IconButton {
+                                    iconName: "minus"
+                                    buttonSize: Theme.dp(30)
+                                    iconSize: Theme.dp(12)
+                                    onClicked: {
+                                        if (root.host && root.host.removeWaterSheetFront) {
+                                            root.host.removeWaterSheetFront();
+                                            root.refreshProperties();
+                                            if (typeof screenOrientation !== "undefined" && screenOrientation)
+                                                screenOrientation.vibrateTouch(15);
+                                        }
+                                    }
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    text: qsTr("+%1").arg(Number(root.currentProps.sheetsFront || 0))
+                                    font.pixelSize: Theme.dp(Theme.fontSm)
+                                    font.weight: Font.Bold
+                                    color: "#06b6d4"
+                                }
+                                IconButton {
+                                    iconName: "plus"
+                                    buttonSize: Theme.dp(30)
+                                    iconSize: Theme.dp(12)
+                                    onClicked: {
+                                        if (root.host && root.host.addWaterSheetFront) {
+                                            root.host.addWaterSheetFront();
+                                            root.refreshProperties();
+                                            if (typeof screenOrientation !== "undefined" && screenOrientation)
+                                                screenOrientation.vibrateTouch(15);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Back Extension (-Z) Stepper
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: Theme.dp(2)
+
+                            FieldLabel { text: qsTr("Back Sheets (-Z)") }
+                            RowLayout {
+                                spacing: Theme.dp(4)
+                                IconButton {
+                                    iconName: "minus"
+                                    buttonSize: Theme.dp(30)
+                                    iconSize: Theme.dp(12)
+                                    onClicked: {
+                                        if (root.host && root.host.removeWaterSheetBack) {
+                                            root.host.removeWaterSheetBack();
+                                            root.refreshProperties();
+                                            if (typeof screenOrientation !== "undefined" && screenOrientation)
+                                                screenOrientation.vibrateTouch(15);
+                                        }
+                                    }
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    horizontalAlignment: Text.AlignHCenter
+                                    text: qsTr("+%1").arg(Number(root.currentProps.sheetsBack || 0))
+                                    font.pixelSize: Theme.dp(Theme.fontSm)
+                                    font.weight: Font.Bold
+                                    color: "#06b6d4"
+                                }
+                                IconButton {
+                                    iconName: "plus"
+                                    buttonSize: Theme.dp(30)
+                                    iconSize: Theme.dp(12)
+                                    onClicked: {
+                                        if (root.host && root.host.addWaterSheetBack) {
+                                            root.host.addWaterSheetBack();
+                                            root.refreshProperties();
+                                            if (typeof screenOrientation !== "undefined" && screenOrientation)
+                                                screenOrientation.vibrateTouch(15);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Extent & World Readouts
+                    Rectangle {
+                        width: parent.width
+                        height: Theme.dp(48)
+                        radius: Theme.radiusSm
+                        color: Theme.alpha(Theme.surface2, 0.6)
+                        border.color: Theme.alpha(Theme.border, 0.4)
+                        border.width: 1
+
+                        ColumnLayout {
+                            anchors.fill: parent
+                            anchors.margins: Theme.dp(6)
+                            spacing: Theme.dp(2)
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: qsTr("Front Extent: +%1 u").arg(Number(root.currentProps.frontZ !== undefined ? root.currentProps.frontZ : 40).toFixed(0))
+                                    font.pixelSize: Theme.dp(10)
+                                    font.weight: Font.DemiBold
+                                    color: "#06b6d4"
+                                }
+                                Text {
+                                    Layout.fillWidth: true
+                                    horizontalAlignment: Text.AlignRight
+                                    text: qsTr("Back Extent: %1 u").arg(Number(root.currentProps.backZ !== undefined ? root.currentProps.backZ : -20).toFixed(0))
+                                    font.pixelSize: Theme.dp(10)
+                                    font.weight: Font.DemiBold
+                                    color: "#06b6d4"
+                                }
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                text: qsTr("World Z Span: [%1 .. %2]").arg(Number(root.currentProps.worldBackZ !== undefined ? root.currentProps.worldBackZ : 0).toFixed(0)).arg(Number(root.currentProps.worldFrontZ !== undefined ? root.currentProps.worldFrontZ : 0).toFixed(0))
+                                font.pixelSize: Theme.dp(10)
+                                font.weight: Font.Medium
+                                color: Theme.textSecondary
                             }
                         }
                     }
@@ -1159,8 +1387,7 @@ Rectangle {
                                     onClicked: {
                                         var cur = Number(root.currentProps.minDamage || 4)
                                         var updated = Math.max(1, cur - 1)
-                                        root.setHazardProperty("minDamage", updated)
-                                        root.setHazardProperty("maxDamage", updated)
+                                        root.setHazardProperties({ "minDamage": updated, "maxDamage": updated })
                                     }
                                 }
 
@@ -1176,10 +1403,10 @@ Rectangle {
                                         anchors.centerIn: parent
                                         spacing: Theme.dp(4)
                                         Icon {
-                                            name: "bolt"
-                                            size: Theme.dp(12)
-                                            color: "#ef4444"
-                                            anchors.verticalCenter: parent.verticalCenter
+                                             name: "bolt"
+                                             size: Theme.dp(12)
+                                             color: "#ef4444"
+                                             anchors.verticalCenter: parent.verticalCenter
                                         }
                                         Text {
                                             text: qsTr("%1 Hearts").arg(Number(root.currentProps.minDamage || 4).toFixed(0))
@@ -1198,8 +1425,7 @@ Rectangle {
                                     onClicked: {
                                         var cur = Number(root.currentProps.minDamage || 4)
                                         var updated = Math.min(20, cur + 1)
-                                        root.setHazardProperty("minDamage", updated)
-                                        root.setHazardProperty("maxDamage", updated)
+                                        root.setHazardProperties({ "minDamage": updated, "maxDamage": updated })
                                     }
                                 }
                             }
@@ -1351,11 +1577,16 @@ Rectangle {
     function adjustDimension(prop, delta) {
         if (!root.host || !root.host.isSelectedWater) return
         var p = root.host.getSelectedWaterProperties()
-        var current = Number(p[prop] || 0)
+        var current = Number(p[prop] !== undefined ? p[prop] : 0)
         var updated = current + delta
         if (prop === "width" && updated < 20) updated = 20
         if (prop === "height" && updated < 20) updated = 20
         p[prop] = updated
+        if (prop === "posZ" || prop === "z" || prop === "depth") {
+            p["posZ"] = updated
+            p["z"] = updated
+            p["depth"] = updated
+        }
         root.host.setSelectedWaterProperties(p)
         root.refreshProperties()
         if (typeof screenOrientation !== "undefined" && screenOrientation)

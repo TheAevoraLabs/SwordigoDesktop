@@ -6526,6 +6526,7 @@ bool Viewport3DWidget::mesh_apply() {
         // engine law is not re-applied here on purpose: it would overwrite the
         // sculpt, which is the "my edit snapped back to vanilla" complaint.
         params.depth_source = boulderx::Params::DepthSource::Outline;
+        params.z = m_mesh_z;
 
         const int ids6[6] = {m_mesh_ids.polygon_id, m_mesh_ids.mesh_id,
                              m_mesh_ids.generator_id, m_mesh_ids.collision_id,

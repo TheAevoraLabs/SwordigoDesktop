@@ -61,9 +61,12 @@ Instead of relying on heavy OS virtualization, Android containers, or slow emula
 * **Embedded Offline Git (`src/ruby/git/`)**: Embedded static `libgit2` implementation with zero external shared library dependencies, powering local history, visual diffing, and revision rollbacks.
 
 ### 3.2 Ruby Touch (Ruby Mobile) (`src/ruby/android/`)
-* **Standalone Mobile Distribution**: Ruby Touch (also known as **Ruby Mobile**, formerly Ruby GG Mobile) brings the 3D scene studio and terrain modding capabilities directly to Android smartphones and tablets.
+* **Standalone Mobile Distribution**: Ruby Touch (also known as **Ruby Mobile**, formerly Ruby GG Mobile) brings the 3D scene studio, terrain modding, and volumetric fluid editing capabilities directly to Android smartphones and tablets.
 * **Touch-Optimized Controls**: Dual floating thumbsticks for 3D camera translation, orbit, and elevation with hardware refresh rates up to 120Hz.
 * **Ground Mesh Studio**: Direct 3D vertex manipulation via ray-plane touch projection, diamond vertex selection handles, and non-destructive in-place topology updates.
+* **Volumetric Water Mesh Studio**: Multi-sheet water volume generation and synchronized multi-sheet editing, decomp-faithful 4-corner Water Box HUD (`x, y, width, height`), 3D fluid cage overlay with animated wave crest, and interactive HSV spectrum color picker.
+* **Index-FM Remastered File Manager**: High-performance dual-mode (Grid & List) mobile file browser with batch operations (Copy, Cut, Delete), Places Drawer, file preview modal, and real-time search filter engine.
+* **Studio Dark UI Remaster**: Modern edge-to-edge Material 3-inspired mobile interface featuring 6 studio themes (Ruby Dark, Obsidian AMOLED, Cyber Synth, Emerald Grove, Royal Violet, Nord Frost), customizable studio identities, and 7 vector avatars.
 * **In-Place Biome Texturing**: Instant surface cap and vertical cliff texture swapping with 10 authentic game biome presets and local modder preset storage.
 * **Standalone Distribution**: Packaged and mirrored as the lightweight standalone repository [RubyTouch](https://github.com/TheAevoraLabs/RubyTouch).
 

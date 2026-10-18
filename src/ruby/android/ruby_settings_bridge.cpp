@@ -139,6 +139,31 @@ void RubySettingsBridge::setGroundGenerator(const QString& id) {
     if (changed) emit groundGeneratorChanged(resolved);
 }
 
+QString RubySettingsBridge::themeId() const {
+    QSettings s;
+    QString id = s.value(QStringLiteral("ruby_mobile/theme_id"), QStringLiteral("oled")).toString().trimmed().toLower();
+    if (id != QLatin1String("oled") && id != QLatin1String("obsidian") &&
+        id != QLatin1String("cyber") && id != QLatin1String("nordic") &&
+        id != QLatin1String("monolith")) {
+        return QStringLiteral("oled");
+    }
+    return id;
+}
+
+void RubySettingsBridge::setThemeId(const QString& id) {
+    QString normalized = id.trimmed().toLower();
+    if (normalized != QLatin1String("oled") && normalized != QLatin1String("obsidian") &&
+        normalized != QLatin1String("cyber") && normalized != QLatin1String("nordic") &&
+        normalized != QLatin1String("monolith")) {
+        normalized = QStringLiteral("oled");
+    }
+    QSettings s;
+    if (s.value(QStringLiteral("ruby_mobile/theme_id")).toString() != normalized) {
+        s.setValue(QStringLiteral("ruby_mobile/theme_id"), normalized);
+        emit themeIdChanged(normalized);
+    }
+}
+
 int RubySettingsBridge::nameDatabaseCount() const {
     return int(sizeof(s_names200) / sizeof(s_names200[0]));
 }
@@ -175,6 +200,44 @@ void RubySettingsBridge::setUserTitle(const QString& title) {
         s.setValue(QStringLiteral("ruby_mobile/user_title"), trimmed);
         emit userTitleChanged(trimmed);
     }
+}
+
+QStringList RubySettingsBridge::getPresetAvatars() const {
+    return {
+        QStringLiteral("qrc:/svg/avatar_ruby_gem.svg"),
+        QStringLiteral("qrc:/svg/avatar_hero_sword.svg"),
+        QStringLiteral("qrc:/svg/avatar_cyber_ninja.svg"),
+        QStringLiteral("qrc:/svg/avatar_dragon_crest.svg"),
+        QStringLiteral("qrc:/svg/avatar_wizard_spark.svg"),
+        QStringLiteral("qrc:/svg/avatar_pixel_ghost.svg"),
+        QStringLiteral("qrc:/svg/avatar_zenith_core.svg")
+    };
+}
+
+QString RubySettingsBridge::avatarImage() const {
+    QSettings s;
+    return s.value(QStringLiteral("ruby_mobile/avatar_image"), QStringLiteral("qrc:/svg/avatar_ruby_gem.svg")).toString();
+}
+
+void RubySettingsBridge::setAvatarImage(const QString& path) {
+    QSettings s;
+    if (s.value(QStringLiteral("ruby_mobile/avatar_image")).toString() != path) {
+        s.setValue(QStringLiteral("ruby_mobile/avatar_image"), path);
+        emit avatarImageChanged(path);
+    }
+}
+
+QString RubySettingsBridge::randomizeAvatarImage() {
+    const QStringList presets = getPresetAvatars();
+    if (presets.isEmpty()) return QString();
+    QString cur = avatarImage();
+    int idx = QRandomGenerator::global()->bounded(presets.size());
+    if (presets[idx] == cur && presets.size() > 1) {
+        idx = (idx + 1) % presets.size();
+    }
+    QString nextAvatar = presets[idx];
+    setAvatarImage(nextAvatar);
+    return nextAvatar;
 }
 
 QString RubySettingsBridge::getRandomName() const {
@@ -355,7 +418,9 @@ void RubySettingsBridge::resetToDefaults() {
     setEditorFontSize(13);
     setHapticsEnabled(true);
     setGroundGenerator(QStringLiteral("zypher"));
+    setThemeId(QStringLiteral("oled"));
     setUserTitle(QStringLiteral("Swordigo Modder"));
+    setAvatarImage(QStringLiteral("qrc:/svg/avatar_ruby_gem.svg"));
 }
 
 // ── Zypher look ──────────────────────────────────────────────────────────────

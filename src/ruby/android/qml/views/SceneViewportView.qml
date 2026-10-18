@@ -709,238 +709,309 @@ Item {
         anchors.topMargin: root.width > root.height ? Theme.dp(6) : Theme.dp(8)
         anchors.rightMargin: root.width > root.height ? Theme.dp(6) : 0
         height: Theme.dp(40)
-        width: waterToolbarRow.implicitWidth + Theme.dp(20)
+        width: Math.min(parent.width - Theme.dp(16), waterToolbarRow.implicitWidth + Theme.dp(24))
         z: 30
         visible: viewportItem.waterEditActive
+        clip: true
 
-        Row {
-            id: waterToolbarRow
-            anchors.centerIn: parent
-            spacing: Theme.dp(5)
+        Flickable {
+            id: waterToolbarFlickable
+            anchors.fill: parent
+            contentWidth: waterToolbarRow.implicitWidth + Theme.dp(16)
+            contentHeight: height
+            flickableDirection: Flickable.HorizontalFlick
+            boundsBehavior: Flickable.StopAtBounds
+            clip: true
 
-            // Identity Badge
-            Rectangle {
+            Row {
+                id: waterToolbarRow
                 anchors.verticalCenter: parent.verticalCenter
-                height: Theme.dp(28)
-                width: wBadgeRow.implicitWidth + Theme.dp(12)
-                radius: Theme.radiusSm
-                color: Theme.alpha("#06b6d4", 0.22)
-                border.color: "#06b6d4"
-                border.width: 1
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.dp(8)
+                spacing: Theme.dp(5)
 
-                Row {
-                    id: wBadgeRow
-                    anchors.centerIn: parent
-                    spacing: Theme.dp(3)
-                    Icon { name: "water"; size: Theme.dp(12); color: "#06b6d4" }
-                    Text { text: qsTr("W-Mesh"); font.pixelSize: Theme.dp(11); font.weight: Font.Bold; color: "#06b6d4" }
-                }
-            }
+                // Identity & Dimension Badge
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: Theme.dp(28)
+                    width: wBadgeRow.implicitWidth + Theme.dp(12)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha("#06b6d4", 0.22)
+                    border.color: "#06b6d4"
+                    border.width: 1
 
-            // Discard Button
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                height: Theme.dp(28)
-                width: discardWRow.implicitWidth + Theme.dp(12)
-                radius: Theme.radiusSm
-                color: Theme.alpha(Theme.surface2, 0.9)
-                border.color: Theme.borderSubtle
-                border.width: 1
-                Row {
-                    id: discardWRow
-                    anchors.centerIn: parent
-                    spacing: Theme.dp(3)
-                    Icon { name: "close"; size: Theme.dp(13); color: Theme.colorErrorBright }
-                    Text { text: qsTr("Discard"); font.pixelSize: Theme.dp(11); font.weight: Font.Medium; color: Theme.textPrimary }
-                }
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
-                        viewportItem.discardWaterMeshEdit()
+                    Row {
+                        id: wBadgeRow
+                        anchors.centerIn: parent
+                        spacing: Theme.dp(4)
+                        Icon { name: "water"; size: Theme.dp(12); color: "#06b6d4" }
+                        Text {
+                            text: qsTr("Water %1×%2").arg(Math.round(viewportItem.waterEditWidth)).arg(Math.round(viewportItem.waterEditHeight))
+                            font.pixelSize: Theme.dp(11)
+                            font.weight: Font.Bold
+                            color: "#06b6d4"
+                        }
                     }
                 }
-            }
 
-            // Reset to Rect Button
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                height: Theme.dp(28)
-                width: resetRectRow.implicitWidth + Theme.dp(10)
-                radius: Theme.radiusSm
-                color: Theme.alpha(Theme.surface2, 0.9)
-                border.color: Theme.borderSubtle
-                border.width: 1
+                // Discard Button
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: Theme.dp(28)
+                    width: discardWRow.implicitWidth + Theme.dp(10)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.9)
+                    border.color: Theme.borderSubtle
+                    border.width: 1
+                    Row {
+                        id: discardWRow
+                        anchors.centerIn: parent
+                        spacing: Theme.dp(3)
+                        Icon { name: "close"; size: Theme.dp(13); color: Theme.colorErrorBright }
+                        Text { text: qsTr("Discard"); font.pixelSize: Theme.dp(11); font.weight: Font.Medium; color: Theme.textPrimary }
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
+                            viewportItem.discardWaterMeshEdit()
+                        }
+                    }
+                }
+
+                // Reset to Rect Button
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: Theme.dp(28)
+                    width: resetRectRow.implicitWidth + Theme.dp(8)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.9)
+                    border.color: Theme.borderSubtle
+                    border.width: 1
+                    Row {
+                        id: resetRectRow
+                        anchors.centerIn: parent
+                        spacing: Theme.dp(3)
+                        Icon { name: "rotate"; size: Theme.dp(12); color: Theme.textSecondary }
+                        Text { text: qsTr("Reset"); font.pixelSize: Theme.dp(11); color: Theme.textSecondary }
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(20)
+                            viewportItem.resetWaterEditToRect()
+                        }
+                    }
+                }
+
+                // Divider
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 1
+                    height: Theme.dp(18)
+                    color: Theme.borderSubtle
+                }
+
+                // Previous Corner Button
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Theme.dp(24)
+                    height: Theme.dp(28)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.85)
+                    border.color: Theme.borderSubtle
+                    border.width: 1
+                    Icon {
+                        anchors.centerIn: parent
+                        name: "chevron-left"
+                        size: Theme.dp(12)
+                        color: Theme.textPrimary
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                            viewportItem.selectPrevWaterVertex()
+                        }
+                    }
+                }
+
+                // Corner Name Badge
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: Theme.dp(28)
+                    width: wVertBadgeText.implicitWidth + Theme.dp(12)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha("#06b6d4", 0.18)
+                    border.color: Theme.alpha("#06b6d4", 0.50)
+                    border.width: 1
+                    Text {
+                        id: wVertBadgeText
+                        anchors.centerIn: parent
+                        readonly property var cornerNames: ["TL", "TR", "BR", "BL"]
+                        text: cornerNames[viewportItem.selectedWaterVertex % 4] || "TL"
+                        font.pixelSize: Theme.dp(10)
+                        font.weight: Font.Bold
+                        color: "#06b6d4"
+                    }
+                }
+
+                // Next Corner Button
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Theme.dp(24)
+                    height: Theme.dp(28)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.85)
+                    border.color: Theme.borderSubtle
+                    border.width: 1
+                    Icon {
+                        anchors.centerIn: parent
+                        name: "chevron-right"
+                        size: Theme.dp(12)
+                        color: Theme.textPrimary
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                            viewportItem.selectNextWaterVertex()
+                        }
+                    }
+                }
+
+                // Divider
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 1
+                    height: Theme.dp(18)
+                    color: Theme.borderSubtle
+                }
+
+                // Width Steppers: [-] W [+]
                 Row {
-                    id: resetRectRow
-                    anchors.centerIn: parent
-                    spacing: Theme.dp(3)
-                    Icon { name: "rotate"; size: Theme.dp(12); color: Theme.textSecondary }
-                    Text { text: qsTr("Reset Rect"); font.pixelSize: Theme.dp(11); color: Theme.textSecondary }
-                }
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(20)
-                        viewportItem.resetWaterEditToRect()
-                    }
-                }
-            }
-
-            // Divider
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                width: 1
-                height: Theme.dp(18)
-                color: Theme.borderSubtle
-            }
-
-            // Previous Vertex Button
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                width: Theme.dp(26)
-                height: Theme.dp(28)
-                radius: Theme.radiusSm
-                color: Theme.alpha(Theme.surface2, 0.85)
-                border.color: Theme.borderSubtle
-                border.width: 1
-                Icon {
-                    anchors.centerIn: parent
-                    name: "chevron-left"
-                    size: Theme.dp(13)
-                    color: Theme.textPrimary
-                }
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
-                        viewportItem.selectPrevWaterVertex()
-                    }
-                }
-            }
-
-            // Vertex Index Badge
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                height: Theme.dp(28)
-                width: wVertBadgeText.implicitWidth + Theme.dp(14)
-                radius: Theme.radiusSm
-                color: Theme.alpha("#06b6d4", 0.18)
-                border.color: Theme.alpha("#06b6d4", 0.50)
-                border.width: 1
-                Text {
-                    id: wVertBadgeText
-                    anchors.centerIn: parent
-                    text: qsTr("V %1/%2").arg(viewportItem.selectedWaterVertex + 1).arg(viewportItem.waterVertexCount)
-                    font.pixelSize: Theme.dp(10)
-                    font.weight: Font.Bold
-                    color: "#06b6d4"
-                }
-            }
-
-            // Next Vertex Button
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                width: Theme.dp(26)
-                height: Theme.dp(28)
-                radius: Theme.radiusSm
-                color: Theme.alpha(Theme.surface2, 0.85)
-                border.color: Theme.borderSubtle
-                border.width: 1
-                Icon {
-                    anchors.centerIn: parent
-                    name: "chevron-right"
-                    size: Theme.dp(13)
-                    color: Theme.textPrimary
-                }
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
-                        viewportItem.selectNextWaterVertex()
-                    }
-                }
-            }
-
-            // Add Point Button
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                height: Theme.dp(28)
-                width: addPointRow.implicitWidth + Theme.dp(12)
-                radius: Theme.radiusSm
-                color: Theme.alpha(Theme.surface3, 0.9)
-                border.color: "#06b6d4"
-                border.width: 1
-                Row {
-                    id: addPointRow
-                    anchors.centerIn: parent
-                    spacing: Theme.dp(3)
-                    Icon { name: "plus"; size: Theme.dp(12); color: "#06b6d4" }
-                    Text { text: qsTr("Point"); font.pixelSize: Theme.dp(11); font.weight: Font.DemiBold; color: "#06b6d4" }
-                }
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
-                        viewportItem.insertWaterVertex(viewportItem.selectedWaterVertex, 0, 0)
-                    }
-                }
-            }
-
-            // Delete Point Button
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                height: Theme.dp(28)
-                width: delPointRow.implicitWidth + Theme.dp(10)
-                radius: Theme.radiusSm
-                color: Theme.alpha(Theme.surface2, 0.9)
-                border.color: Theme.borderSubtle
-                border.width: 1
-                enabled: viewportItem.waterVertexCount > 3
-                opacity: enabled ? 1.0 : 0.4
-                Row {
-                    id: delPointRow
-                    anchors.centerIn: parent
+                    anchors.verticalCenter: parent.verticalCenter
                     spacing: Theme.dp(2)
-                    Icon { name: "trash"; size: Theme.dp(12); color: Theme.colorDanger }
-                    Text { text: qsTr("Del"); font.pixelSize: Theme.dp(11); color: Theme.colorDanger }
-                }
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
-                        viewportItem.deleteWaterVertex(viewportItem.selectedWaterVertex)
+
+                    Rectangle {
+                        width: Theme.dp(22)
+                        height: Theme.dp(28)
+                        radius: Theme.radiusSm
+                        color: Theme.alpha(Theme.surface2, 0.85)
+                        border.color: Theme.borderSubtle
+                        border.width: 1
+                        Text { anchors.centerIn: parent; text: "-"; font.pixelSize: Theme.dp(13); font.weight: Font.Bold; color: Theme.textPrimary }
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                                viewportItem.adjustWaterWidth(-20.0)
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: Theme.dp(28)
+                        width: wText.implicitWidth + Theme.dp(8)
+                        radius: Theme.radiusSm
+                        color: Theme.alpha(Theme.surface3, 0.6)
+                        border.color: Theme.borderSubtle
+                        border.width: 1
+                        Text { id: wText; anchors.centerIn: parent; text: qsTr("W"); font.pixelSize: Theme.dp(10); font.weight: Font.Bold; color: Theme.textSecondary }
+                    }
+                    Rectangle {
+                        width: Theme.dp(22)
+                        height: Theme.dp(28)
+                        radius: Theme.radiusSm
+                        color: Theme.alpha(Theme.surface2, 0.85)
+                        border.color: Theme.borderSubtle
+                        border.width: 1
+                        Text { anchors.centerIn: parent; text: "+"; font.pixelSize: Theme.dp(13); font.weight: Font.Bold; color: Theme.textPrimary }
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                                viewportItem.adjustWaterWidth(20.0)
+                            }
+                        }
                     }
                 }
-            }
 
-            // Divider
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                width: 1
-                height: Theme.dp(18)
-                color: Theme.borderSubtle
-            }
-
-            // Apply Button
-            Rectangle {
-                anchors.verticalCenter: parent.verticalCenter
-                height: Theme.dp(28)
-                width: applyWRow.implicitWidth + Theme.dp(14)
-                radius: Theme.radiusSm
-                color: Theme.colorSuccess
+                // Height Steppers: [-] H [+]
                 Row {
-                    id: applyWRow
-                    anchors.centerIn: parent
-                    spacing: Theme.dp(3)
-                    Icon { name: "check"; size: Theme.dp(13); color: "#ffffff" }
-                    Text { text: qsTr("Apply"); font.pixelSize: Theme.dp(11); font.weight: Font.Bold; color: "#ffffff" }
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.dp(2)
+
+                    Rectangle {
+                        width: Theme.dp(22)
+                        height: Theme.dp(28)
+                        radius: Theme.radiusSm
+                        color: Theme.alpha(Theme.surface2, 0.85)
+                        border.color: Theme.borderSubtle
+                        border.width: 1
+                        Text { anchors.centerIn: parent; text: "-"; font.pixelSize: Theme.dp(13); font.weight: Font.Bold; color: Theme.textPrimary }
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                                viewportItem.adjustWaterHeight(-20.0)
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: Theme.dp(28)
+                        width: hText.implicitWidth + Theme.dp(8)
+                        radius: Theme.radiusSm
+                        color: Theme.alpha(Theme.surface3, 0.6)
+                        border.color: Theme.borderSubtle
+                        border.width: 1
+                        Text { id: hText; anchors.centerIn: parent; text: qsTr("H"); font.pixelSize: Theme.dp(10); font.weight: Font.Bold; color: Theme.textSecondary }
+                    }
+                    Rectangle {
+                        width: Theme.dp(22)
+                        height: Theme.dp(28)
+                        radius: Theme.radiusSm
+                        color: Theme.alpha(Theme.surface2, 0.85)
+                        border.color: Theme.borderSubtle
+                        border.width: 1
+                        Text { anchors.centerIn: parent; text: "+"; font.pixelSize: Theme.dp(13); font.weight: Font.Bold; color: Theme.textPrimary }
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                                viewportItem.adjustWaterHeight(20.0)
+                            }
+                        }
+                    }
                 }
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: {
-                        if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
-                        viewportItem.applyWaterMeshEdit()
+
+                // Divider
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 1
+                    height: Theme.dp(18)
+                    color: Theme.borderSubtle
+                }
+
+                // Apply Button
+                Rectangle {
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: Theme.dp(28)
+                    width: applyWRow.implicitWidth + Theme.dp(14)
+                    radius: Theme.radiusSm
+                    color: Theme.colorSuccess
+                    Row {
+                        id: applyWRow
+                        anchors.centerIn: parent
+                        spacing: Theme.dp(3)
+                        Icon { name: "check"; size: Theme.dp(13); color: "#ffffff" }
+                        Text { text: qsTr("Apply"); font.pixelSize: Theme.dp(11); font.weight: Font.Bold; color: "#ffffff" }
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(25)
+                            viewportItem.applyWaterMeshEdit()
+                        }
                     }
                 }
             }
@@ -1318,6 +1389,50 @@ Item {
                 }
             }
 
+            // Quick Z layer stepper for GroundMesh edit
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: viewportItem.meshEditActive || viewportItem.canMeshEdit
+                height: Theme.dp(30)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.surface2, 0.90)
+                border.color: Theme.colorWarning
+                border.width: 1
+
+                Row {
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(2)
+
+                    IconButton {
+                        iconName: "minus"
+                        buttonSize: Theme.dp(26)
+                        iconSize: Theme.dp(10)
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                            viewportItem.adjustMeshEditZ(-5.0)
+                        }
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: qsTr("Z: %1").arg(Number(viewportItem.meshEditZ).toFixed(0))
+                        font.pixelSize: Theme.dp(11)
+                        font.weight: Font.DemiBold
+                        color: Theme.colorWarning
+                    }
+
+                    IconButton {
+                        iconName: "plus"
+                        buttonSize: Theme.dp(26)
+                        iconSize: Theme.dp(10)
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                            viewportItem.adjustMeshEditZ(5.0)
+                        }
+                    }
+                }
+            }
+
             // Water Mesh Edit mode toggle
             Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
@@ -1363,6 +1478,98 @@ Item {
                             viewportItem.applyWaterMeshEdit()
                         } else {
                             viewportItem.beginWaterMeshEdit()
+                        }
+                    }
+                }
+            }
+
+            // Quick Z Depth stepper for WaterMesh edit (Fluid Mesh 3D thickness)
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: viewportItem.waterEditActive
+                height: Theme.dp(30)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.surface2, 0.90)
+                border.color: "#06b6d4"
+                border.width: 1
+
+                Row {
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(2)
+
+                    IconButton {
+                        iconName: "minus"
+                        buttonSize: Theme.dp(26)
+                        iconSize: Theme.dp(10)
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                            viewportItem.removeWaterSheetBack()
+                        }
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: {
+                            var d = Number(viewportItem.selectedWaterDepth);
+                            var sheets = Math.max(1, Math.round(d / 60.0));
+                            return qsTr("Sheets: %1 (%2 u)").arg(sheets).arg((sheets * 60).toFixed(0));
+                        }
+                        font.pixelSize: Theme.dp(11)
+                        font.weight: Font.DemiBold
+                        color: "#06b6d4"
+                    }
+
+                    IconButton {
+                        iconName: "plus"
+                        buttonSize: Theme.dp(26)
+                        iconSize: Theme.dp(10)
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                            viewportItem.addWaterSheetBack()
+                        }
+                    }
+                }
+            }
+
+            // Quick Layer Z stepper for WaterMesh edit (Object 3D translation)
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                visible: viewportItem.waterEditActive
+                height: Theme.dp(30)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.surface2, 0.90)
+                border.color: "#a855f7"
+                border.width: 1
+
+                Row {
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(2)
+
+                    IconButton {
+                        iconName: "minus"
+                        buttonSize: Theme.dp(26)
+                        iconSize: Theme.dp(10)
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                            viewportItem.adjustWaterZ(-5.0)
+                        }
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: qsTr("Z: %1").arg(Number(viewportItem.selectedZ).toFixed(0))
+                        font.pixelSize: Theme.dp(11)
+                        font.weight: Font.DemiBold
+                        color: "#a855f7"
+                    }
+
+                    IconButton {
+                        iconName: "plus"
+                        buttonSize: Theme.dp(26)
+                        iconSize: Theme.dp(10)
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation) screenOrientation.vibrateTouch(15)
+                            viewportItem.adjustWaterZ(5.0)
                         }
                     }
                 }

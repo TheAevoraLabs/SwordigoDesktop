@@ -23,6 +23,8 @@ SwipeDelegate {
     property alias fileDateStr: root.fileDateText
     property alias isDir: root.isDirectory
     property bool isPinned: false
+    property bool isSelectionMode: false
+    property bool isSelected: false
 
     signal rowClicked()
     signal rowLongPressed()
@@ -30,14 +32,16 @@ SwipeDelegate {
     signal pinToggled()
     signal renameClicked()
     signal deleteClicked()
+    signal selectionToggled()
+    signal previewRequested()
 
     readonly property color typeColor: Theme.colorForType(root.fileType)
     readonly property string typeIcon: root.isDirectory ? "folder" : Theme.iconForType(root.fileType)
 
     background: Rectangle {
-        color: root.down ? Theme.surface2 : Theme.surface1
-        border.color: Theme.borderSubtle
-        border.width: 1
+        color: root.isSelected ? Theme.alpha(Theme.accentInk, 0.18) : (root.down ? Theme.surface2 : Theme.surface1)
+        border.color: root.isSelected ? Theme.accentInk : Theme.borderSubtle
+        border.width: root.isSelected ? 2 : 1
 
         // 3dp semantic data-type indicator bar on the left edge
         Rectangle {
@@ -54,6 +58,34 @@ SwipeDelegate {
 
     contentItem: Row {
         spacing: Theme.dp(Theme.spacingMd)
+
+        // Multi-select circular checkbox (Index FM style)
+        Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            width: (root.isSelectionMode || root.isSelected) ? Theme.dp(22) : 0
+            height: Theme.dp(22)
+            radius: Theme.dp(11)
+            visible: width > 0
+            color: root.isSelected ? Theme.accentInk : Theme.surface2
+            border.color: root.isSelected ? Theme.accentInk : Theme.borderSubtle
+            border.width: 1
+            clip: true
+
+            Behavior on width { NumberAnimation { duration: 150; easing.type: Easing.OutQuad } }
+
+            Icon {
+                anchors.centerIn: parent
+                name: "check"
+                size: Theme.dp(12)
+                color: Theme.onAccent
+                visible: root.isSelected
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                onClicked: root.selectionToggled()
+            }
+        }
 
         // Type plate + vector icon
         Rectangle {
@@ -76,7 +108,7 @@ SwipeDelegate {
         // Title / meta
         Column {
             anchors.verticalCenter: parent.verticalCenter
-            width: parent.width - Theme.dp(38) - Theme.dp(Theme.spacingMd) - Theme.dp(36) - Theme.dp(Theme.spacingMd)
+            width: parent.width - ((root.isSelectionMode || root.isSelected) ? Theme.dp(22) + Theme.dp(Theme.spacingMd) : 0) - Theme.dp(38) - Theme.dp(Theme.spacingMd) - Theme.dp(36) - Theme.dp(Theme.spacingMd)
             spacing: Theme.dp(2)
 
             Row {
@@ -232,6 +264,12 @@ SwipeDelegate {
         }
     }
 
-    onClicked: root.rowClicked()
+    onClicked: {
+        if (root.isSelectionMode) {
+            root.selectionToggled()
+        } else {
+            root.rowClicked()
+        }
+    }
     onPressAndHold: root.rowLongPressed()
 }

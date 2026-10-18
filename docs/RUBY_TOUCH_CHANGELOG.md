@@ -5,6 +5,51 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 > **Repository move (2026-09-26):** development moved from GitHub (`TheAevoraLabs`, terminated by automated moderation) to GitLab — [AevoralabsIN/RubyTouch](https://gitlab.com/AevoralabsIN/RubyTouch) — with a mirror at [quantumcreeper/RubyTouch](https://codeberg.org/quantumcreeper/RubyTouch). `github.com` links in older entries below are historical.
 
+## [1.4.5] - 2026-10-18
+
+### Added
+- **Multi-Sheet Volumetric Water Engine (`rubywater_meta.h`, `scene_loader.cpp`, `water_renderer.cpp`, `ruby_quick_viewport.cpp`)**:
+  - Engine-faithful multi-sheet water volume metadata persistence: stores front-most Z, back-most Z, sheet count, sheet spacing, and group UUIDs in field 15 custom properties (`rubywater_meta.h`) without breaking binary scene compatibility.
+  - Recursive front & back sheet generation: eliminates duplicate overlapping sheets and Z-fighting depth artifacts.
+  - Synchronized Multi-Sheet Edit Mode: modifying, scaling, dragging, or resizing a water volume dynamically updates and transforms all companion sheets in the multi-sheet volume simultaneously in real-time across both 2D and 3D preview spaces.
+- **Engine-Faithful Water Box HUD & 4-Corner Editor (`SceneViewportView.qml`, `ruby_quick_viewport.cpp`)**:
+  - Replaced legacy freeform polygon wireframe editor with an authentic rectangular 4-corner box editor conforming to Swordigo's `BoundsShape` (`x, y, width, height`).
+  - Interactive 4-corner dragging (`TL`, `TR`, `BR`, `BL`) and edge midpoint dragging with strict 90° rectangular geometry preservation.
+  - In-viewport Water HUD with live `Water W×H` dimensions badge, corner cycler, width/height increment steppers (`[-] W [+]`, `[-] H [+]`), reset, discard, and apply controls.
+  - 3D Volumetric Fluid Cage visual overlay with glowing cyan front contour, back plane, depth struts, animated wave crest, corner diamonds, and midpoint handles.
+- **Index-FM Remastered Mobile File Manager (`FilesView.qml`, `OperationsBar.qml`, `FilePreviewModal.qml`, `PlacesDrawer.qml`, `ruby_file_model.cpp`)**:
+  - Deep integration of native index-fm mobile file manager patterns into Ruby Touch.
+  - Dual view modes: Grid view (card delegates) and List view (dense row delegates) with smooth animated switching.
+  - Full batch multi-select operations with floating `OperationsBar` (Copy, Cut, Delete, Select All, Deselect).
+  - Quick Places Drawer for navigation between Internal Storage, Downloads, Documents, Modding Workshop, and SD card roots.
+  - Interactive File Preview Modal with metadata inspection, instant scene preview, texture inspection, and direct opening.
+  - Dynamic search filter engine with real-time text query filtering.
+  - Fixed Android root directory display (`/storage/emulated/0` resolving to clean `"Internal Storage"` instead of `"0"`).
+- **Studio Dark UI Remaster & Theme Engine (`Theme.qml`, `SettingsView.qml`, `HomeView.qml`, `IdentityHeader.qml`, `GuideCard.qml`)**:
+  - Purged all "web-SaaS bento fluff", artificial pill badges, and duplicate navigation controls.
+  - 6 Studio Themes: Ruby Dark, Obsidian (pure AMOLED black), Cyber Synth, Emerald Grove, Royal Violet, and Nord Frost.
+  - Complete Settings View overhaul: clean modular grouped sections (Studio Identity, Visual Appearance, Engine & Viewport Preferences, Storage & Workspace Paths, Diagnostics & Information).
+  - Identity system upgrade: customizable profile avatar with 7 high-res vector avatars (`avatar_ruby_gem`, `avatar_cyber_ninja`, `avatar_dragon_crest`, `avatar_hero_sword`, `avatar_pixel_ghost`, `avatar_wizard_spark`, `avatar_zenith_core`), customizable display names with lightweight randomizer, and random avatar picker.
+  - Home View 6-Point Master Polish:
+    - Edge-to-edge layout with bottom breathing spacer, eliminating bottom scroll cutoff bugs above the bottom nav bar.
+    - Dynamic hero card eyebrow and action button labels (`ACTIVE SCENE`, `ACTIVE TEXTURE`, `ACTIVE MODEL`, `ACTIVE SCRIPT`).
+    - Deduplicated Recent Files list (starts from index 1 when hero shows index 0) with parent directory path format and inset list dividers (`64dp`).
+    - Replaced duplicate top-right Settings gear with flat Material Search button.
+    - Borderless tonal surface hierarchy across hero cards, modding guide cards, and identity header.
+
+---
+
+### Added
+- **Interactive HSV Spectrum Color Picker in WaterMesh Studio**:
+  - Full continuous HSV spectrum slider + saturation/brightness canvas and quick fluid color swatches for deep body and surface crest colors.
+  - Interactive live preview and direct hex input with instant viewport shader sync.
+- **Deadly Fluid Hazard & Damage Control (`CollisionShapeComponent` + `DamageComponent`)**:
+  - Full integration of Swordigo's hazard collision pipeline: toggle deadly fluid (`InflictsDamage` / `SpecialType: 6`).
+  - Adjustable damage rate / amount (`MinDamage` / `MaxDamage`), damage type (Physical/Fire vs Magical), and immunity bypass (`IgnoreTargetImmunity`).
+  - Contact reaction triggers matching engine decompilation (`fireblast` woosh / `watersplash`).
+
+---
+
 ## [1.4.3] - 2026-10-17
 
 ### Added

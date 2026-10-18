@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <defs>
+    <linearGradient id="gemGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF5376"/>
+      <stop offset="50%" stop-color="#FF2A5F"/>
+      <stop offset="100%" stop-color="#800020"/>
+    </linearGradient>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#24111E"/>
+      <stop offset="100%" stop-color="#120A10"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="48" fill="url(#bgGrad)"/>
+  <circle cx="48" cy="48" r="46" fill="none" stroke="#FF2A5F" stroke-width="1.5" stroke-opacity="0.4"/>
+  <polygon points="48,18 72,34 62,76 34,76 24,34" fill="url(#gemGrad)" stroke="#FFA3B8" stroke-width="2"/>
+  <polygon points="48,18 72,34 48,46" fill="#FFA3B8" fill-opacity="0.45"/>
+  <polygon points="48,18 24,34 48,46" fill="#FFFFFF" fill-opacity="0.25"/>
+  <polygon points="24,34 34,76 48,46" fill="#800020" fill-opacity="0.4"/>
+  <polygon points="72,34 62,76 48,46" fill="#FF5376" fill-opacity="0.5"/>
+  <polygon points="34,76 62,76 48,46" fill="#FF2A5F" fill-opacity="0.7"/>
+</svg>

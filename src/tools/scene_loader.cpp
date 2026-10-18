@@ -34,6 +34,7 @@
 #include "scene_schemas.h"
 #include "filerift.h"
 #include "platform/protobuf_reader.h"
+#include "tools/rubywater_meta.h"
 
 #include <memory>
 #include <chrono>
@@ -2529,12 +2530,14 @@ static bool read_shape_rectangle(const SceneObject& obj, int bounds_id, float re
     for (const auto& comp : comps) {
         if (comp.type_id != bounds_id) continue;
         const int payload = component_payload_field(comp);
-        if (payload == 0) continue;
         try {
             proto::Reader wrapper(comp.raw_data);
             proto::Field field;
             while (wrapper.read_field(field)) {
-                if (field.field_number != static_cast<uint32_t>(payload) ||
+                // Shape data is stored in ShapeComponent payload (tag 120).
+                // In UtilityShape/Shape, field 120 is the main payload.
+                // In CollisionShape, field 120 is ShapeComponent and field 121 is CollisionShapeComponent.
+                if ((field.field_number != 120 && field.field_number != static_cast<uint32_t>(payload)) ||
                     field.wire_type != proto::WIRE_LEN)
                     continue;
                 proto::Reader shape(field.bytes_val);
@@ -2548,7 +2551,7 @@ static bool read_shape_rectangle(const SceneObject& obj, int bounds_id, float re
                     while (rc.read_field(rf) && idx < 4) {
                         if (rf.wire_type == proto::WIRE_I32) rect[idx++] = rf.float_val;
                     }
-                    return idx >= 4;
+                    if (idx >= 4) return true;
                 }
             }
         } catch (...) {}
@@ -2562,12 +2565,11 @@ static void read_shape_polygon(const SceneObject& obj, int bounds_id, std::vecto
     for (const auto& comp : comps) {
         if (comp.type_id != bounds_id) continue;
         const int payload = component_payload_field(comp);
-        if (payload == 0) continue;
         try {
             proto::Reader wrapper(comp.raw_data);
             proto::Field field;
             while (wrapper.read_field(field)) {
-                if (field.field_number != static_cast<uint32_t>(payload) ||
+                if ((field.field_number != 120 && field.field_number != static_cast<uint32_t>(payload)) ||
                     field.wire_type != proto::WIRE_LEN)
                     continue;
                 proto::Reader shape(field.bytes_val);
@@ -2649,6 +2651,10 @@ static void parse_scene_waters(SceneData& scene) {
             int bounds_id = 0, tex_id = 0;
             float front[4] = {0.5f, 0.7f, 1.0f, 0.7f};
             float surface[4] = {0.7f, 0.9f, 1.0f, 0.7f};
+            float front_z = 40.0f;
+            float back_z = -20.0f;
+            rubywater::WaterMeta wmeta;
+            bool has_wmeta = false;
             try {
                 proto::Reader wrapper(comp.raw_data);
                 proto::Field field;
@@ -2667,11 +2673,51 @@ static void parse_scene_waters(SceneData& scene) {
                             parse_float_color(wf.bytes_val, front);
                         else if (wf.field_number == 4 && wf.wire_type == proto::WIRE_LEN)
                             parse_float_color(wf.bytes_val, surface);
+                        else if (wf.field_number == 5 && wf.wire_type == proto::WIRE_I32)
+                            front_z = wf.float_val;
+                        else if (wf.field_number == 6 && wf.wire_type == proto::WIRE_I32)
+                            back_z = wf.float_val;
+                        else if (wf.field_number == rubywater::kTagWaterMeta && wf.wire_type == proto::WIRE_LEN)
+                            has_wmeta = rubywater::decode_water_meta(wf.bytes_val, wmeta);
                     }
                     break;
                 }
             } catch (...) {}
             if (bounds_id <= 0) continue;  // no shape -> cannot place the sheet
+
+            // Also inspect if CollisionShape defines MinDepth (f6) and MaxDepth (f7)
+            for (const auto& c : comps) {
+                if (c.type_id != bounds_id) continue;
+                try {
+                    proto::Reader wrapper(c.raw_data);
+                    proto::Field f;
+                    while (wrapper.read_field(f)) {
+                        if (f.field_number == 121 && f.wire_type == proto::WIRE_LEN) {
+                            proto::Reader col(f.bytes_val);
+                            proto::Field cf;
+                            while (col.read_field(cf)) {
+                                if (cf.field_number == 6 && cf.wire_type == proto::WIRE_I32) {
+                                    if (back_z == -20.0f) back_z = cf.float_val;
+                                } else if (cf.field_number == 7 && cf.wire_type == proto::WIRE_I32) {
+                                    if (front_z == 40.0f) front_z = cf.float_val;
+                                }
+                            }
+                        }
+                    }
+                } catch (...) {}
+            }
+
+            std::string master_name;
+            bool is_sec = false;
+            if (has_wmeta && wmeta.is_secondary) {
+                is_sec = true;
+                master_name = wmeta.master_name;
+            } else if (rubywater::is_secondary_name(obj.name, &master_name)) {
+                is_sec = true;
+            }
+
+            scene.objects[oi].is_secondary_water_sheet = is_sec;
+            scene.objects[oi].water_master_name = master_name;
 
             SceneData::SceneWater water;
             water.object_index = (int)oi;
@@ -2679,6 +2725,15 @@ static void parse_scene_waters(SceneData& scene) {
             if (water.rect[2] <= 0.0f || water.rect[3] <= 0.0f) continue;
             memcpy(water.front_color, front, sizeof(front));
             memcpy(water.surface_color, surface, sizeof(surface));
+            water.front_z = has_wmeta ? wmeta.front_z : front_z;
+            water.back_z = has_wmeta ? wmeta.back_z : back_z;
+            water.z_depth = has_wmeta ? wmeta.total_depth : (front_z - back_z);
+            water.is_secondary_sheet = is_sec;
+            water.master_name = master_name;
+            water.sheet_index = has_wmeta ? wmeta.sheet_index : (is_sec ? 1 : 0);
+            water.sheets_front = has_wmeta ? wmeta.sheets_front : 0;
+            water.sheets_back = has_wmeta ? wmeta.sheets_back : (has_wmeta && wmeta.total_sheets > 1 ? wmeta.total_sheets - 1 : 0);
+            water.total_sheets = has_wmeta ? wmeta.total_sheets : 1;
             read_texture_mapping(obj, tex_id, water.texture, water.tile_size, water.tex_offset);
             if (water.tile_size <= 0.0f) water.tile_size = 64.0f;
             read_shape_polygon(obj, bounds_id, water.polygon_points);

@@ -1683,6 +1683,7 @@ std::string serialize_swdm(const SwdmDocument& doc) {
     o << "    HatWidthOffset2 : " << doc.params.hat_width_offset_2 << "\n";
     o << "    HorizNoise : " << doc.params.horiz_noise << "\n";
     o << "    RandomSeed : " << doc.params.random_seed << "\n";
+    o << "    Z : " << doc.params.z << "\n";
     o << "    TextureScale : " << doc.params.texture_scale << "\n";
     o << "    SurfaceTexture : '" << doc.params.surface_texture << "'\n";
     o << "    FrontTexture : '" << doc.params.front_texture << "'\n";
@@ -1775,6 +1776,7 @@ bool parse_swdm(const std::string& text, SwdmDocument& out) {
             else if (key == "HorizNoise")   out.params.horiz_noise = std::stod(val);
             else if (key == "RandomSeed")
                 out.params.random_seed = static_cast<uint32_t>(std::stoul(val));
+            else if (key == "Z")            out.params.z = std::stod(val);
             else if (key == "TextureScale") out.params.texture_scale = std::stod(val);
             // v2 texture keys.
             else if (key == "SurfaceTexture") out.params.surface_texture = val;
@@ -1977,7 +1979,7 @@ std::string generate_ground_mesh_object(const std::vector<Node>& outline_in,
     obj.write_bytes_field(3, comp_tm_surface.to_string());
     obj.write_bytes_field(3, comp_tm_front.to_string());
     obj.write_nested_field(4, make_vector2(0, 0));
-    obj.write_float_field(5, static_cast<float>(mesh.max_abs_z()));
+    obj.write_float_field(5, static_cast<float>(params.z));
     obj.write_float_field(6, 0.0f);
     obj.write_float_field(7, 1.0f);
     obj.write_nested_field(8, make_rectangle(aabb_x, aabb_y, aabb_w, aabb_h));

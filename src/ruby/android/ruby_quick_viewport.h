@@ -171,6 +171,7 @@ public:
     Q_PROPERTY(bool canMeshEdit READ canMeshEdit NOTIFY selectedObjectChanged)
     Q_PROPERTY(int selectedMeshVertex READ selectedMeshVertex NOTIFY selectedMeshVertexChanged)
     Q_PROPERTY(int meshVertexCount READ meshVertexCount NOTIFY meshEditVerticesChanged)
+    Q_PROPERTY(double meshEditZ READ meshEditZ WRITE setMeshEditZ NOTIFY meshEditZChanged)
     // Which generator actually produced the last regenerated ground mesh, and
     // why it fell back if it did. boulderx declines meshes it cannot reproduce
     // faithfully and the editor silently uses boulder instead, so without this
@@ -180,22 +181,43 @@ public:
 
     Q_PROPERTY(bool holdToSelect READ holdToSelect WRITE setHoldToSelect NOTIFY holdToSelectChanged)
     Q_PROPERTY(bool isSelectedWater READ isSelectedWater NOTIFY selectedWaterChanged)
+    Q_PROPERTY(double selectedWaterDepth READ selectedWaterDepth WRITE setSelectedWaterDepth NOTIFY selectedWaterPropertiesChanged)
     Q_PROPERTY(bool waterEditActive READ waterEditActive NOTIFY waterEditActiveChanged)
     Q_PROPERTY(bool canWaterMeshEdit READ canWaterMeshEdit NOTIFY selectedWaterChanged)
     Q_PROPERTY(int selectedWaterVertex READ selectedWaterVertex NOTIFY selectedWaterVertexChanged)
     Q_PROPERTY(int waterVertexCount READ waterVertexCount NOTIFY waterEditVerticesChanged)
+    Q_PROPERTY(double waterEditWidth READ waterEditWidth NOTIFY waterEditVerticesChanged)
+    Q_PROPERTY(double waterEditHeight READ waterEditHeight NOTIFY waterEditVerticesChanged)
+    Q_PROPERTY(double waterEditSurfaceY READ waterEditSurfaceY NOTIFY waterEditVerticesChanged)
+    Q_PROPERTY(double waterEditBedY READ waterEditBedY NOTIFY waterEditVerticesChanged)
 
     bool meshEditActive() const { return m_meshEditActive; }
     bool canMeshEdit() const;
     bool holdToSelect() const { return m_holdToSelect; }
     void setHoldToSelect(bool val);
     bool isSelectedWater() const;
+    double selectedWaterDepth() const;
+    void setSelectedWaterDepth(double depth);
     bool waterEditActive() const { return m_waterEditActive; }
     bool canWaterMeshEdit() const;
     int selectedWaterVertex() const { return m_selectedWaterVertex; }
     int waterVertexCount() const { return int(m_waterEditPoints.size()); }
+    double waterEditWidth() const;
+    double waterEditHeight() const;
+    double waterEditSurfaceY() const;
+    double waterEditBedY() const;
     int selectedMeshVertex() const { return m_selectedMeshVertex; }
     int meshVertexCount() const { return int(m_meshEditPoints.size()); }
+    double meshEditZ() const;
+    void setMeshEditZ(double z);
+    Q_INVOKABLE void adjustMeshEditZ(double delta);
+    Q_INVOKABLE void adjustWaterZ(double delta);
+    Q_INVOKABLE void adjustWaterMeshDepth(double delta);
+    Q_INVOKABLE void adjustWaterWidth(float delta);
+    Q_INVOKABLE void adjustWaterHeight(float delta);
+    Q_INVOKABLE void adjustWaterSurface(float delta);
+    Q_INVOKABLE void adjustWaterBed(float delta);
+    Q_INVOKABLE void setWaterDimensions(float width, float height);
     QString groundGeneratorStatus() const { return m_groundGeneratorStatus; }
     void setGroundGeneratorStatus(const QString& status);
 
@@ -271,11 +293,11 @@ public:
     Q_INVOKABLE void dragSelected(float deltaX, float deltaY, float deltaZ);
     Q_INVOKABLE void finishDrag();
 
-    Q_PROPERTY(float selectedX READ selectedX NOTIFY selectedObjectChanged)
-    Q_PROPERTY(float selectedY READ selectedY NOTIFY selectedObjectChanged)
-    Q_PROPERTY(float selectedZ READ selectedZ NOTIFY selectedObjectChanged)
-    Q_PROPERTY(float selectedRot READ selectedRot NOTIFY selectedObjectChanged)
-    Q_PROPERTY(float selectedScale READ selectedScale NOTIFY selectedObjectChanged)
+    Q_PROPERTY(float selectedX READ selectedX NOTIFY objectTransformChanged)
+    Q_PROPERTY(float selectedY READ selectedY NOTIFY objectTransformChanged)
+    Q_PROPERTY(float selectedZ READ selectedZ NOTIFY objectTransformChanged)
+    Q_PROPERTY(float selectedRot READ selectedRot NOTIFY objectTransformChanged)
+    Q_PROPERTY(float selectedScale READ selectedScale NOTIFY objectTransformChanged)
 
     // Camera presets for touch: "iso" (default), "top", "front", "side".
     // Only the orbit angles change; distance and target are preserved.
@@ -317,6 +339,11 @@ public:
     Q_INVOKABLE bool setSelectedWaterProperties(const QVariantMap& props);
     Q_INVOKABLE bool setWaterPreset(const QString& presetName);
     Q_INVOKABLE int createWaterObject(float x = 0.0f, float y = 0.0f, float width = 300.0f, float height = 80.0f, const QString& preset = QStringLiteral("azure"));
+    Q_INVOKABLE bool addWaterSheetFront();
+    Q_INVOKABLE bool removeWaterSheetFront();
+    Q_INVOKABLE bool addWaterSheetBack();
+    Q_INVOKABLE bool removeWaterSheetBack();
+    Q_INVOKABLE bool setWaterSheets(int sheetsFront, int sheetsBack);
     Q_INVOKABLE bool beginWaterMeshEdit();
     Q_INVOKABLE bool applyWaterMeshEdit();
     Q_INVOKABLE void discardWaterMeshEdit();
@@ -382,6 +409,7 @@ signals:
     void frameChanged();
     void meshEditActiveChanged();
     void meshEditVerticesChanged();
+    void meshEditZChanged();
     void selectedMeshVertexChanged();
     void waterEditActiveChanged();
     void waterEditVerticesChanged();
@@ -546,6 +574,7 @@ private:
     std::vector<boulder::PolygonPoint> m_waterEditPoints;
     bool m_waterDragging = false;
     int m_waterDragPoint = -1;
+    int m_waterDragEdge = -1;
     double m_waterDragOffX = 0.0;
     double m_waterDragOffY = 0.0;
     bool m_waterPanning = false;
@@ -562,6 +591,18 @@ private:
     bool waterRayObjectPlane(const float origin[3], const float dir[3], double& lx, double& ly) const;
     int waterHitTestVertex(const QPointF& px, float radiusPx = 48.0f) const;
     int waterHitTestEdge(const QPointF& px, double& hitLx, double& hitLy, float radiusPx = 28.0f) const;
+
+    std::vector<int> getWaterSheetIndices(int masterObjIdx) const;
+    void dragWaterCorner(int corner, double targetX, double targetY);
+    void dragWaterEdge(int edge, double targetX, double targetY);
+
+    void synchronizeWaterSheets(int masterIdx, int sheetsFront, int sheetsBack,
+                                const float front[4], const float surface[4],
+                                const std::string& tex, float tile, float off_x, float off_y,
+                                const std::vector<boulder::PolygonPoint>& pts,
+                                float rx, float ry, float rw, float rh,
+                                bool isDeadly, int minDmg, int maxDmg, int dmgType, bool ignoreImmunity);
+    void propagateWaterCompanionDelta(int masterIdx, float dx, float dy, float dz);
 
     int m_gizmoMode = 0; // 0=Off/View, 1=Move, 2=Rotate, 3=Scale
     int m_selectedObject = -1;

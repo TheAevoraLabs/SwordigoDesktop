@@ -7,48 +7,51 @@ Item {
     height: Theme.dp(56)
 
     property string userName: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.userName : "Ruby Dev"
-    property string userTitle: (typeof rubySettings !== "undefined" && rubySettings && rubySettings.userTitle) ? rubySettings.userTitle : "DEV"
-    property string workspaceName: "Local Ruby Workspace"
+    property string avatarImg: (typeof rubySettings !== "undefined" && rubySettings && rubySettings.avatarImage) ? rubySettings.avatarImage : ""
+    property string workspaceName: (typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.folderName && rubyFileModel.folderName.length > 0)
+                                   ? rubyFileModel.folderName : "Swordigo Workspace"
     property string statusText: qsTr("Local Active")
     property bool isConnected: true
 
     signal profileClicked()
     signal settingsClicked()
-    signal notificationsClicked()
+    signal searchClicked()
 
     Row {
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
         spacing: Theme.dp(Theme.spacingMd)
 
-        // ── Avatar Monogram with Ruby Halo ──────────────────────────────
+        // ── Clean Native Avatar ─────────────────────────────────────────
         Item {
-            width: Theme.dp(44)
-            height: Theme.dp(44)
+            width: Theme.dp(40)
+            height: Theme.dp(40)
             anchors.verticalCenter: parent.verticalCenter
 
-            // Ambient Ruby Glow
             Rectangle {
-                anchors.centerIn: parent
-                width: parent.width + Theme.dp(4)
-                height: parent.height + Theme.dp(4)
-                radius: width / 2
-                color: Theme.alpha(Theme.accentStart, 0.22)
-            }
-
-            // Outer Facet Ring
-            Rectangle {
-                id: avatarRing
+                id: avatarBg
                 anchors.fill: parent
                 radius: width / 2
-                color: "#18141D"
-                border.color: Theme.accentEnd
-                border.width: Theme.dp(1.5)
+                color: Theme.surface2
+                border.width: 0
+                clip: true
 
+                // Custom / Preset Avatar Image
+                Image {
+                    anchors.fill: parent
+                    anchors.margins: Theme.dp(2)
+                    source: root.avatarImg
+                    visible: root.avatarImg.length > 0
+                    fillMode: Image.PreserveAspectFit
+                    smooth: true
+                }
+
+                // Monogram Fallback
                 Text {
                     anchors.centerIn: parent
-                    text: root.userName.length > 0 ? root.userName.charAt(0).toUpperCase() : "Q"
-                    font.pixelSize: Theme.dp(18)
+                    visible: root.avatarImg.length === 0
+                    text: root.userName.length > 0 ? root.userName.charAt(0).toUpperCase() : "R"
+                    font.pixelSize: Theme.dp(16)
                     font.weight: Font.Bold
                     font.family: Theme.monoFamily
                     color: Theme.accentInk
@@ -59,10 +62,8 @@ Item {
             Rectangle {
                 anchors.right: parent.right
                 anchors.bottom: parent.bottom
-                anchors.rightMargin: Theme.dp(1)
-                anchors.bottomMargin: Theme.dp(1)
-                width: Theme.dp(11)
-                height: Theme.dp(11)
+                width: Theme.dp(10)
+                height: Theme.dp(10)
                 radius: width / 2
                 color: "#10B981"
                 border.color: Theme.surface0
@@ -80,37 +81,15 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             spacing: Theme.dp(2)
 
-            Row {
-                spacing: Theme.dp(6)
-                Text {
-                    text: root.userName
-                    font.pixelSize: Theme.dp(15)
-                    font.weight: Font.DemiBold
-                    color: Theme.textPrimary
-                }
-
-                Rectangle {
-                    anchors.verticalCenter: parent.verticalCenter
-                    height: Theme.dp(16)
-                    width: proTag.implicitWidth + Theme.dp(8)
-                    radius: Theme.radiusPill
-                    color: Theme.alpha(Theme.accentInk, 0.12)
-                    border.color: Theme.alpha(Theme.accentInk, 0.28)
-                    border.width: 1
-
-                    Text {
-                        id: proTag
-                        anchors.centerIn: parent
-                        text: root.userTitle
-                        font.pixelSize: Theme.dp(9)
-                        font.weight: Font.Bold
-                        color: Theme.accentInk
-                    }
-                }
+            Text {
+                text: root.userName
+                font.pixelSize: Theme.dp(16)
+                font.weight: Font.DemiBold
+                color: Theme.textPrimary
             }
 
             Row {
-                spacing: Theme.dp(4)
+                spacing: Theme.dp(5)
                 anchors.left: parent.left
 
                 Icon {
@@ -124,6 +103,7 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     text: root.workspaceName
                     font.pixelSize: Theme.dp(Theme.fontXs)
+                    font.family: Theme.monoFamily
                     color: Theme.textSecondary
                 }
 
@@ -152,12 +132,12 @@ Item {
         spacing: Theme.dp(Theme.spacingXs)
 
         IconButton {
-            iconName: "settings"
-            variant: "soft"
+            iconName: "search"
+            variant: "plain"
             buttonSize: Theme.dp(36)
             iconSize: Theme.dp(18)
-            square: true
-            onClicked: root.settingsClicked()
+            tint: Theme.textSecondary
+            onClicked: root.searchClicked()
         }
     }
 }

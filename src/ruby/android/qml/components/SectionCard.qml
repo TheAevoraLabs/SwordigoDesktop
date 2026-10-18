@@ -17,8 +17,8 @@ Rectangle {
 
     color: Theme.surface1
     radius: Theme.radiusCard
-    border.color: Theme.borderSubtle
-    border.width: 1
+    border.color: "transparent"
+    border.width: 0
     implicitHeight: layout.implicitHeight + contentPadding * 2
 
     Column {

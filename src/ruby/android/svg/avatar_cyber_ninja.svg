@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <defs>
+    <linearGradient id="cyberBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#181028"/>
+      <stop offset="100%" stop-color="#0B0616"/>
+    </linearGradient>
+    <linearGradient id="visorGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#BD93F9"/>
+      <stop offset="50%" stop-color="#FF79C6"/>
+      <stop offset="100%" stop-color="#8BE9FD"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="48" fill="url(#cyberBg)"/>
+  <circle cx="48" cy="48" r="46" fill="none" stroke="#BD93F9" stroke-width="1.5" stroke-opacity="0.4"/>
+  <!-- Cyber Hood/Mask -->
+  <polygon points="48,18 74,32 68,74 48,82 28,74 22,32" fill="#241B3B" stroke="#48386F" stroke-width="2"/>
+  <!-- Neon Visor -->
+  <polygon points="30,44 66,44 60,54 36,54" fill="url(#visorGrad)"/>
+  <line x1="32" y1="48" x2="64" y2="48" stroke="#FFFFFF" stroke-width="1.5" stroke-opacity="0.8"/>
+  <!-- Respirator vents -->
+  <rect x="42" y="62" width="12" height="2" rx="1" fill="#FF79C6"/>
+  <rect x="44" y="66" width="8" height="2" rx="1" fill="#FF79C6"/>
+  <rect x="46" y="70" width="4" height="2" rx="1" fill="#FF79C6"/>
+</svg>

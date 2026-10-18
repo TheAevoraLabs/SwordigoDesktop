@@ -486,6 +486,7 @@ QVariantMap RubyToolsBridge::exportGroundMeshSheet(const QVariantMap& sheet) {
             sheet.value(QStringLiteral("randomSeed"), 1291618994).toUInt());
         doc.params.surface_texture = top_tex;
         doc.params.front_texture = front_tex;
+        doc.params.z = sheet.value(QStringLiteral("z"), 0.0).toDouble();
         text = boulderx::serialize_swdm(doc);
         res[QStringLiteral("generator")] = QStringLiteral("boulderx");
     } else {
@@ -572,6 +573,7 @@ QVariantMap RubyToolsBridge::importGroundMeshSheet(const QString& filePath) {
     res[QStringLiteral("surfaceWidth")] = doc.params.surface_width;
     res[QStringLiteral("meshType")] = doc.params.mesh_type;
     res[QStringLiteral("randomSeed")] = double(doc.params.random_seed);
+    res[QStringLiteral("z")] = doc.params.z;
     QVariantList dome_hats;
     for (const auto& h : doc.hats) {
         QVariantMap hm;

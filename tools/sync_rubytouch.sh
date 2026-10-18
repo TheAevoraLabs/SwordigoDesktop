@@ -236,6 +236,15 @@ Navigate 3D scenes fluidly using dual on-screen floating thumbsticks designed fo
 Ground Mesh Studio
 Select, inspect, and edit terrain meshes directly inside the 3D viewport. Ruby Touch renders diamond vertex selection handles and wireframe outlines using hardware depth-tested shaders. Manipulate vertices in real time via ray-plane touch projection, add new control points, remove vertices, and apply structural mesh updates without geometric degradation.
 
+Volumetric WaterMesh Studio
+Multi-sheet water volume architecture generating recursive front and back sheets with zero depth-fighting. Synchronized multi-sheet edit mode transforms all companion sheets simultaneously. Authentic 4-corner rectangular box editor strictly conforming to Swordigo's BoundsShape engine parameters with 3D fluid cage overlay, animated wave crest, and HSV spectrum color picker.
+
+Index-FM Remastered File Manager
+High-performance mobile file manager with dual Grid and List view modes, batch operations (Copy, Cut, Delete, Select All), Places Drawer for rapid folder navigation, instant file preview modal with metadata inspection, and real-time search filter engine.
+
+Studio Dark UI & Theme Engine
+Clean edge-to-edge Material 3 mobile interface completely free of web clutter. 6 studio themes (Ruby Dark, Obsidian AMOLED, Cyber Synth, Emerald Grove, Royal Violet, Nord Frost), customizable studio identities with 7 vector avatars, and polished home navigation.
+
 Biome Texture Inspector
 Inspect and modify terrain surface (cap/grass) and cliff (front/wall) textures in place. Switch between authentic presets derived from game scenes, including Plains, Forest, Grove, Florennum, Wasteland, Snowy Peaks, Ice Castle, Volcano, Caves, and Crypt. Create and persist custom modder biome presets via device storage.
 
@@ -267,7 +276,7 @@ cat << 'README_EOF' > "${DEST_DIR}/README.md"
 [![UI Framework](https://img.shields.io/badge/UI-Qt%206.6%20Quick%20%2F%20QML-41cd52.svg)](https://www.qt.io/)
 [![Upstream](https://img.shields.io/badge/Upstream-SwordigoDesktop-informational.svg)](https://github.com/TheAevoraLabs/SwordigoDesktop)
 
-Ruby Touch is a high-performance, standalone mobile 3D scene studio and terrain editor tailored for Swordigo modders and level designers. Built entirely in modern C++20 and Qt 6 with OpenGL ES 3.0, Ruby Touch brings precision 3D viewport navigation, interactive ground mesh vertex editing, and in-place biome texturing to Android devices.
+Ruby Touch is a high-performance, standalone mobile 3D scene studio, terrain editor, and volumetric water toolchain tailored for Swordigo modders and level designers. Built entirely in modern C++20 and Qt 6 with OpenGL ES 3.0, Ruby Touch brings precision 3D viewport navigation, interactive ground mesh vertex editing, volumetric fluid simulation, and in-place biome texturing to Android devices.
 
 > **Upstream Project Notice**: Ruby Touch is the dedicated mobile distribution and mirror repository for the mobile 3D editor component of [SwordigoDesktop](https://github.com/TheAevoraLabs/SwordigoDesktop). All core engine improvements, tools, and bug fixes are maintained upstream and mirrored here for standalone mobile packaging and F-Droid distribution.
 
@@ -285,6 +294,25 @@ Ruby Touch is a high-performance, standalone mobile 3D scene studio and terrain 
 - **Native Overlay Rendering**: Diamond vertex selection handles and wireframe outlines rendered directly in the OpenGL pipeline.
 - **Topology Tools**: Add new vertices, remove existing points, and cycle through control points via a floating mobile toolbar.
 - **Non-Destructive In-Place Apply**: Retains existing component identifiers and dimension objects without geometric trashing.
+
+### Volumetric WaterMesh Studio
+- **Multi-Sheet Fluid Volumes**: Recursive front and back water sheet generation with zero depth-fighting artifacts.
+- **Synchronized Multi-Sheet Edit Mode**: Moving, scaling, or resizing a water volume transforms all companion sheets in the volume simultaneously in real-time.
+- **Decomp-Faithful Water Box HUD**: 4-corner box editor strictly conforming to Swordigo's `BoundsShape` (`x, y, width, height`) with corner and edge dragging.
+- **3D Fluid Cage Overlay**: Glowing cyan front outline, back plane, depth struts, animated wave crest, corner diamonds, and midpoint handles.
+- **Interactive HSV Spectrum Picker**: Continuous HSV slider, saturation/brightness canvas, fluid presets, and hex color input.
+
+### Index-FM Remastered File Manager
+- **Dual View Modes**: Smoothly toggle between visual Grid view (card delegates) and dense List view (row delegates).
+- **Batch File Operations**: Integrated floating operations bar supporting Copy, Cut, Delete, Select All, and Deselect.
+- **Places Drawer**: Quick jump drawer for Internal Storage, Downloads, Documents, Modding Workshop, and SD card locations.
+- **File Preview Modal**: Inspect file metadata, scene hierarchy, and textures with instant preview and opening.
+- **Real-Time Search Engine**: Instant search filtering across folders with parent path resolution.
+
+### Studio Dark UI & Theme Engine
+- **Edge-to-Edge Material 3 Layout**: Native mobile ergonomics with zero web-SaaS clutter, clean inset dividers, and bottom breathing padding.
+- **6 Studio Themes**: Ruby Dark, Obsidian (pure AMOLED black), Cyber Synth, Emerald Grove, Royal Violet, and Nord Frost.
+- **Customizable Studio Identity**: Configurable modder name, lightweight name randomizer, and 7 high-res vector avatars.
 
 ### Biome Inspector & Terrain Texturing
 - **In-Place Texture Swapping**: Change surface cap textures and vertical cliff textures instantly without mesh regeneration.
@@ -309,6 +337,7 @@ Ruby Touch is a high-performance, standalone mobile 3D scene studio and terrain 
 ### FileRift & Embedded Lua
 - **Bytecode Inspection**: Schema analysis and syntax highlighting for game data structures.
 - **Embedded Lua Runtime**: Headless ANSI C Lua engine for validating level scripts and event triggers.
+
 
 ---
 

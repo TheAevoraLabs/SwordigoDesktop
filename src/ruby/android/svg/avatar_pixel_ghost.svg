@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" width="96" height="96">
+  <defs>
+    <linearGradient id="ghostBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E1E2E"/>
+      <stop offset="100%" stop-color="#11111B"/>
+    </linearGradient>
+    <linearGradient id="ghostGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#CBA6F7"/>
+      <stop offset="100%" stop-color="#89B4FA"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="48" fill="url(#ghostBg)"/>
+  <circle cx="48" cy="48" r="46" fill="none" stroke="#CBA6F7" stroke-width="1.5" stroke-opacity="0.4"/>
+  <!-- Pixel style ghost -->
+  <path d="M28,40 Q28,24 48,24 Q68,24 68,40 L68,68 L60,62 L52,68 L48,64 L44,68 L36,62 L28,68 Z" fill="url(#ghostGrad)"/>
+  <!-- Eyes -->
+  <circle cx="40" cy="38" r="5" fill="#11111B"/>
+  <circle cx="42" cy="37" r="2" fill="#FFFFFF"/>
+  <circle cx="56" cy="38" r="5" fill="#11111B"/>
+  <circle cx="58" cy="37" r="2" fill="#FFFFFF"/>
+</svg>

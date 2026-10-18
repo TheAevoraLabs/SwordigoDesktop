@@ -57,6 +57,7 @@ struct Params {
     double hat_width_offset_1 = 5.0;     // field 10 — rim bevel width
     double hat_width_offset_2 = 5.0;     // field 11
     double horiz_noise = 0.0;            // field 6  — per-node depth jitter
+    double z = 0.0;                      // Tag 5 Depth in SceneObject (world Z position)
     // HorizNoise written back into the generator component, when that differs
     // from the value applied above. It has to be able to: a mesh rebuilt from the
     // depths recovered out of a vanilla bake must NOT have the noise applied a

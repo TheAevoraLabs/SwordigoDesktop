@@ -9,6 +9,8 @@ Rectangle {
 
     property string text: ""
     property string iconName: ""
+    property alias buttonWidth: root.width
+    property alias buttonHeight: root.height
 
     signal clicked()
 

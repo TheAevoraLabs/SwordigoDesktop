@@ -7,6 +7,8 @@ Item {
     id: root
 
     property alias currentPath: breadcrumbs.currentPath
+    property bool isSelectionMode: false
+    property string viewMode: "list"
 
     signal fileOpened(string path, string fileType)
     signal modelConvertRequested(string path)
@@ -37,11 +39,97 @@ Item {
             onUpClicked: {
                 rubyFileModel.navigateUp()
             }
+            onStorageRootsClicked: {
+                placesDrawer.open()
+            }
             onStoragePickerRequested: {
-                storageSheet.open(false)
+                placesDrawer.open()
             }
             onSearchFilterChanged: (filterText) => {
                 rubyFileModel.setFilter(filterText)
+            }
+            onRecursiveSearchRequested: (query) => {
+                rubyFileModel.searchRecursive(query)
+            }
+            onClearSearchRequested: {
+                rubyFileModel.clearSearch()
+            }
+        }
+
+        // ── Index FM Storage & Deep Search Status Strip ────────────────────
+        Rectangle {
+            width: parent.width
+            height: Theme.dp(24)
+            color: Theme.surface0
+
+            // Normal storage & folder status
+            Row {
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.dp(Theme.spacingMd)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.dp(Theme.spacingSm)
+                visible: !rubyFileModel.isSearchMode
+
+                Icon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "drive"
+                    size: Theme.dp(11)
+                    color: Theme.accentInk
+                }
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: (rubyFileModel.availableStorageStr ? (rubyFileModel.availableStorageStr + " free") : "") + "  ·  " + rubyFileModel.statusText
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    color: Theme.textMuted
+                }
+            }
+
+            // Deep Search results strip
+            Row {
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.dp(Theme.spacingMd)
+                anchors.right: parent.right
+                anchors.rightMargin: Theme.dp(Theme.spacingMd)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.dp(Theme.spacingSm)
+                visible: rubyFileModel.isSearchMode
+
+                Icon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "layers"
+                    size: Theme.dp(12)
+                    color: Theme.accentInk
+                }
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: rubyFileModel.isSearching
+                          ? qsTr("Searching subdirectories…")
+                          : qsTr("Deep Search: Found %1 matches").arg(rubyFileModel.searchResultCount)
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    font.weight: Font.DemiBold
+                    color: Theme.accentInk
+                }
+
+                Item { width: Theme.dp(10); height: 1 }
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: qsTr("Exit Search")
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    font.weight: Font.Bold
+                    color: Theme.colorErrorBright
+                    visible: !rubyFileModel.isSearching
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            breadcrumbs.searchText = ""
+                            rubyFileModel.clearSearch()
+                        }
+                    }
+                }
             }
         }
 
@@ -82,6 +170,37 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Theme.dp(Theme.spacingXs)
 
+                // Multi-select toggle button (Index FM SelectionBar style)
+                IconButton {
+                    iconName: root.isSelectionMode ? "check-square" : "check"
+                    tint: root.isSelectionMode ? Theme.accentInk : Theme.textMuted
+                    plate: root.isSelectionMode ? Theme.alpha(Theme.accentInk, 0.20) : "transparent"
+                    plateEdge: root.isSelectionMode ? Theme.alpha(Theme.accentInk, 0.40) : "transparent"
+                    buttonSize: Theme.dp(34)
+                    iconSize: Theme.dp(16)
+                    square: true
+                    onClicked: {
+                        root.isSelectionMode = !root.isSelectionMode
+                        if (!root.isSelectionMode) {
+                            rubyFileModel.clearSelection()
+                        }
+                    }
+                }
+
+                // Grid / List toggle button (Index FM ViewMode style)
+                IconButton {
+                    iconName: root.viewMode === "grid" ? "list" : "grid"
+                    tint: root.viewMode === "grid" ? Theme.accentInk : Theme.textMuted
+                    plate: root.viewMode === "grid" ? Theme.alpha(Theme.accentInk, 0.20) : "transparent"
+                    plateEdge: root.viewMode === "grid" ? Theme.alpha(Theme.accentInk, 0.40) : "transparent"
+                    buttonSize: Theme.dp(34)
+                    iconSize: Theme.dp(16)
+                    square: true
+                    onClicked: {
+                        root.viewMode = (root.viewMode === "grid" ? "list" : "grid")
+                    }
+                }
+
                 IconButton {
                     iconName: "sort"
                     buttonSize: Theme.dp(34)
@@ -103,11 +222,11 @@ Item {
             }
         }
 
-        // ── Smooth non-blocking folder scan progress bar ───────────────────
+        // ── Smooth non-blocking folder scan & search progress bar ─────────
         Item {
             width: parent.width
             height: Theme.dp(3)
-            visible: rubyFileModel.isLoading
+            visible: rubyFileModel.isLoading || rubyFileModel.isSearching
             clip: true
 
             Rectangle {
@@ -118,7 +237,7 @@ Item {
                 color: Theme.accentInk
 
                 SequentialAnimation on x {
-                    running: rubyFileModel.isLoading
+                    running: rubyFileModel.isLoading || rubyFileModel.isSearching
                     loops: Animation.Infinite
                     NumberAnimation {
                         from: -fileLoadingBar.width
@@ -130,79 +249,180 @@ Item {
             }
         }
 
-        // ── File list ──────────────────────────────────────────────────────
-        ListView {
-            id: fileListView
+        // ── Dual View Container (List View & Grid View - Index FM style) ──
+        Item {
+            id: viewContainer
             width: parent.width
-            height: parent.height - breadcrumbs.height - Theme.dp(48) - statusBar.height
+            height: parent.height - breadcrumbs.height - Theme.dp(24) - Theme.dp(48) - Theme.dp(3) - statusBar.height
             clip: true
-            boundsBehavior: Flickable.StopAtBounds
-            flickableDirection: Flickable.VerticalFlick
-            model: rubyFileModel
 
-            delegate: FileRowDelegate {
-                width: fileListView.width
-                fileName: model.fileName != null ? model.fileName : ""
-                filePath: model.filePath != null ? model.filePath : ""
-                fileType: model.fileType != null ? model.fileType : ""
-                isDir: model.isDir === true
-                fileSizeStr: model.fileSizeStr != null ? model.fileSizeStr : ""
-                fileDateStr: model.fileDateStr != null ? model.fileDateStr : ""
-                isPinned: model.isPinned === true
+            // 1. Detailed List View
+            ListView {
+                id: fileListView
+                anchors.fill: parent
+                visible: root.viewMode === "list"
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                flickableDirection: Flickable.VerticalFlick
+                model: rubyFileModel
 
-                function popContext() {
-                    if (!model || !model.filePath) return
-                    contextSheet.targetFilePath = model.filePath
-                    contextSheet.targetFileName = model.fileName
-                    contextSheet.targetIsDir = model.isDir
-                    contextSheet.targetFileType = model.fileType
-                    contextSheet.open(false)
-                }
+                delegate: FileRowDelegate {
+                    width: fileListView.width
+                    fileName: model.fileName != null ? model.fileName : ""
+                    filePath: model.filePath != null ? model.filePath : ""
+                    fileType: model.fileType != null ? model.fileType : ""
+                    isDir: model.isDir === true
+                    fileSizeStr: model.fileSizeStr != null ? model.fileSizeStr : ""
+                    fileDateStr: model.fileDateStr != null ? model.fileDateStr : ""
+                    isPinned: model.isPinned === true
+                    isSelectionMode: root.isSelectionMode
+                    isSelected: model.isSelected === true
 
-                onRowClicked: {
-                    if (!model || !model.filePath) return
-                    if (model.isDir) {
-                        rubyFileModel.navigateTo(model.filePath)
-                    } else {
-                        root.fileOpened(model.filePath, model.fileType)
+                    function popContext() {
+                        if (!model || !model.filePath) return
+                        contextSheet.targetFilePath = model.filePath
+                        contextSheet.targetFileName = model.fileName
+                        contextSheet.targetIsDir = model.isDir
+                        contextSheet.targetFileType = model.fileType
+                        contextSheet.open(false)
+                    }
+
+                    onSelectionToggled: {
+                        rubyFileModel.toggleItemSelected(model.filePath)
+                    }
+
+                    onRowClicked: {
+                        if (!model || !model.filePath) return
+                        if (model.isDir) {
+                            rubyFileModel.navigateTo(model.filePath)
+                        } else {
+                            root.fileOpened(model.filePath, model.fileType)
+                        }
+                    }
+
+                    onRowLongPressed: {
+                        if (!model || !model.filePath) return
+                        if (!root.isSelectionMode) {
+                            root.isSelectionMode = true
+                            rubyFileModel.setItemSelected(model.filePath, true)
+                        } else {
+                            rubyFileModel.toggleItemSelected(model.filePath)
+                        }
+                        if (typeof rubySettings !== "undefined" && rubySettings && rubySettings.hapticsEnabled) {
+                            if (typeof androidContext !== "undefined" && androidContext && typeof androidContext.vibrate === "function") {
+                                androidContext.vibrate(25)
+                            }
+                        }
+                    }
+
+                    onActionRequested: (action) => {
+                        if (action === "menu") popContext()
+                    }
+
+                    onDeleteClicked: {
+                        deleteDialog.isBatch = false
+                        deleteDialog.targetPath = model.filePath
+                        deleteDialog.targetName = model.fileName
+                        deleteDialog.open()
+                    }
+
+                    onRenameClicked: {
+                        renameDialog.targetPath = model.filePath
+                        renameDialog.targetName = model.fileName
+                        renameDialog.initialText = model.fileName
+                        renameDialog.open()
+                    }
+
+                    onPinToggled: {
+                        rubyFileModel.togglePin(model.filePath)
                     }
                 }
+            }
 
-                onRowLongPressed: popContext()
+            // 2. Card Grid View (Index FM style)
+            GridView {
+                id: fileGridView
+                anchors.fill: parent
+                anchors.leftMargin: Theme.dp(Theme.spacingMd)
+                anchors.rightMargin: Theme.dp(Theme.spacingMd)
+                visible: root.viewMode === "grid"
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                flickableDirection: Flickable.VerticalFlick
+                cellWidth: fileGridView.width > Theme.dp(460) ? (fileGridView.width / 3) : (fileGridView.width / 2)
+                cellHeight: Theme.dp(140)
+                model: rubyFileModel
 
-                // The ⋮ button previously emitted actionRequested("menu") into
-                // the void — nothing in FilesView listened, so it looked broken.
-                onActionRequested: (action) => {
-                    if (action === "menu") popContext()
-                }
+                delegate: FileCardDelegate {
+                    fileName: model.fileName != null ? model.fileName : ""
+                    filePath: model.filePath != null ? model.filePath : ""
+                    fileType: model.fileType != null ? model.fileType : ""
+                    isDir: model.isDir === true
+                    fileSizeStr: model.fileSizeStr != null ? model.fileSizeStr : ""
+                    fileDateStr: model.fileDateStr != null ? model.fileDateStr : ""
+                    isPinned: model.isPinned === true
+                    isSelectionMode: root.isSelectionMode
+                    isSelected: model.isSelected === true
 
-                onDeleteClicked: {
-                    if (!model || !model.filePath) return
-                    deleteDialog.targetPath = model.filePath
-                    deleteDialog.targetName = model.fileName
-                    deleteDialog.open()
-                }
+                    function popContext() {
+                        if (!model || !model.filePath) return
+                        contextSheet.targetFilePath = model.filePath
+                        contextSheet.targetFileName = model.fileName
+                        contextSheet.targetIsDir = model.isDir
+                        contextSheet.targetFileType = model.fileType
+                        contextSheet.open(false)
+                    }
 
-                onRenameClicked: {
-                    if (!model || !model.filePath) return
-                    renameDialog.targetPath = model.filePath
-                    renameDialog.targetName = model.fileName
-                    renameDialog.initialText = model.fileName
-                    renameDialog.open()
-                }
+                    onSelectionToggled: {
+                        rubyFileModel.toggleItemSelected(model.filePath)
+                    }
 
-                onPinToggled: {
-                    if (!model || !model.filePath) return
-                    rubyFileModel.togglePin(model.filePath)
+                    onCardClicked: {
+                        if (!model || !model.filePath) return
+                        if (model.isDir) {
+                            rubyFileModel.navigateTo(model.filePath)
+                        } else {
+                            root.fileOpened(model.filePath, model.fileType)
+                        }
+                    }
+
+                    onCardLongPressed: {
+                        if (!model || !model.filePath) return
+                        if (!root.isSelectionMode) {
+                            root.isSelectionMode = true
+                            rubyFileModel.setItemSelected(model.filePath, true)
+                        } else {
+                            rubyFileModel.toggleItemSelected(model.filePath)
+                        }
+                        if (typeof rubySettings !== "undefined" && rubySettings && rubySettings.hapticsEnabled) {
+                            if (typeof androidContext !== "undefined" && androidContext && typeof androidContext.vibrate === "function") {
+                                androidContext.vibrate(25)
+                            }
+                        }
+                    }
+
+                    onActionRequested: (action) => {
+                        if (action === "menu") popContext()
+                    }
+
+                    onPreviewRequested: {
+                        if (!model || !model.filePath) return
+                        filePreviewModal.openWith(model.filePath, model.fileName, model.fileType, model.isDir)
+                    }
+
+                    onPinToggled: {
+                        if (!model || !model.filePath) return
+                        rubyFileModel.togglePin(model.filePath)
+                    }
                 }
             }
 
             // Empty state
             Item {
                 anchors.centerIn: parent
-                visible: fileListView.count === 0
+                visible: rubyFileModel.count === 0 && !rubyFileModel.isLoading && !rubyFileModel.isSearching
                 width: parent.width * 0.7
-                height: Theme.dp(120)
+                height: Theme.dp(140)
 
                 Column {
                     anchors.centerIn: parent
@@ -227,7 +447,7 @@ Item {
 
                     Text {
                         anchors.horizontalCenter: parent.horizontalCenter
-                        text: qsTr("Nothing here")
+                        text: rubyFileModel.isSearchMode ? qsTr("No search results") : qsTr("Nothing here")
                         font.pixelSize: Theme.dp(Theme.fontLg)
                         font.weight: Font.DemiBold
                         color: Theme.textSecondary
@@ -237,7 +457,7 @@ Item {
                         anchors.horizontalCenter: parent.horizontalCenter
                         width: parent.width
                         horizontalAlignment: Text.AlignHCenter
-                        text: qsTr("This folder is empty, or the filter hides everything in it.")
+                        text: rubyFileModel.isSearchMode ? qsTr("No matching files found across subdirectories.") : qsTr("This folder is empty, or the filter hides everything in it.")
                         font.pixelSize: Theme.dp(Theme.fontSm)
                         color: Theme.textMuted
                         wrapMode: Text.WordWrap
@@ -326,6 +546,92 @@ Item {
         }
     }
 
+    // ── OperationsBar (Batch / Single file quick action dock) ──────────────
+    OperationsBar {
+        id: operationsBar
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: Theme.dp(Theme.spacingMd)
+        anchors.rightMargin: Theme.dp(Theme.spacingMd)
+        anchors.bottomMargin: Theme.dp(16)
+        z: 10
+
+        selectedCount: root.isSelectionMode ? rubyFileModel.selectedCount : (operationsBar.targetPath.length > 0 ? 1 : 0)
+        totalSizeStr: root.isSelectionMode ? rubyFileModel.getSelectedTotalBytesStr() : ""
+
+        onCloseRequested: {
+            root.isSelectionMode = false
+            rubyFileModel.clearSelection()
+            operationsBar.targetPath = ""
+            operationsBar.targetFileName = ""
+        }
+
+        onZipRequested: (path) => {
+            if (root.isSelectionMode && rubyFileModel.selectedCount > 1) {
+                operationsBar.isBusy = true
+                operationsBar.statusText = qsTr("Compressing %1 files…").arg(rubyFileModel.selectedCount)
+                rubyFileModel.compressMultiple(rubyFileModel.getSelectedPaths())
+                operationsBar.isBusy = false
+                root.isSelectionMode = false
+                rubyFileModel.clearSelection()
+            } else {
+                var p = path || operationsBar.targetPath
+                if (!p) return
+                operationsBar.isBusy = true
+                operationsBar.statusText = qsTr("Compressing…")
+                rubyFileModel.compressToZip(p)
+                operationsBar.isBusy = false
+                operationsBar.targetPath = ""
+                operationsBar.targetFileName = ""
+            }
+        }
+
+        onCopyRequested: (path) => {
+            if (root.isSelectionMode && rubyFileModel.selectedCount > 1) {
+                rubyFileModel.copyMultiple(rubyFileModel.getSelectedPaths())
+                root.isSelectionMode = false
+                rubyFileModel.clearSelection()
+            } else {
+                var p = path || operationsBar.targetPath
+                if (!p) return
+                rubyFileModel.copyItem(p)
+                operationsBar.targetPath = ""
+                operationsBar.targetFileName = ""
+            }
+        }
+
+        onCutRequested: (path) => {
+            if (root.isSelectionMode && rubyFileModel.selectedCount > 1) {
+                rubyFileModel.cutMultiple(rubyFileModel.getSelectedPaths())
+                root.isSelectionMode = false
+                rubyFileModel.clearSelection()
+            } else {
+                var p = path || operationsBar.targetPath
+                if (!p) return
+                rubyFileModel.cutItem(p)
+                operationsBar.targetPath = ""
+                operationsBar.targetFileName = ""
+            }
+        }
+
+        onDeleteRequested: (path) => {
+            if (root.isSelectionMode && rubyFileModel.selectedCount > 1) {
+                deleteDialog.isBatch = true
+                deleteDialog.targetPaths = rubyFileModel.getSelectedPaths()
+                deleteDialog.targetName = qsTr("%1 selected items").arg(rubyFileModel.selectedCount)
+                deleteDialog.open()
+            } else {
+                var p = path || operationsBar.targetPath
+                if (!p) return
+                deleteDialog.isBatch = false
+                deleteDialog.targetPath = p
+                deleteDialog.targetName = operationsBar.targetFileName
+                deleteDialog.open()
+            }
+        }
+    }
+
     // ── Floating Action Button (Create) ────────────────────────────────────
     Rectangle {
         id: createFab
@@ -339,7 +645,7 @@ Item {
         color: fabMouseArea.pressed ? Theme.accentEnd : Theme.accentStart
         border.color: Theme.alpha(Theme.accentInk, 0.5)
         border.width: 1
-        visible: !createSheet.isOpen
+        visible: !createSheet.isOpen && !operationsBar.active
 
         Icon {
             anchors.centerIn: parent
@@ -699,12 +1005,27 @@ Item {
         property bool targetIsDir: false
         property string targetFileType: ""
         title: targetFileName
-        peekHeight: Theme.dp(340)
+        peekHeight: Theme.dp(390)
 
         Column {
             anchors.fill: parent
             anchors.margins: Theme.dp(Theme.spacingLg)
             spacing: Theme.dp(Theme.spacingSm)
+
+            MenuRow {
+                width: parent.width
+                iconName: "info"
+                accent: true
+                text: qsTr("Quick Preview & Properties")
+                onClicked: {
+                    var p = contextSheet.targetFilePath
+                    var n = contextSheet.targetFileName
+                    var ft = contextSheet.targetFileType
+                    var idr = contextSheet.targetIsDir
+                    contextSheet.close()
+                    filePreviewModal.openWith(p, n, ft, idr)
+                }
+            }
 
             MenuRow {
                 width: parent.width
@@ -850,13 +1171,23 @@ Item {
     // ── Dialogs ────────────────────────────────────────────────────────────
     ConfirmDialog {
         id: deleteDialog
+        property bool isBatch: false
+        property var targetPaths: []
         property string targetPath: ""
         property string targetName: ""
         title: qsTr("Delete")
-        message: qsTr("Permanently delete “%1”?").arg(targetName)
+        message: isBatch ? qsTr("Permanently delete %1 selected items?").arg(targetPaths ? targetPaths.length : 0) : qsTr("Permanently delete “%1”?").arg(targetName)
         danger: true
         confirmText: qsTr("Delete")
-        onConfirmed: rubyFileModel.deleteItem(deleteDialog.targetPath)
+        onConfirmed: {
+            if (isBatch && targetPaths && targetPaths.length > 0) {
+                rubyFileModel.deleteMultiple(targetPaths)
+                root.isSelectionMode = false
+                rubyFileModel.clearSelection()
+            } else if (targetPath.length > 0) {
+                rubyFileModel.deleteItem(targetPath)
+            }
+        }
     }
 
     TextInputDialog {
@@ -893,6 +1224,38 @@ Item {
         id: podConvertDialog
         onOpenConvertedModel: (podPath) => {
             root.fileOpened(podPath, "model")
+        }
+    }
+
+    // ── Index FM Places & Storage Drawer ───────────────────────────────────
+    PlacesDrawer {
+        id: placesDrawer
+        onPlaceSelected: (path) => {
+            rubyFileModel.navigateTo(path)
+        }
+    }
+
+    // ── Index FM File Preview & Properties Modal ───────────────────────────
+    FilePreviewModal {
+        id: filePreviewModal
+        onFileOpenRequested: (path, type) => {
+            root.fileOpened(path, type)
+        }
+        onStartSceneRequested: (path) => {
+            rubyFileModel.startSceneInGame(path)
+        }
+        onExtractArchiveRequested: (path, toSubfolder) => {
+            rubyFileModel.extractArchive(path, toSubfolder)
+        }
+        onExtractLuaRequested: (path) => {
+            var extracted = rubyFileModel.extractLuaFromScene(path)
+            if (extracted && extracted.length > 0) {
+                root.fileOpened(extracted, "code")
+            }
+        }
+        onConvertPodRequested: (path) => {
+            podConvertDialog.initForSource(path)
+            podConvertDialog.open()
         }
     }
 }

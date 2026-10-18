@@ -2,107 +2,107 @@ import QtQuick
 import QtQuick.Controls
 import ".."
 
-// Primary 4-tab navigation. Contract preserved: `currentIndex` + tabSelected(int).
-Item {
+// Material 3 Native Edge-to-Edge Navigation Bar for Ruby Touch
+// Contract preserved: `currentIndex` + tabSelected(int).
+Rectangle {
     id: root
 
     readonly property real safeBottom: (typeof androidContext !== "undefined" && androidContext) ? androidContext.safeInsetBottom : 0
-    height: Theme.dp(Theme.navBarHeight) + safeBottom
-    property int currentIndex: 1 // Default to Files
+    height: Theme.dp(72) + safeBottom
+    color: Theme.surface1
+    z: 20
+
+    property int currentIndex: 0 // Default to Home
 
     signal tabSelected(int index)
 
     readonly property var tabs: [
-        { name: "Home",     icon: "home"   },
-        { name: "Files",    icon: "folder" },
-        { name: "Tools",    icon: "tune"   },
-        { name: "Settings", icon: "gear"   }
+        { name: qsTr("Home"),     icon: "home"   },
+        { name: qsTr("Files"),    icon: "folder" },
+        { name: qsTr("Tools"),    icon: "tune"   },
+        { name: qsTr("Settings"), icon: "gear"   }
     ]
 
+    // Subtle 1px top divider line (no boxy borders around the bar)
     Rectangle {
-        anchors.fill: parent
-        color: Theme.surface1
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: 1
+        color: Theme.borderSubtle
+    }
 
-        // Hairline on the top edge only — a full border reads as a boxed-in
-        // strip on a phone; the single edge keeps it feeling like a floating bar.
-        Rectangle {
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
-            height: 1
-            color: Theme.borderSubtle
-        }
+    Row {
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: Theme.dp(72)
 
-        Item {
-            anchors.top: parent.top
-            anchors.left: parent.left
-            anchors.right: parent.right
-            height: Theme.dp(Theme.navBarHeight)
+        Repeater {
+            model: root.tabs
 
-            Row {
-                anchors.fill: parent
+            Item {
+                id: tabItem
+                width: root.width / root.tabs.length
+                height: parent.height
 
-            Repeater {
-                model: root.tabs
+                readonly property bool active: root.currentIndex === index
 
-                Item {
-                    id: tabItem
-                    width: root.width / root.tabs.length
-                    height: parent.height
+                Column {
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(4)
 
-                    readonly property bool active: root.currentIndex === index
-
-                    // Active pill behind the icon
+                    // M3 Active Pill: Wraps ONLY the icon (56dp x 30dp)
                     Rectangle {
-                        id: pill
                         anchors.horizontalCenter: parent.horizontalCenter
-                        anchors.top: parent.top
-                        anchors.topMargin: Theme.dp(8)
-                        width: Theme.dp(64)
+                        width: Theme.dp(56)
                         height: Theme.dp(30)
-                        radius: Theme.radiusPill
-                        color: tabItem.active ? Theme.alpha(Theme.accentEnd, 0.18) : "transparent"
-                        border.color: tabItem.active ? Theme.alpha(Theme.accentEnd, 0.35) : "transparent"
-                        border.width: tabItem.active ? 1 : 0
+                        radius: Theme.dp(15)
+                        color: tabItem.active ? Theme.alpha(Theme.accentInk, 0.18) : "transparent"
 
                         Behavior on color { ColorAnimation { duration: Theme.durMed } }
+
+                        Icon {
+                            anchors.centerIn: parent
+                            name: modelData.icon
+                            size: Theme.dp(Theme.iconMd)
+                            weight: tabItem.active ? 2.2 : Icons.stroke
+                            color: tabItem.active ? Theme.accentInk : Theme.textMuted
+                            scale: tabMouse.pressed ? 0.92 : 1.0
+
+                            Behavior on color { ColorAnimation { duration: Theme.durMed } }
+                            Behavior on scale { NumberAnimation { duration: 100 } }
+                        }
                     }
 
-                    Icon {
-                        id: tabIcon
-                        anchors.centerIn: pill
-                        name: modelData.icon
-                        size: Theme.dp(Theme.iconMd)
-                        weight: tabItem.active ? 2.0 : Icons.stroke
-                        color: tabItem.active ? Theme.accentInk : Theme.textMuted
-
-                        Behavior on color { ColorAnimation { duration: Theme.durMed } }
-                    }
-
+                    // Tab Text Label: Cleanly sits below the active pill
                     Text {
-                        anchors.top: pill.bottom
-                        anchors.topMargin: Theme.dp(3)
                         anchors.horizontalCenter: parent.horizontalCenter
                         text: modelData.name
-                        font.pixelSize: Theme.dp(Theme.fontSm)
+                        font.pixelSize: Theme.dp(11)
                         font.weight: tabItem.active ? Font.DemiBold : Font.Normal
                         color: tabItem.active ? Theme.textPrimary : Theme.textMuted
 
                         Behavior on color { ColorAnimation { duration: Theme.durMed } }
                     }
+                }
 
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: {
-                            if (root.currentIndex !== index) {
-                                root.currentIndex = index
-                                root.tabSelected(index)
+                MouseArea {
+                    id: tabMouse
+                    anchors.fill: parent
+                    onClicked: {
+                        if (root.currentIndex !== index) {
+                            if (typeof rubySettings !== "undefined" && rubySettings && rubySettings.hapticsEnabled) {
+                                if (typeof androidContext !== "undefined" && androidContext && typeof androidContext.vibrate === "function") {
+                                    androidContext.vibrate(15)
+                                }
                             }
+                            root.currentIndex = index
+                            root.tabSelected(index)
                         }
                     }
                 }
             }
         }
     }
-}
 }
