@@ -2,7 +2,7 @@
 
 All notable changes to Swordigo Desktop.
 
-## [1.4.5] — Multi-Sheet Volumetric Water Engine, Decomp-Faithful Water Box HUD, Index-FM File Manager, and Studio Dark UI Remaster
+## [1.4.4] — Multi-Sheet Volumetric Water Engine, Decomp-Faithful Water Box HUD, Index-FM File Manager, Spectrum Color Picker, and Studio Dark UI Remaster
 
 ### Added
 - **Multi-Sheet Volumetric Water Engine (`rubywater_meta.h`, `scene_loader.cpp`, `water_renderer.cpp`, `ruby_quick_viewport.cpp`)**:
@@ -14,6 +14,13 @@ All notable changes to Swordigo Desktop.
   - Interactive 4-corner dragging (`TL`, `TR`, `BR`, `BL`) and edge midpoint dragging with strict 90° rectangular geometry preservation.
   - In-viewport Water HUD with live `Water W×H` dimensions badge, corner cycler, width/height increment steppers (`[-] W [+]`, `[-] H [+]`), reset, discard, and apply controls.
   - 3D Volumetric Fluid Cage visual overlay with glowing cyan front contour, back plane, depth struts, animated wave crest, corner diamonds, and midpoint handles.
+- **Interactive HSV Spectrum Color Picker in WaterMesh Studio**:
+  - Full continuous HSV spectrum slider + saturation/brightness canvas and quick fluid color swatches for deep body and surface crest colors.
+  - Interactive live preview and direct hex input with instant viewport shader sync.
+- **Deadly Fluid Hazard & Damage Control (`CollisionShapeComponent` + `DamageComponent`)**:
+  - Full integration of Swordigo's hazard collision pipeline: toggle deadly fluid (`InflictsDamage` / `SpecialType: 6`).
+  - Adjustable damage rate / amount (`MinDamage` / `MaxDamage`), damage type (Physical/Fire vs Magical), and immunity bypass (`IgnoreTargetImmunity`).
+  - Contact reaction triggers matching engine decompilation (`fireblast` woosh / `watersplash`).
 - **Index-FM Remastered Mobile File Manager (`FilesView.qml`, `OperationsBar.qml`, `FilePreviewModal.qml`, `PlacesDrawer.qml`, `ruby_file_model.cpp`)**:
   - Deep integration of native index-fm mobile file manager patterns into Ruby Touch.
   - Dual view modes: Grid view (card delegates) and List view (dense row delegates) with smooth animated switching.
@@ -33,17 +40,6 @@ All notable changes to Swordigo Desktop.
     - Deduplicated Recent Files list (starts from index 1 when hero shows index 0) with parent directory path format and inset list dividers (`64dp`).
     - Replaced duplicate top-right Settings gear with flat Material Search button.
     - Borderless tonal surface hierarchy across hero cards, modding guide cards, and identity header.
-
-## [1.4.4] — Interactive Spectrum Color Picker, Deadly Fluid Hazard Control, and Decomp-Accurate Damage Pipeline
-
-### Added
-- **Interactive HSV Spectrum Color Picker in WaterMesh Studio**:
-  - Full continuous HSV spectrum slider + saturation/brightness canvas and quick fluid color swatches for deep body and surface crest colors.
-  - Interactive live preview and direct hex input with instant viewport shader sync.
-- **Deadly Fluid Hazard & Damage Control (`CollisionShapeComponent` + `DamageComponent`)**:
-  - Full integration of Swordigo's hazard collision pipeline: toggle deadly fluid (`InflictsDamage` / `SpecialType: 6`).
-  - Adjustable damage rate / amount (`MinDamage` / `MaxDamage`), damage type (Physical/Fire vs Magical), and immunity bypass (`IgnoreTargetImmunity`).
-  - Contact reaction triggers matching engine decompilation (`fireblast` woosh / `watersplash`).
 
 ## [1.4.3] — Mobile performance overhaul, 120Hz VSync pacing, and native WaterMesh Studio
 
