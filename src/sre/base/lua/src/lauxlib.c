@@ -1,5 +1,5 @@
 /*
-** $Id: lauxlib.c,v 1.158 2006/01/16 12:42:21 roberto Exp $
+** $Id: lauxlib.c,v 1.159.1.3 2008/01/21 13:20:51 roberto Exp $
 ** Auxiliary functions for building Lua libraries
 ** See Copyright Notice in lua.h
 */
@@ -8,7 +8,6 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +22,7 @@
 
 #include "lua.h"
 
+#include <stdint.h>
 #include "lauxlib.h"
 
 
@@ -124,11 +124,17 @@ LUALIB_API int luaL_newmetatable (lua_State *L, const char *tname) {
 
 LUALIB_API void *luaL_checkudata (lua_State *L, int ud, const char *tname) {
   void *p = lua_touserdata(L, ud);
-  lua_getfield(L, LUA_REGISTRYINDEX, tname);  /* get correct metatable */
-  if (p == NULL || !lua_getmetatable(L, ud) || !lua_rawequal(L, -1, -2))
-    luaL_typerror(L, ud, tname);
-  lua_pop(L, 2);  /* remove both metatables */
-  return p;
+  if (p != NULL) {  /* value is a userdata? */
+    if (lua_getmetatable(L, ud)) {  /* does it have a metatable? */
+      lua_getfield(L, LUA_REGISTRYINDEX, tname);  /* get correct metatable */
+      if (lua_rawequal(L, -1, -2)) {  /* does it have the correct mt? */
+        lua_pop(L, 2);  /* remove both metatables */
+        return p;
+      }
+    }
+  }
+  luaL_typerror(L, ud, tname);  /* else error */
+  return NULL;  /* to avoid warnings */
 }
 
 
@@ -239,7 +245,7 @@ LUALIB_API void luaI_openlib (lua_State *L, const char *libname,
   if (libname) {
     int size = libsize(l);
     /* check whether lib already exists */
-    luaL_findtable(L, LUA_REGISTRYINDEX, "_LOADED", size);
+    luaL_findtable(L, LUA_REGISTRYINDEX, "_LOADED", 1);
     lua_getfield(L, -1, libname);  /* get _LOADED[libname] */
     if (!lua_istable(L, -1)) {  /* not found? */
       lua_pop(L, 1);  /* remove previous result */
@@ -530,7 +536,7 @@ static const char *getF (lua_State *L, void *ud, size_t *size) {
     return "\n";
   }
   if (feof(lf->f)) return NULL;
-  *size = fread(lf->buff, 1, LUAL_BUFFERSIZE, lf->f);
+  *size = fread(lf->buff, 1, sizeof(lf->buff), lf->f);
   return (*size > 0) ? lf->buff : NULL;
 }
 
@@ -544,20 +550,22 @@ static int errfile (lua_State *L, const char *what, int fnameindex) {
 }
 
 
-extern const char* sre_vfs_resolve_path(const char* path, char* out_buf);
-
 LUALIB_API int luaL_loadfile (lua_State *L, const char *filename) {
-  int fnameindex = lua_gettop(L) + 1;
-
+  int fnameindex = lua_gettop(L) + 1;  /* index of filename on the stack */
   if (filename == NULL) {
-    /* stdin: fall back to original streaming approach — no SCL handling needed */
     LoadF lf;
-    int status, readstatus;
     lf.extraline = 0;
     lua_pushliteral(L, "=stdin");
     lf.f = stdin;
-    status = lua_load(L, getF, &lf, lua_tostring(L, -1));
-    readstatus = ferror(lf.f);
+    int c = getc(lf.f);
+    if (c == '#') {
+      lf.extraline = 1;
+      while ((c = getc(lf.f)) != EOF && c != '\n') ;
+      if (c == '\n') c = getc(lf.f);
+    }
+    ungetc(c, lf.f);
+    int status = lua_load(L, getF, &lf, lua_tostring(L, -1));
+    int readstatus = ferror(lf.f);
     if (readstatus) {
       lua_settop(L, fnameindex);
       return errfile(L, "read", fnameindex);
@@ -566,20 +574,14 @@ LUALIB_API int luaL_loadfile (lua_State *L, const char *filename) {
     return status;
   }
 
-  /* For named files: read entirely into memory so we can run SCL extraction.
-   * luaL_loadbuffer already contains the protobuf + plain-text SCL detector. */
-  char vfs_buf[512];
-  const char* real_path = sre_vfs_resolve_path(filename, vfs_buf);
-  lua_pushfstring(L, "@%s", filename);
-
-  FILE* f = fopen(real_path, "rb");
+  FILE* f = fopen(filename, "rb");
   if (f == NULL) return errfile(L, "open", fnameindex);
 
   fseek(f, 0, SEEK_END);
   long fsize = ftell(f);
   fseek(f, 0, SEEK_SET);
 
-  if (fsize <= 0 || fsize > 4 * 1024 * 1024) {
+  if (fsize <= 0 || fsize > 64 * 1024 * 1024) {
     fclose(f);
     lua_pushfstring(L, "cannot load %s: %s", filename,
                     fsize <= 0 ? "empty file" : "file too large");
@@ -610,7 +612,6 @@ LUALIB_API int luaL_loadfile (lua_State *L, const char *filename) {
   lua_remove(L, fnameindex);
   return status;
 }
-
 
 typedef struct LoadS {
   const char *s;
@@ -876,4 +877,3 @@ LUALIB_API lua_State *luaL_newstate (void) {
   }
   return L;
 }
-

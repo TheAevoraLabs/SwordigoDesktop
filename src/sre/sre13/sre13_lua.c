@@ -37,12 +37,11 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Vendored Lua 5.1 headers — struct layout of the fields we touch matches
- * the engine's modified lua_State exactly (verified against IDA: status@0x0A,
- * top@0x10, base@0x18, ci@0x28, stack@0x40, base_ci@0x50, nCcalls@0x60,
- * openupval@0x70). errorJmp is NOT at the stock 0x80 — the engine inserts
- * extra fields before it (0xA8) — so it is handled via LUA_ERRORJMP_OFFSET
- * from sre_setjmp.h, never via struct access. */
+/* Vendored Lua 5.1.5 headers — struct layout matches official libswordigo.so
+ * (built with vanilla Lua 5.1.5 64-bit): status@0x0A, top@0x10, base@0x18,
+ * ci@0x28, stack@0x40, base_ci@0x50, nCcalls@0x60, baseCcalls@0x62,
+ * openupval@0x98, errorJmp@0xA8. LUA_ERRORJMP_OFFSET (0xA8) from sre_setjmp.h
+ * matches offsetof(lua_State, errorJmp) exactly. */
 #include "lua.h"
 #include "lstate.h"
 #include "lfunc.h"
