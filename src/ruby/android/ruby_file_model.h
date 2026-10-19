@@ -9,6 +9,8 @@
 #include <QString>
 #include <QPointer>
 #include <atomic>
+#include <memory>
+#include "file_operations.h"
 
 namespace ruby::android {
 
@@ -62,6 +64,20 @@ class RubyFileModel : public QAbstractListModel {
     Q_PROPERTY(qreal storageUsagePercent READ storageUsagePercent NOTIFY storageInfoChanged)
     Q_PROPERTY(QString currentFolderSizeStr READ currentFolderSizeStr NOTIFY folderInfoChanged)
     Q_PROPERTY(int selectedCount READ selectedCount NOTIFY selectionChanged)
+    // ── Async file-operation state (copy/move/delete/zip/extract) ────────
+    // The actual work runs on a worker thread; these properties are a thin
+    // facade over FileOperations so QML never needs the C++ type registered.
+    Q_PROPERTY(bool operationBusy READ operationBusy NOTIFY operationStateChanged)
+    Q_PROPERTY(QString operationTitle READ operationTitle NOTIFY operationStateChanged)
+    Q_PROPERTY(QString operationDetail READ operationDetail NOTIFY operationStateChanged)
+    Q_PROPERTY(qreal operationProgress READ operationProgress NOTIFY operationStateChanged)
+    Q_PROPERTY(QString operationBytesStr READ operationBytesStr NOTIFY operationStateChanged)
+    Q_PROPERTY(QString operationItemsStr READ operationItemsStr NOTIFY operationStateChanged)
+    Q_PROPERTY(bool conflictActive READ conflictActive NOTIFY operationStateChanged)
+    Q_PROPERTY(QString conflictSourceName READ conflictSourceName NOTIFY operationStateChanged)
+    Q_PROPERTY(QString conflictTargetName READ conflictTargetName NOTIFY operationStateChanged)
+    Q_PROPERTY(QString conflictTargetDir READ conflictTargetDir NOTIFY operationStateChanged)
+    Q_PROPERTY(QString clipboardSummary READ clipboardSummary NOTIFY clipboardChanged)
 
 public:
     enum FileRoles {
@@ -76,6 +92,7 @@ public:
     };
 
     explicit RubyFileModel(QObject* parent = nullptr);
+    ~RubyFileModel() override;
 
     int rowCount(const QModelIndex& parent = QModelIndex()) const override;
     QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override;
@@ -115,6 +132,18 @@ public:
     QString currentFolderSizeStr() const { return m_currentFolderSizeStr; }
     int selectedCount() const { return m_selectedPaths.size(); }
 
+    bool operationBusy() const;
+    QString operationTitle() const;
+    QString operationDetail() const;
+    qreal operationProgress() const;
+    QString operationBytesStr() const;
+    QString operationItemsStr() const;
+    bool conflictActive() const;
+    QString conflictSourceName() const;
+    QString conflictTargetName() const;
+    QString conflictTargetDir() const;
+    QString clipboardSummary() const;
+
     Q_INVOKABLE void setCategory(const QString& category);
     Q_INVOKABLE void setSortMode(const QString& mode);
     Q_INVOKABLE void setSortAscending(bool ascending);
@@ -138,14 +167,23 @@ public:
     Q_INVOKABLE void toggleItemSelected(const QString& path);
     Q_INVOKABLE bool isItemSelected(const QString& path) const;
     Q_INVOKABLE void selectAll();
+    Q_INVOKABLE void invertSelection();
     Q_INVOKABLE void clearSelection();
+    Q_INVOKABLE void removeSelectedPath(const QString& path);
     Q_INVOKABLE QStringList getSelectedPaths() const;
+    Q_INVOKABLE QVariantList getSelectedItems() const;
     Q_INVOKABLE QString getSelectedTotalBytesStr() const;
 
     Q_INVOKABLE bool deleteMultiple(const QStringList& paths);
     Q_INVOKABLE void copyMultiple(const QStringList& paths);
     Q_INVOKABLE void cutMultiple(const QStringList& paths);
     Q_INVOKABLE bool compressMultiple(const QStringList& paths, const QString& outZipPath = QString());
+    Q_INVOKABLE void shareSelected();
+    Q_INVOKABLE void shareFiles(const QStringList& paths);
+    Q_INVOKABLE void sanitizeSelectedAudio();
+
+    // ── File Permissions & POSIX Control (Index FM FileProperties) ────
+    Q_INVOKABLE bool setFilePermission(const QString& path, const QString& user, const QString& perm, bool enable);
 
     // ── Deep Recursive Search (Index & HyprFM SearchEngine) ───────────
     Q_INVOKABLE void searchRecursive(const QString& query);
@@ -163,6 +201,8 @@ public:
     Q_INVOKABLE void copyItem(const QString& path);
     Q_INVOKABLE void clearClipboard();
     Q_INVOKABLE bool paste();
+    Q_INVOKABLE void cancelFileOperation();
+    Q_INVOKABLE void resolveFileConflict(int decision, bool applyToAll = false);
 
     // ── ZArchiver-Grade Archive Operations ──────────────────────────────
     Q_INVOKABLE bool compressToZip(const QString& targetPath, const QString& outZipPath = QString());
@@ -172,6 +212,7 @@ public:
     // ── Asset Data Extraction & Conversion ──────────────────────────────
     Q_INVOKABLE QString extractLuaFromScene(const QString& scenePath);
     Q_INVOKABLE bool exportTextureToPng(const QString& texPath, const QString& outPngPath = QString());
+    Q_INVOKABLE bool sanitizeAudioForEngine(const QString& audioPath, bool replaceOriginal = true);
 
     // ── Storage Roots & Item Properties ─────────────────────────────────
     Q_INVOKABLE QVariantList detectStorageRoots();
@@ -219,6 +260,8 @@ signals:
     void storageInfoChanged();
     void folderInfoChanged();
     void selectionChanged();
+    void operationStateChanged();
+    void operationFinished(int kind, bool ok, bool cancelled, const QString& summary);
 
 private:
     void reload();
@@ -244,6 +287,7 @@ private:
 
     QSet<QString> m_selectedPaths;
     QStringList m_clipboardPaths;
+    std::unique_ptr<FileOperations> m_operations;
 
     bool m_isSearching = false;
     bool m_isSearchMode = false;

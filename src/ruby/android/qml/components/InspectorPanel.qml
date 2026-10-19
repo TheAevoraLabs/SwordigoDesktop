@@ -41,6 +41,7 @@ Rectangle {
     property bool maximized: false
     property bool isGroundMesh: false
     property bool isWater: false
+    property bool isModel: false
 
     signal openWaterStudioRequested()
 
@@ -78,7 +79,7 @@ Rectangle {
         case "posZ":   return posZField
         case "rotX":   return rotXField
         case "rotY":   return rotYField
-        case "rotZ":   return rotZField
+        case "rotZ":   return (root.isGroundMesh || root.isWater) ? planarRotField : rotZField
         case "scaleX": return scaleXField
         case "scaleY": return scaleYField
         case "scaleZ": return scaleZField
@@ -91,9 +92,9 @@ Rectangle {
         case "posX":   return qsTr("Position X")
         case "posY":   return qsTr("Position Y")
         case "posZ":   return qsTr("Position Z")
-        case "rotX":   return qsTr("Rotation X")
-        case "rotY":   return qsTr("Rotation Y")
-        case "rotZ":   return qsTr("Rotation Z")
+        case "rotX":   return qsTr("Pitch · X")
+        case "rotY":   return qsTr("Yaw · Y")
+        case "rotZ":   return (root.isGroundMesh || root.isWater) ? qsTr("In-Plane Roll · 2.5D") : qsTr("Roll · Z")
         case "scaleX": return qsTr("Scale X")
         case "scaleY": return qsTr("Scale Y")
         case "scaleZ": return qsTr("Scale Z")
@@ -139,12 +140,16 @@ Rectangle {
         rotXField.text = Number(obj.rotX).toFixed(1)
         rotYField.text = Number(obj.rotY).toFixed(1)
         rotZField.text = Number(obj.rotZ).toFixed(1)
+        if (typeof planarRotField !== "undefined" && planarRotField) {
+            planarRotField.text = Number(obj.rotZ).toFixed(1)
+        }
         scaleXField.text = Number(obj.scaleX).toFixed(2)
         scaleYField.text = Number(obj.scaleY).toFixed(2)
         scaleZField.text = Number(obj.scaleZ).toFixed(2)
 
         root.isGroundMesh = !!obj.isGroundMesh
-        root.isWater = (root.host && root.host.isSelectedWater)
+        root.isWater = !!obj.isWater || (root.host && root.host.isSelectedWater && root.host.isSelectedWater())
+        root.isModel = !!obj.isModel
         if (root.isGroundMesh && typeof topTexField !== "undefined" && topTexField) {
             topTexField.text = obj.topTexture || "grass_subtle"
             groundTexField.text = obj.groundTexture || "maybegood"
@@ -162,13 +167,19 @@ Rectangle {
 
     function applyFromFields() {
         if (!root.hasSelection()) return
+        var rz = (root.isGroundMesh || root.isWater)
+                 ? (parseFloat(planarRotField.text) || 0)
+                 : (parseFloat(rotZField.text) || 0)
+        var ry = (root.isGroundMesh || root.isWater)
+                 ? 0
+                 : (parseFloat(rotYField.text) || 0)
         root.host.applyTransform(
             parseFloat(posXField.text) || 0,
             parseFloat(posYField.text) || 0,
             parseFloat(posZField.text) || 0,
             parseFloat(rotXField.text) || 0,
-            parseFloat(rotYField.text) || 0,
-            parseFloat(rotZField.text) || 0,
+            ry,
+            rz,
             parseFloat(scaleXField.text) || 1,
             parseFloat(scaleYField.text) || 1,
             parseFloat(scaleZField.text) || 1)
@@ -625,18 +636,151 @@ Rectangle {
                     KeypadField { id: posZField; keyLabel: qsTr("Position Z"); routed: root.routedKey === "posZ"; width: (parent.width - Theme.dp(Theme.spacingSm) * 2) / 3; onTapRequested: root.routeTo("posZ") }
                 }
 
-                FieldLabel { text: qsTr("Rotation · degrees") }
+                FieldLabel {
+                    text: (root.isGroundMesh || root.isWater)
+                          ? qsTr("In-Plane Roll · degrees")
+                          : (root.isModel ? qsTr("3D Rotation · Pitch, Yaw, Roll") : qsTr("Rotation · degrees"))
+                }
+
+                // 3D Rotation Fields (Pitch X, Yaw Y, Roll Z) for Models and generic objects
                 Row {
                     width: parent.width
                     spacing: Theme.dp(Theme.spacingSm)
-                    KeypadField { id: rotXField; keyLabel: qsTr("Rotation X"); routed: root.routedKey === "rotX"; width: (parent.width - Theme.dp(Theme.spacingSm) * 2) / 3; onTapRequested: root.routeTo("rotX") }
-                    KeypadField { id: rotYField; keyLabel: qsTr("Rotation Y"); routed: root.routedKey === "rotY"; width: (parent.width - Theme.dp(Theme.spacingSm) * 2) / 3; onTapRequested: root.routeTo("rotY") }
-                    KeypadField { id: rotZField; keyLabel: qsTr("Rotation Z"); routed: root.routedKey === "rotZ"; width: (parent.width - Theme.dp(Theme.spacingSm) * 2) / 3; onTapRequested: root.routeTo("rotZ") }
+                    visible: !root.isGroundMesh && !root.isWater
+
+                    KeypadField {
+                        id: rotXField
+                        keyLabel: qsTr("Pitch · X")
+                        routed: root.routedKey === "rotX"
+                        width: (parent.width - Theme.dp(Theme.spacingSm) * 2) / 3
+                        onTapRequested: root.routeTo("rotX")
+                    }
+                    KeypadField {
+                        id: rotYField
+                        keyLabel: qsTr("Yaw · Y")
+                        routed: root.routedKey === "rotY"
+                        width: (parent.width - Theme.dp(Theme.spacingSm) * 2) / 3
+                        onTapRequested: root.routeTo("rotY")
+                    }
+                    KeypadField {
+                        id: rotZField
+                        keyLabel: qsTr("Roll · Z")
+                        routed: root.routedKey === "rotZ"
+                        width: (parent.width - Theme.dp(Theme.spacingSm) * 2) / 3
+                        onTapRequested: root.routeTo("rotZ")
+                    }
+                }
+
+                // Dedicated clean single angle field for GroundMesh / WaterMesh
+                Row {
+                    width: parent.width
+                    spacing: Theme.dp(Theme.spacingSm)
+                    visible: root.isGroundMesh || root.isWater
+
+                    KeypadField {
+                        id: planarRotField
+                        keyLabel: qsTr("Angle (Roll · 2.5D)")
+                        text: rotZField.text
+                        routed: root.routedKey === "rotZ"
+                        width: parent.width - Theme.dp(96)
+                        onTapRequested: root.routeTo("rotZ")
+                    }
+
+                    Rectangle {
+                        width: Theme.dp(88)
+                        height: Theme.dp(36)
+                        anchors.verticalCenter: planarRotField.verticalCenter
+                        radius: Theme.radiusMd
+                        color: resetPlanarArea.pressed ? Theme.accentStart : Theme.surface2
+                        border.color: Theme.borderSubtle
+                        border.width: 1
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: qsTr("Reset 0°")
+                            font.pixelSize: Theme.dp(Theme.fontSm)
+                            font.weight: Font.Medium
+                            color: Theme.textSecondary
+                        }
+
+                        MouseArea {
+                            id: resetPlanarArea
+                            anchors.fill: parent
+                            onClicked: {
+                                rotZField.text = "0.0"
+                                if (typeof planarRotField !== "undefined" && planarRotField)
+                                    planarRotField.text = "0.0"
+                                root.applyFromFields()
+                            }
+                        }
+                    }
+                }
+
+                // Quick Action Preset Pills for 3D Models
+                Row {
+                    width: parent.width
+                    spacing: Theme.dp(5)
+                    visible: root.isModel
+
+                    Repeater {
+                        model: [
+                            { label: qsTr("Flip H"), action: "flipH" },
+                            { label: qsTr("Flip V"), action: "flipV" },
+                            { label: qsTr("Lay Flat"), action: "layFlat" },
+                            { label: qsTr("Reset 0°"), action: "reset" }
+                        ]
+
+                        delegate: Rectangle {
+                            height: Theme.dp(26)
+                            width: (parent.width - Theme.dp(5) * 3) / 4
+                            radius: Theme.radiusPill
+                            color: pillArea.pressed ? Theme.accentStart : Theme.alpha(Theme.surface2, 0.8)
+                            border.color: Theme.alpha(Theme.accentInk, 0.25)
+                            border.width: 1
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: modelData.label
+                                font.pixelSize: Theme.dp(10)
+                                font.weight: Font.Medium
+                                color: Theme.textPrimary
+                            }
+
+                            MouseArea {
+                                id: pillArea
+                                anchors.fill: parent
+                                onClicked: {
+                                    if (modelData.action === "flipH") {
+                                        var cy = (parseFloat(rotYField.text) || 0) + 180.0
+                                        while (cy >= 360.0) cy -= 360.0
+                                        rotYField.text = cy.toFixed(1)
+                                        root.applyFromFields()
+                                    } else if (modelData.action === "flipV") {
+                                        var cr = (parseFloat(rotZField.text) || 0) + 180.0
+                                        while (cr >= 360.0) cr -= 360.0
+                                        rotZField.text = cr.toFixed(1)
+                                        root.applyFromFields()
+                                    } else if (modelData.action === "layFlat") {
+                                        rotXField.text = "90.0"
+                                        root.applyFromFields()
+                                    } else if (modelData.action === "reset") {
+                                        rotXField.text = "0.0"
+                                        rotYField.text = "0.0"
+                                        rotZField.text = "0.0"
+                                        root.applyFromFields()
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Text {
                     width: parent.width
-                    text: qsTr("A .scene persists Y rotation and one uniform scale; X/Z rotation is a live preview only.")
+                    text: (root.isGroundMesh || root.isWater)
+                          ? qsTr("Ground & water meshes use 2D planar physics. Rotates in-plane (Roll) only.")
+                          : (root.isModel ? qsTr("3D model rotation (Pitch X, Yaw Y, Roll Z). Fully saved into .scene ModelComponent.")
+                                          : qsTr("A .scene persists Y rotation and one uniform scale; X/Z rotation is a live preview only."))
                     font.pixelSize: Theme.dp(Theme.fontXs)
                     color: Theme.textMuted
                     wrapMode: Text.WordWrap

@@ -2,6 +2,32 @@
 
 All notable changes to Swordigo Desktop.
 
+## [1.4.5] — 3D Euler Rotation Persistence, Case-Based Precision Rotation HUD, Zero-Emoji Studio UI, and Audio Sanitizer
+
+### Added
+- **Full 3D Euler Rotation Persistence Engine (`scene_loader.cpp`, `scene_loader.h`, `ruby_quick_viewport.cpp`)**:
+  - Full round-trip preservation of all 3 Euler rotation axes: Pitch (X), Yaw (Y), and Roll (Z) into Swordigo binary `.scene` files.
+  - Automatically synthesizes and synchronizes `ModelComponent` overrides (Tag 2 `YRotation` for Yaw, Tag 4 `XRotation` for Pitch) alongside Tag 6 (`Rotation` for Roll) for any template instance (trees, rocks, props, decorations, items, monsters) and placed 3D models.
+  - Explicit 0.0-degree rotation preservation: fixed regression where rotating an object to 0° on Pitch or Yaw dropped the tag or fell back to template defaults, ensuring 0° reset and fine tuning persist verbatim across save and reload cycles.
+  - In-memory `scene_sync_model_rotation`: rotation mutations immediately update the object's `ModelComponent` in memory, preventing `scene_refresh` from reverting rotations during active editing sessions.
+  - Guarded against double model rotation in `swk::object_render_matrix` when both world Euler angles and model component angles exist.
+- **Precision Case-Based Uniform Rotation Module (`SceneViewportView.qml`, `ruby_quick_viewport.cpp`)**:
+  - Context-adaptive rotation controls in the right-edge viewport deck:
+    - **3D Model / Prop mode**: 3-way segmented axis selector (`X` Pitch red, `Y` Yaw green, `Z` Roll blue) with color-coded axis pips.
+    - **2D Planar Mesh mode**: locked Planar Roll (`Z`) mode with cyan badge for GroundMesh and WaterMesh.
+    - **No Selection mode**: Camera Orbit mode with camera yaw readout.
+  - Hold-to-repeat steppers (`[-15°]` / `[+15°]`) with 70ms tick timer and subtle haptic feedback for fast, comfortable orientation.
+  - Interactive live readout jog-scrubber chip with real-time drag scrubbing (0.75° sensitivity) and tap-to-reset.
+  - One-tap quick action buttons: `180°` flip, `45°` snap, and `0°` reset.
+  - Emits `objectTransformChanged` immediately on object selection change so the angle chip updates in real-time.
+- **Audio Sanitizer Pipeline for Android Modding (`ruby_file_model.cpp`, `ruby_audio_bridge.cpp`)**:
+  - Long-press context action on `.ogg` and `.wav` audio files to sanitize and clean metadata tags.
+  - Strips incompatible comment headers and invalid tags, sets album identifier to `resources`, and re-encodes pure Ogg Vorbis streams to prevent audio engine crashes on Android.
+- **Clean Icon-Only Center Gizmo Dock (`SceneViewportView.qml`)**:
+  - Restored compact 36dp floating glassmorphic pill bar in the bottom center.
+  - Icon-only delegates (`eye`, `move`, `rotate`, `scale`) with active accent glow.
+  - 100% Zero-Emoji UI compliance across all toolbars, badges, and dialogues.
+
 ## [1.4.4] — Multi-Sheet Volumetric Water Engine, Decomp-Faithful Water Box HUD, Index-FM File Manager, Spectrum Color Picker, and Studio Dark UI Remaster
 
 ### Added

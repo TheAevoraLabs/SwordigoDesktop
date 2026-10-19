@@ -56,6 +56,7 @@
         <file>qml/components/KeyboardAccessoryBar.qml</file>
         <file>qml/components/GlassmorphicOverlay.qml</file>
         <file>qml/components/OperationsBar.qml</file>
+        <file>qml/components/FileOperationOverlay.qml</file>
         <file>qml/components/FileCardDelegate.qml</file>
         <file>qml/components/FilePreviewModal.qml</file>
         <file>qml/components/PlacesDrawer.qml</file>

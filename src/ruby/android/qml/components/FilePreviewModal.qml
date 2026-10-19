@@ -434,6 +434,106 @@ Rectangle {
                                 }
                             }
                         }
+
+                        // Audio Preview Card (Index FM AudioPreview style)
+                        Rectangle {
+                            width: parent.width
+                            height: Theme.dp(136)
+                            radius: Theme.radiusMd
+                            color: Theme.surface1
+                            border.color: Theme.borderSubtle
+                            border.width: 1
+                            visible: root.targetFileType === "audio" || root.targetName.toLowerCase().endsWith(".wav") || root.targetName.toLowerCase().endsWith(".ogg") || root.targetName.toLowerCase().endsWith(".mp3")
+
+                            Column {
+                                anchors.fill: parent
+                                anchors.margins: Theme.dp(12)
+                                spacing: Theme.dp(10)
+
+                                Row {
+                                    width: parent.width
+                                    spacing: Theme.dp(10)
+
+                                    Rectangle {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: Theme.dp(40)
+                                        height: Theme.dp(40)
+                                        radius: Theme.radiusSm
+                                        color: Theme.alpha(Theme.colorAudio, 0.16)
+                                        border.color: Theme.alpha(Theme.colorAudio, 0.35)
+                                        border.width: 1
+
+                                        Icon {
+                                            anchors.centerIn: parent
+                                            name: "volume"
+                                            size: Theme.dp(20)
+                                            color: Theme.colorAudio
+                                        }
+                                    }
+
+                                    Column {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: parent.width - Theme.dp(40) - Theme.dp(10)
+                                        spacing: Theme.dp(2)
+
+                                        Text {
+                                            width: parent.width
+                                            text: root.targetName
+                                            font.pixelSize: Theme.dp(Theme.fontMd)
+                                            font.weight: Font.DemiBold
+                                            color: Theme.textPrimary
+                                            elide: Text.ElideMiddle
+                                        }
+
+                                        Text {
+                                            text: qsTr("Swordigo Engine Sound Asset")
+                                            font.pixelSize: Theme.dp(Theme.fontXs)
+                                            color: Theme.textMuted
+                                        }
+                                    }
+                                }
+
+                                // Quick Sanitize Audio button inside preview
+                                Rectangle {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    height: Theme.dp(36)
+                                    width: parent.width
+                                    radius: Theme.radiusSm
+                                    color: sanAudM.pressed ? Theme.surface3 : Theme.alpha(Theme.colorAudio, 0.14)
+                                    border.color: Theme.alpha(Theme.colorAudio, 0.38)
+                                    border.width: 1
+
+                                    Row {
+                                        anchors.centerIn: parent
+                                        spacing: Theme.dp(6)
+                                        Icon {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            name: "sparkles"
+                                            size: Theme.dp(14)
+                                            color: Theme.colorAudio
+                                        }
+                                        Text {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: qsTr("Sanitize Audio for Swordigo Engine")
+                                            font.pixelSize: Theme.dp(Theme.fontSm)
+                                            font.weight: Font.DemiBold
+                                            color: Theme.colorAudio
+                                        }
+                                    }
+
+                                    MouseArea {
+                                        id: sanAudM
+                                        anchors.fill: parent
+                                        onClicked: {
+                                            if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
+                                                rubyFileModel.sanitizeAudioForEngine(root.targetPath, true)
+                                                root.fileProps = rubyFileModel.getDetailedFileProperties(root.targetPath)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // ── View B: PROPERTIES TAB (Index FM style) ─────────────
@@ -535,16 +635,227 @@ Rectangle {
                                     anchors.margins: Theme.dp(10)
                                     spacing: Theme.dp(2)
                                     Text {
-                                        text: qsTr("Permissions")
+                                        text: qsTr("Type")
                                         font.pixelSize: Theme.dp(Theme.fontXs)
                                         color: Theme.textMuted
                                     }
                                     Text {
-                                        text: root.fileProps.permissions ? root.fileProps.permissions : "-rw-r--r--"
+                                        text: root.targetIsDir ? qsTr("Folder") : (root.fileProps.fileType ? root.fileProps.fileType.toUpperCase() : qsTr("File"))
                                         font.pixelSize: Theme.dp(Theme.fontSm)
+                                        font.weight: Font.DemiBold
+                                        color: Theme.accentInk
+                                    }
+                                }
+                            }
+                        }
+
+                        // Directory Stats Card (Index FM DirInfo style)
+                        Rectangle {
+                            width: parent.width
+                            height: Theme.dp(72)
+                            radius: Theme.radiusMd
+                            color: Theme.surface1
+                            border.color: Theme.borderSubtle
+                            border.width: 1
+                            visible: root.targetIsDir
+
+                            Column {
+                                anchors.fill: parent
+                                anchors.margins: Theme.dp(10)
+                                spacing: Theme.dp(4)
+
+                                Text {
+                                    text: qsTr("Directory Contents (Recursive)")
+                                    font.pixelSize: Theme.dp(Theme.fontXs)
+                                    font.weight: Font.DemiBold
+                                    color: Theme.textMuted
+                                }
+
+                                Row {
+                                    width: parent.width
+                                    spacing: Theme.dp(16)
+
+                                    Row {
+                                        spacing: Theme.dp(4)
+                                        Icon { anchors.verticalCenter: parent.verticalCenter; name: "file"; size: Theme.dp(13); color: Theme.textSecondary }
+                                        Text {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: qsTr("%1 Files").arg(root.fileProps.filesCount !== undefined ? root.fileProps.filesCount : 0)
+                                            font.pixelSize: Theme.dp(Theme.fontSm)
+                                            color: Theme.textPrimary
+                                        }
+                                    }
+
+                                    Row {
+                                        spacing: Theme.dp(4)
+                                        Icon { anchors.verticalCenter: parent.verticalCenter; name: "folder"; size: Theme.dp(13); color: Theme.colorFolder }
+                                        Text {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: qsTr("%1 Folders").arg(root.fileProps.dirsCount !== undefined ? root.fileProps.dirsCount : 0)
+                                            font.pixelSize: Theme.dp(Theme.fontSm)
+                                            color: Theme.textPrimary
+                                        }
+                                    }
+
+                                    Row {
+                                        spacing: Theme.dp(4)
+                                        Icon { anchors.verticalCenter: parent.verticalCenter; name: "archive"; size: Theme.dp(13); color: Theme.colorArchive }
+                                        Text {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: root.fileProps.recursiveSizeStr || "0 B"
+                                            font.pixelSize: Theme.dp(Theme.fontSm)
+                                            font.weight: Font.DemiBold
+                                            color: Theme.accentInk
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Index FM Interactive Permissions Matrix
+                        Rectangle {
+                            width: parent.width
+                            height: Theme.dp(160)
+                            radius: Theme.radiusMd
+                            color: Theme.surface1
+                            border.color: Theme.borderSubtle
+                            border.width: 1
+
+                            Column {
+                                anchors.fill: parent
+                                anchors.margins: Theme.dp(10)
+                                spacing: Theme.dp(6)
+
+                                Row {
+                                    width: parent.width
+                                    Text {
+                                        text: qsTr("POSIX Access Permissions")
+                                        font.pixelSize: Theme.dp(Theme.fontSm)
+                                        font.weight: Font.Bold
+                                        color: Theme.textPrimary
+                                    }
+                                    Item { width: Theme.dp(10); height: 1 }
+                                    Text {
+                                        text: (root.fileProps.permissionsOctal ? root.fileProps.permissionsOctal : "0755") + "  " + (root.fileProps.permissions ? root.fileProps.permissions : "")
+                                        font.pixelSize: Theme.dp(Theme.fontXs)
                                         font.family: "Monospace"
                                         font.weight: Font.DemiBold
                                         color: Theme.accentInk
+                                    }
+                                }
+
+                                // Header row: User | Read | Write | Execute
+                                Row {
+                                    width: parent.width
+                                    spacing: Theme.dp(4)
+                                    Text { width: Theme.dp(60); text: ""; font.pixelSize: Theme.dp(Theme.fontXs) }
+                                    Text { width: (parent.width - Theme.dp(60) - 12) / 3; horizontalAlignment: Text.AlignHCenter; text: qsTr("Read (r)"); font.pixelSize: Theme.dp(Theme.fontXs); color: Theme.textMuted }
+                                    Text { width: (parent.width - Theme.dp(60) - 12) / 3; horizontalAlignment: Text.AlignHCenter; text: qsTr("Write (w)"); font.pixelSize: Theme.dp(Theme.fontXs); color: Theme.textMuted }
+                                    Text { width: (parent.width - Theme.dp(60) - 12) / 3; horizontalAlignment: Text.AlignHCenter; text: qsTr("Exec (x)"); font.pixelSize: Theme.dp(Theme.fontXs); color: Theme.textMuted }
+                                }
+
+                                // Row 1: Owner
+                                Row {
+                                    width: parent.width
+                                    spacing: Theme.dp(4)
+                                    Text {
+                                        width: Theme.dp(60)
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: qsTr("Owner")
+                                        font.pixelSize: Theme.dp(Theme.fontSm)
+                                        font.weight: Font.DemiBold
+                                        color: Theme.textPrimary
+                                    }
+                                    Rectangle {
+                                        width: (parent.width - Theme.dp(60) - 12) / 3; height: Theme.dp(26); radius: Theme.radiusSm
+                                        color: root.fileProps.ownerRead ? Theme.alpha(Theme.accentInk, 0.20) : Theme.surface2
+                                        border.color: root.fileProps.ownerRead ? Theme.accentInk : Theme.borderSubtle; border.width: 1
+                                        Text { anchors.centerIn: parent; text: "R"; font.pixelSize: Theme.dp(Theme.fontXs); font.weight: Font.Bold; color: root.fileProps.ownerRead ? Theme.accentInk : Theme.textDisabled }
+                                        MouseArea { anchors.fill: parent; onClicked: { rubyFileModel.setFilePermission(root.targetPath, "owner", "read", !root.fileProps.ownerRead); root.fileProps = rubyFileModel.getDetailedFileProperties(root.targetPath); } }
+                                    }
+                                    Rectangle {
+                                        width: (parent.width - Theme.dp(60) - 12) / 3; height: Theme.dp(26); radius: Theme.radiusSm
+                                        color: root.fileProps.ownerWrite ? Theme.alpha(Theme.colorWarning, 0.20) : Theme.surface2
+                                        border.color: root.fileProps.ownerWrite ? Theme.colorWarning : Theme.borderSubtle; border.width: 1
+                                        Text { anchors.centerIn: parent; text: "W"; font.pixelSize: Theme.dp(Theme.fontXs); font.weight: Font.Bold; color: root.fileProps.ownerWrite ? Theme.colorWarning : Theme.textDisabled }
+                                        MouseArea { anchors.fill: parent; onClicked: { rubyFileModel.setFilePermission(root.targetPath, "owner", "write", !root.fileProps.ownerWrite); root.fileProps = rubyFileModel.getDetailedFileProperties(root.targetPath); } }
+                                    }
+                                    Rectangle {
+                                        width: (parent.width - Theme.dp(60) - 12) / 3; height: Theme.dp(26); radius: Theme.radiusSm
+                                        color: root.fileProps.ownerExecute ? Theme.alpha(Theme.colorSuccess, 0.20) : Theme.surface2
+                                        border.color: root.fileProps.ownerExecute ? Theme.colorSuccess : Theme.borderSubtle; border.width: 1
+                                        Text { anchors.centerIn: parent; text: "X"; font.pixelSize: Theme.dp(Theme.fontXs); font.weight: Font.Bold; color: root.fileProps.ownerExecute ? Theme.colorSuccess : Theme.textDisabled }
+                                        MouseArea { anchors.fill: parent; onClicked: { rubyFileModel.setFilePermission(root.targetPath, "owner", "execute", !root.fileProps.ownerExecute); root.fileProps = rubyFileModel.getDetailedFileProperties(root.targetPath); } }
+                                    }
+                                }
+
+                                // Row 2: Group
+                                Row {
+                                    width: parent.width
+                                    spacing: Theme.dp(4)
+                                    Text {
+                                        width: Theme.dp(60)
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: qsTr("Group")
+                                        font.pixelSize: Theme.dp(Theme.fontSm)
+                                        font.weight: Font.DemiBold
+                                        color: Theme.textPrimary
+                                    }
+                                    Rectangle {
+                                        width: (parent.width - Theme.dp(60) - 12) / 3; height: Theme.dp(26); radius: Theme.radiusSm
+                                        color: root.fileProps.groupRead ? Theme.alpha(Theme.accentInk, 0.20) : Theme.surface2
+                                        border.color: root.fileProps.groupRead ? Theme.accentInk : Theme.borderSubtle; border.width: 1
+                                        Text { anchors.centerIn: parent; text: "R"; font.pixelSize: Theme.dp(Theme.fontXs); font.weight: Font.Bold; color: root.fileProps.groupRead ? Theme.accentInk : Theme.textDisabled }
+                                        MouseArea { anchors.fill: parent; onClicked: { rubyFileModel.setFilePermission(root.targetPath, "group", "read", !root.fileProps.groupRead); root.fileProps = rubyFileModel.getDetailedFileProperties(root.targetPath); } }
+                                    }
+                                    Rectangle {
+                                        width: (parent.width - Theme.dp(60) - 12) / 3; height: Theme.dp(26); radius: Theme.radiusSm
+                                        color: root.fileProps.groupWrite ? Theme.alpha(Theme.colorWarning, 0.20) : Theme.surface2
+                                        border.color: root.fileProps.groupWrite ? Theme.colorWarning : Theme.borderSubtle; border.width: 1
+                                        Text { anchors.centerIn: parent; text: "W"; font.pixelSize: Theme.dp(Theme.fontXs); font.weight: Font.Bold; color: root.fileProps.groupWrite ? Theme.colorWarning : Theme.textDisabled }
+                                        MouseArea { anchors.fill: parent; onClicked: { rubyFileModel.setFilePermission(root.targetPath, "group", "write", !root.fileProps.groupWrite); root.fileProps = rubyFileModel.getDetailedFileProperties(root.targetPath); } }
+                                    }
+                                    Rectangle {
+                                        width: (parent.width - Theme.dp(60) - 12) / 3; height: Theme.dp(26); radius: Theme.radiusSm
+                                        color: root.fileProps.groupExecute ? Theme.alpha(Theme.colorSuccess, 0.20) : Theme.surface2
+                                        border.color: root.fileProps.groupExecute ? Theme.colorSuccess : Theme.borderSubtle; border.width: 1
+                                        Text { anchors.centerIn: parent; text: "X"; font.pixelSize: Theme.dp(Theme.fontXs); font.weight: Font.Bold; color: root.fileProps.groupExecute ? Theme.colorSuccess : Theme.textDisabled }
+                                        MouseArea { anchors.fill: parent; onClicked: { rubyFileModel.setFilePermission(root.targetPath, "group", "execute", !root.fileProps.groupExecute); root.fileProps = rubyFileModel.getDetailedFileProperties(root.targetPath); } }
+                                    }
+                                }
+
+                                // Row 3: Others
+                                Row {
+                                    width: parent.width
+                                    spacing: Theme.dp(4)
+                                    Text {
+                                        width: Theme.dp(60)
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: qsTr("Others")
+                                        font.pixelSize: Theme.dp(Theme.fontSm)
+                                        font.weight: Font.DemiBold
+                                        color: Theme.textPrimary
+                                    }
+                                    Rectangle {
+                                        width: (parent.width - Theme.dp(60) - 12) / 3; height: Theme.dp(26); radius: Theme.radiusSm
+                                        color: root.fileProps.otherRead ? Theme.alpha(Theme.accentInk, 0.20) : Theme.surface2
+                                        border.color: root.fileProps.otherRead ? Theme.accentInk : Theme.borderSubtle; border.width: 1
+                                        Text { anchors.centerIn: parent; text: "R"; font.pixelSize: Theme.dp(Theme.fontXs); font.weight: Font.Bold; color: root.fileProps.otherRead ? Theme.accentInk : Theme.textDisabled }
+                                        MouseArea { anchors.fill: parent; onClicked: { rubyFileModel.setFilePermission(root.targetPath, "other", "read", !root.fileProps.otherRead); root.fileProps = rubyFileModel.getDetailedFileProperties(root.targetPath); } }
+                                    }
+                                    Rectangle {
+                                        width: (parent.width - Theme.dp(60) - 12) / 3; height: Theme.dp(26); radius: Theme.radiusSm
+                                        color: root.fileProps.otherWrite ? Theme.alpha(Theme.colorWarning, 0.20) : Theme.surface2
+                                        border.color: root.fileProps.otherWrite ? Theme.colorWarning : Theme.borderSubtle; border.width: 1
+                                        Text { anchors.centerIn: parent; text: "W"; font.pixelSize: Theme.dp(Theme.fontXs); font.weight: Font.Bold; color: root.fileProps.otherWrite ? Theme.colorWarning : Theme.textDisabled }
+                                        MouseArea { anchors.fill: parent; onClicked: { rubyFileModel.setFilePermission(root.targetPath, "other", "write", !root.fileProps.otherWrite); root.fileProps = rubyFileModel.getDetailedFileProperties(root.targetPath); } }
+                                    }
+                                    Rectangle {
+                                        width: (parent.width - Theme.dp(60) - 12) / 3; height: Theme.dp(26); radius: Theme.radiusSm
+                                        color: root.fileProps.otherExecute ? Theme.alpha(Theme.colorSuccess, 0.20) : Theme.surface2
+                                        border.color: root.fileProps.otherExecute ? Theme.colorSuccess : Theme.borderSubtle; border.width: 1
+                                        Text { anchors.centerIn: parent; text: "X"; font.pixelSize: Theme.dp(Theme.fontXs); font.weight: Font.Bold; color: root.fileProps.otherExecute ? Theme.colorSuccess : Theme.textDisabled }
+                                        MouseArea { anchors.fill: parent; onClicked: { rubyFileModel.setFilePermission(root.targetPath, "other", "execute", !root.fileProps.otherExecute); root.fileProps = rubyFileModel.getDetailedFileProperties(root.targetPath); } }
                                     }
                                 }
                             }

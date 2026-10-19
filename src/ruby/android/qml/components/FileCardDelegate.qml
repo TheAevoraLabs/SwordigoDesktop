@@ -10,8 +10,8 @@ Rectangle {
     height: GridView.view ? (GridView.view.cellHeight - Theme.dp(Theme.spacingSm)) : Theme.dp(140)
     radius: Theme.radiusMd
     color: root.isSelected ? Theme.alpha(Theme.accentInk, 0.16) : (cardMouse.pressed ? Theme.surface2 : Theme.surface1)
-    border.color: root.isSelected ? Theme.accentInk : (cardMouse.containsMouse ? Theme.borderFocus : Theme.borderSubtle)
-    border.width: root.isSelected ? 2 : 1
+    border.color: root.isSelected ? Theme.alpha(Theme.accentInk, 0.45) : (cardMouse.containsMouse ? Theme.borderFocus : Theme.borderSubtle)
+    border.width: 1
 
     property string fileName: ""
     property string filePath: ""
@@ -155,7 +155,9 @@ Rectangle {
 
         Text {
             width: parent.width
-            text: root.isDirectory ? qsTr("Folder") : root.fileSizeText
+            text: root.isDirectory
+                  ? (root.fileDateText.length > 0 ? root.fileDateText : qsTr("Directory"))
+                  : root.fileSizeText
             font.pixelSize: Theme.dp(Theme.fontXs)
             color: Theme.textMuted
             horizontalAlignment: Text.AlignHCenter

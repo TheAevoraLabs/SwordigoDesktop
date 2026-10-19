@@ -297,7 +297,14 @@ public:
     Q_PROPERTY(float selectedY READ selectedY NOTIFY objectTransformChanged)
     Q_PROPERTY(float selectedZ READ selectedZ NOTIFY objectTransformChanged)
     Q_PROPERTY(float selectedRot READ selectedRot NOTIFY objectTransformChanged)
+    Q_PROPERTY(float selectedRotX READ selectedRotX NOTIFY objectTransformChanged)
+    Q_PROPERTY(float selectedRotY READ selectedRotY NOTIFY objectTransformChanged)
+    Q_PROPERTY(float selectedRotZ READ selectedRotZ NOTIFY objectTransformChanged)
     Q_PROPERTY(float selectedScale READ selectedScale NOTIFY objectTransformChanged)
+
+    float selectedRotX() const;
+    float selectedRotY() const;
+    float selectedRotZ() const;
 
     // Camera presets for touch: "iso" (default), "top", "front", "side".
     // Only the orbit angles change; distance and target are preserved.
@@ -314,7 +321,14 @@ public:
     Q_INVOKABLE void setNavStep(float step);
     Q_INVOKABLE void cycleNavStep(int dir);
     Q_INVOKABLE void nudgeSelectedCoord(int axis, float delta);
+    Q_INVOKABLE void rotateSelectedX(float angleDeg);
+    Q_INVOKABLE void rotateSelectedY(float angleDeg);
     Q_INVOKABLE void rotateSelectedZ(float angleDeg);
+    Q_INVOKABLE void rotateSelectedAxis(int axis, float angleDeg);
+    Q_INVOKABLE void setSelectedRotationAngle(int axis, float angleDeg);
+    Q_INVOKABLE void setSelectedScaleValue(float scale);
+    Q_INVOKABLE void snapSelectedToGrid(float gridSize = 1.0f);
+    Q_INVOKABLE void resetSelectedRotation();
     Q_INVOKABLE void placeCurrentObject();
     Q_INVOKABLE void deselectObject();
     Q_INVOKABLE void deleteCurrentObject();

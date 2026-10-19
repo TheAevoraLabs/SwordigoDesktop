@@ -541,7 +541,7 @@ Item {
 
                         Text {
                             text: (typeof rubySettings !== "undefined" && rubySettings)
-                                  ? (rubySettings.appVersion + " • Qt 6.6.3 Android C++20") : "v1.4.4"
+                                  ? (rubySettings.appVersion + " • Qt 6.6.3 Android C++20") : "v1.4.5"
                             font.pixelSize: Theme.dp(11)
                             font.family: Theme.monoFamily
                             color: Theme.textMuted

@@ -602,6 +602,21 @@ if (BUILD_TESTING)
     target_link_libraries(apk_session_test PRIVATE ZLIB::ZLIB)
     add_test(NAME apk_session_test COMMAND apk_session_test)
 
+    # Mobile file manager engine (Index-FM-style jobs: copy/move/delete/zip/
+    # extract) with cancel, progress and the overwrite/keep-both/skip
+    # rendezvous, plus hostile entry names. Links Qt Core (it is a QObject) and
+    # zlib; no GL, no device.
+    add_executable(file_operations_test
+        tests/file_operations_test.cpp
+        ${SRC_DIR}/ruby/android/file_operations.cpp
+        ${SRC_DIR}/platform/zip_archive.cpp
+        ${SRC_DIR}/platform/zip_stream.cpp)
+    set_target_properties(file_operations_test PROPERTIES AUTOMOC ON)
+    target_include_directories(file_operations_test PRIVATE
+        ${SRC_DIR} ${SRC_DIR}/ruby/android)
+    target_link_libraries(file_operations_test PRIVATE Qt6::Core ZLIB::ZLIB)
+    add_test(NAME file_operations_test COMMAND file_operations_test)
+
     # Ground Mesh Studio: simple-polygon enforcement (repaint-lag fix) + the
     # "Add to Scene" object round trip. Runs headless (offscreen platform).
     # boulderx.cpp comes along because the studio now writes both .swdm dialects

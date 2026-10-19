@@ -1504,7 +1504,65 @@ bool triangulate(const std::vector<std::pair<double, double>>& polygon,
     }
     const double expected = std::fabs(area) * 0.5;
     const double tol = std::max(1e-6, expected * 1e-4);
-    if (std::fabs(emitted - expected) > tol) {
+    if (out_indices.empty() || std::fabs(emitted - expected) > tol) {
+        // Guaranteed fallback: Classical polygon ear-clipping on CCW ring
+        out_indices.clear();
+        std::vector<V2> pz;
+        pz.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            pz.push_back(at(orig[i]));
+        }
+        std::vector<int> V(n);
+        for (size_t i = 0; i < n; ++i) V[i] = static_cast<int>(i);
+
+        auto cross2d = [](V2 o, V2 a, V2 b) {
+            return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+        };
+
+        auto is_ear = [&](int u, int v, int w, int cur_n, const std::vector<int>& cur_V) {
+            V2 A = pz[cur_V[u]], B = pz[cur_V[v]], C = pz[cur_V[w]];
+            if (cross2d(A, B, C) <= 1e-7) return false;
+            for (int p = 0; p < cur_n; ++p) {
+                if (p == u || p == v || p == w) continue;
+                V2 P = pz[cur_V[p]];
+                bool b1 = cross2d(A, B, P) >= -1e-9;
+                bool b2 = cross2d(B, C, P) >= -1e-9;
+                bool b3 = cross2d(C, A, P) >= -1e-9;
+                if (b1 && b2 && b3) return false;
+            }
+            return true;
+        };
+
+        int cur_n = static_cast<int>(n);
+        int count = 2 * cur_n;
+        for (int m = cur_n, v = cur_n - 1; m > 2; ) {
+            if (count-- <= 0) break;
+            int u = v; if (cur_n <= u) u = 0;
+            v = u + 1; if (cur_n <= v) v = 0;
+            int w = v + 1; if (cur_n <= w) w = 0;
+
+            if (is_ear(u, v, w, cur_n, V)) {
+                out_indices.push_back(static_cast<uint16_t>(orig[V[u]]));
+                out_indices.push_back(static_cast<uint16_t>(orig[V[v]]));
+                out_indices.push_back(static_cast<uint16_t>(orig[V[w]]));
+                for (int s = v, t = v + 1; t < cur_n; s++, t++) V[s] = V[t];
+                cur_n--;
+                m--;
+                count = 2 * m;
+            }
+        }
+
+        // Re-evaluate emitted area with fallback ear-clip triangles
+        emitted = 0.0;
+        for (size_t t = 0; t + 2 < out_indices.size(); t += 3) {
+            const V2 a = at(out_indices[t]);
+            const V2 b = at(out_indices[t + 1]);
+            const V2 c = at(out_indices[t + 2]);
+            emitted += 0.5 * std::fabs((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x));
+        }
+    }
+
+    if (std::fabs(emitted - expected) > tol && out_indices.size() < 3) {
         if (std::getenv("BOULDERX_DEBUG_TRI")) {
             std::fprintf(stderr,
                          "[tri] n=%zu tris=%zu emitted=%.1f expected=%.1f fanned=%d\n",

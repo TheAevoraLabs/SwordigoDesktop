@@ -366,10 +366,9 @@ static SceneObject parse_object(const std::string& bytes) {
                         obj.pos_z = f.float_val;
                     break;
 
-                case 6: // Rotation (Y-axis)
+                case 6: // Rotation (Y-axis / planar roll)
                     if (f.wire_type == proto::WIRE_I32) {
                         obj.rot_y = f.float_val;
-                        obj.rot_x = obj.rot_z = 0.0f;
                     }
                     break;
 
@@ -584,9 +583,11 @@ static void resolve_object_render_data(SceneObject& obj) {
                             if (sf.field_number == 2 && sf.wire_type == proto::WIRE_I32) {
                                 obj.model_y_rotation = sf.float_val;
                                 obj.has_model_y_rotation = std::fabsf(sf.float_val) > 1e-5f;
+                                obj.rot_z = sf.float_val;
                             } else if (sf.field_number == 4 && sf.wire_type == proto::WIRE_I32) {
                                 obj.model_x_rotation = sf.float_val;
                                 obj.has_model_x_rotation = std::fabsf(sf.float_val) > 1e-5f;
+                                obj.rot_x = sf.float_val;
                             } else if (sf.field_number == 6 && sf.wire_type == proto::WIRE_LEN) {
                                 read_vector3(sf.bytes_val, obj.model_origin);
                                 obj.has_model_origin = true;
@@ -1192,12 +1193,104 @@ static std::string rebuild_ground_mesh_component(const SceneObject& obj,
     return w.to_string();
 }
 
+static constexpr uint32_t kModelPayload = 101;
+
+// Rebuild the ModelComponent payload message so XRotation (Tag 4, Pitch) and
+// YRotation (Tag 2, Yaw) reflect obj.rot_x and obj.rot_z, while preserving
+// all other sub-fields (Mesh name, origin offset, diffuse color, etc.).
+static std::string rebuild_model_component(const SceneObject& obj,
+                                           const SceneComponent& component) {
+    const int payload = component_payload_field(component);
+    if (payload == 0) return component.raw_data;
+
+    try {
+        proto::Reader wrapper(component.raw_data);
+        proto::Writer new_wrapper;
+        proto::Field f;
+        while (wrapper.read_field(f)) {
+            if (f.field_number != static_cast<uint32_t>(payload) ||
+                f.wire_type != proto::WIRE_LEN) {
+                new_wrapper.write_field(f);
+                continue;
+            }
+
+            proto::Reader model_r(f.bytes_val);
+            proto::Writer new_model;
+            proto::Field mf;
+            bool wrote_y_rot = false;
+            bool wrote_x_rot = false;
+
+            while (model_r.read_field(mf)) {
+                if (mf.field_number == 2 && mf.wire_type == proto::WIRE_I32) {
+                    // Field 2: YRotation (Yaw / rot_z)
+                    new_model.write_float_field(2, obj.rot_z);
+                    wrote_y_rot = true;
+                } else if (mf.field_number == 4 && mf.wire_type == proto::WIRE_I32) {
+                    // Field 4: XRotation (Pitch / rot_x)
+                    new_model.write_float_field(4, obj.rot_x);
+                    wrote_x_rot = true;
+                } else {
+                    new_model.write_field(mf);
+                }
+            }
+
+            if (!wrote_y_rot) {
+                new_model.write_float_field(2, obj.rot_z);
+            }
+            if (!wrote_x_rot) {
+                new_model.write_float_field(4, obj.rot_x);
+            }
+
+            new_wrapper.write_bytes_field(f.field_number, new_model.to_string());
+        }
+        return new_wrapper.to_string();
+    } catch (...) {
+        return component.raw_data;
+    }
+}
+
+void scene_sync_model_rotation(SceneObject& obj) {
+    if (!obj.ground_meshes.empty() || obj.is_secondary_water_sheet) return;
+    const bool has_model_asset = (!obj.mesh_name.empty() || !obj.template_name.empty());
+    bool has_resolved_model = false;
+    SceneComponent resolved_model_comp;
+    for (const auto& c : obj.resolved_components) {
+        if (component_schema_name(c) == "ModelComponent" ||
+            c.type_name == "Model" ||
+            component_payload_field(c) == static_cast<int>(kModelPayload)) {
+            has_resolved_model = true;
+            resolved_model_comp = c;
+            break;
+        }
+    }
+    if (!has_model_asset && !has_resolved_model) return;
+
+    for (auto& comp : obj.components) {
+        const int payload = component_payload_field(comp);
+        const std::string sname = component_schema_name(comp);
+        if (payload == static_cast<int>(kModelPayload) || sname == "ModelComponent" || comp.type_name == "Model") {
+            comp.raw_data = rebuild_model_component(obj, comp);
+            return;
+        }
+    }
+
+    // Object has no local ModelComponent in obj.components — create/copy one so Euler angles persist!
+    SceneComponent new_comp = has_resolved_model
+        ? resolved_model_comp
+        : scene_make_model_component(!obj.mesh_name.empty() ? obj.mesh_name : obj.template_name);
+    new_comp.raw_data = rebuild_model_component(obj, new_comp);
+    obj.components.push_back(std::move(new_comp));
+}
+
 // ============================================================
 // Serialize a SceneObject back to protobuf binary bytes.
 // Mirrors parse_object exactly: every field is written in the
 // same tag order so file diffs are minimal.
 // ============================================================
-static std::string serialize_object(const SceneObject& obj) {
+static std::string serialize_object(const SceneObject& in_obj) {
+    SceneObject obj = in_obj;
+    scene_sync_model_rotation(obj);
+
     proto::Writer w;
 
     // Tag 1: TemplateName
@@ -1210,11 +1303,17 @@ static std::string serialize_object(const SceneObject& obj) {
 
     // Tag 3: Component[] — write raw bytes verbatim (preserves all sub-fields).
     // Dirty GroundMesh components are re-encoded from the edited mesh data.
+    // ModelComponent is re-encoded to persist 3D Euler rotations (Pitch X, Yaw Y).
     for (const auto& comp : obj.components) {
         std::string data = comp.raw_data;
+        const int payload = component_payload_field(comp);
+        const std::string sname = component_schema_name(comp);
+        const bool is_model = (payload == static_cast<int>(kModelPayload) || sname == "ModelComponent" || comp.type_name == "Model");
         if (obj.ground_meshes_dirty && !obj.ground_meshes.empty() &&
-            component_payload_field(comp) == static_cast<int>(kGroundMeshPayload)) {
+            payload == static_cast<int>(kGroundMeshPayload)) {
             data = rebuild_ground_mesh_component(obj, comp);
+        } else if (is_model) {
+            data = rebuild_model_component(obj, comp);
         }
         w.write_bytes_field(3, data);
     }

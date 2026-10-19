@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Layouts
 import ".."
 
 // Files list row. Public contract preserved exactly:
@@ -37,86 +38,88 @@ SwipeDelegate {
 
     readonly property color typeColor: Theme.colorForType(root.fileType)
     readonly property string typeIcon: root.isDirectory ? "folder" : Theme.iconForType(root.fileType)
+    readonly property string metaText: {
+        if (root.isDirectory) {
+            return root.fileDateText.length > 0 ? root.fileDateText : qsTr("Directory")
+        }
+        if (root.fileSizeText.length > 0 && root.fileDateText.length > 0) {
+            return root.fileSizeText + "  ·  " + root.fileDateText
+        }
+        return root.fileSizeText.length > 0 ? root.fileSizeText : root.fileDateText
+    }
 
-    background: Rectangle {
-        color: root.isSelected ? Theme.alpha(Theme.accentInk, 0.18) : (root.down ? Theme.surface2 : Theme.surface1)
-        border.color: root.isSelected ? Theme.accentInk : Theme.borderSubtle
-        border.width: root.isSelected ? 2 : 1
-
-        // 3dp semantic data-type indicator bar on the left edge
+    // The background wrapper is auto-sized by the control; the inner tile is
+    // inset so selected rows read as a rounded tonal card, not a full-width
+    // neon outline.
+    background: Item {
         Rectangle {
-            anchors.left: parent.left
-            anchors.top: parent.top
-            anchors.bottom: parent.bottom
-            width: 3
-            color: root.typeColor
+            anchors.fill: parent
+            anchors.leftMargin: Theme.dp(8)
+            anchors.rightMargin: Theme.dp(8)
+            anchors.topMargin: Theme.dp(2)
+            anchors.bottomMargin: Theme.dp(2)
+            radius: Theme.radiusMd
+            color: root.isSelected
+                   ? Theme.alpha(Theme.accentInk, 0.16)
+                   : (root.down ? Theme.surface2 : "transparent")
+            border.width: 0
+
+            Behavior on color { ColorAnimation { duration: Theme.durFast } }
+
+            // Inset hairline: starts where the title starts, not under the icon.
+            Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                anchors.leftMargin: Theme.dp(60)
+                anchors.rightMargin: Theme.dp(12)
+                height: 1
+                color: Theme.borderSubtle
+                visible: !root.isSelected
+            }
         }
     }
 
     leftPadding: Theme.dp(Theme.spacingLg)
     rightPadding: Theme.dp(Theme.spacingSm)
 
-    contentItem: Row {
+    contentItem: RowLayout {
         spacing: Theme.dp(Theme.spacingMd)
 
-        // Multi-select circular checkbox (Index FM style)
+        // The type plate doubles as the selection indicator. There is no
+        // separate empty radio column eating width from every row.
         Rectangle {
-            anchors.verticalCenter: parent.verticalCenter
-            width: (root.isSelectionMode || root.isSelected) ? Theme.dp(22) : 0
-            height: Theme.dp(22)
-            radius: Theme.dp(11)
-            visible: width > 0
-            color: root.isSelected ? Theme.accentInk : Theme.surface2
-            border.color: root.isSelected ? Theme.accentInk : Theme.borderSubtle
-            border.width: 1
+            Layout.preferredWidth: Theme.dp(40)
+            Layout.preferredHeight: Theme.dp(40)
+            Layout.alignment: Qt.AlignVCenter
+            radius: root.isSelected ? width / 2 : Theme.radiusMd
+            color: root.isSelected ? Theme.accentInk : Theme.alpha(root.typeColor, 0.14)
+            border.color: root.isSelected ? "transparent" : Theme.alpha(root.typeColor, 0.28)
+            border.width: root.isSelected ? 0 : 1
             clip: true
 
-            Behavior on width { NumberAnimation { duration: 150; easing.type: Easing.OutQuad } }
+            Behavior on radius { NumberAnimation { duration: Theme.durFast } }
+            Behavior on color { ColorAnimation { duration: Theme.durFast } }
 
             Icon {
                 anchors.centerIn: parent
-                name: "check"
-                size: Theme.dp(12)
-                color: Theme.onAccent
-                visible: root.isSelected
-            }
-
-            MouseArea {
-                anchors.fill: parent
-                onClicked: root.selectionToggled()
+                name: root.isSelected ? "check" : root.typeIcon
+                size: root.isSelected ? Theme.dp(18) : Theme.dp(Theme.iconMd)
+                color: root.isSelected ? Theme.onAccent : root.typeColor
             }
         }
 
-        // Type plate + vector icon
-        Rectangle {
-            anchors.verticalCenter: parent.verticalCenter
-            width: Theme.dp(38)
-            height: Theme.dp(38)
-            radius: Theme.radiusMd
-            color: Theme.alpha(root.typeColor, 0.14)
-            border.color: Theme.alpha(root.typeColor, 0.28)
-            border.width: 1
-
-            Icon {
-                anchors.centerIn: parent
-                name: root.typeIcon
-                size: Theme.dp(Theme.iconMd)
-                color: root.typeColor
-            }
-        }
-
-        // Title / meta
-        Column {
-            anchors.verticalCenter: parent.verticalCenter
-            width: parent.width - ((root.isSelectionMode || root.isSelected) ? Theme.dp(22) + Theme.dp(Theme.spacingMd) : 0) - Theme.dp(38) - Theme.dp(Theme.spacingMd) - Theme.dp(36) - Theme.dp(Theme.spacingMd)
+        ColumnLayout {
+            Layout.fillWidth: true
+            Layout.alignment: Qt.AlignVCenter
             spacing: Theme.dp(2)
 
-            Row {
-                width: parent.width
+            RowLayout {
+                Layout.fillWidth: true
                 spacing: Theme.dp(5)
 
                 Icon {
-                    anchors.verticalCenter: parent.verticalCenter
+                    Layout.alignment: Qt.AlignVCenter
                     visible: root.isPinned
                     name: "pin"
                     size: Theme.dp(12)
@@ -124,32 +127,36 @@ SwipeDelegate {
                 }
 
                 Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: parent.width - (root.isPinned ? Theme.dp(17) : 0)
+                    Layout.fillWidth: true
                     text: root.fileName
                     font.pixelSize: Theme.dp(Theme.fontLg)
                     font.weight: root.isDirectory ? Font.DemiBold : Font.Normal
                     color: Theme.textPrimary
                     elide: Text.ElideMiddle
+                    maximumLineCount: 1
                 }
             }
 
             Text {
-                width: parent.width
-                text: root.isDirectory
-                      ? qsTr("Folder")
-                      : (root.fileSizeText + "  ·  " + root.fileDateText)
+                Layout.fillWidth: true
+                text: root.metaText
                 font.pixelSize: Theme.dp(Theme.fontSm)
                 color: Theme.textSecondary
                 elide: Text.ElideRight
+                maximumLineCount: 1
             }
         }
 
         // Per-row overflow menu
         IconButton {
-            anchors.verticalCenter: parent.verticalCenter
+            Layout.preferredWidth: Theme.dp(32)
+            Layout.preferredHeight: Theme.dp(32)
+            Layout.alignment: Qt.AlignVCenter
             iconName: "more-vertical"
-            buttonSize: Theme.dp(36)
+            tint: Theme.textMuted
+            plate: "transparent"
+            plateEdge: "transparent"
+            buttonSize: Theme.dp(32)
             iconSize: Theme.dp(Theme.iconSm)
             onClicked: root.actionRequested("menu")
         }

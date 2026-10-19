@@ -33,12 +33,16 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 
 import android.media.MediaPlayer;
+import android.media.MediaExtractor;
+import android.media.MediaCodec;
+import android.media.MediaFormat;
 
 import org.qtproject.qt.android.bindings.QtActivity;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
 
 /**
  * RubyActivity — Main Android activity for Ruby GG Mobile (in.aevora.ruby).
@@ -384,9 +388,11 @@ public class RubyActivity extends QtActivity {
 
     @Override
     public void onBackPressed() {
-        // Move task to back gracefully instead of destroying Qt C++ runtime,
-        // allowing instant resume without freeze or cold starts.
-        moveTaskToBack(true);
+        // Let Qt deliver Back to the QML scene first. The app owns hierarchical
+        // back (folder -> parent folder, selection -> browse, modal -> close,
+        // tab -> Home) in Main.qml/FilesView.qml; moving the task to the
+        // background here used to swallow every one of those steps.
+        super.onBackPressed();
     }
 
     @Override
@@ -921,6 +927,48 @@ public class RubyActivity extends QtActivity {
         });
     }
 
+    public void shareFiles(final String[] filePaths) {
+        shareFilesStatic(filePaths);
+    }
+
+    public static void shareFilesStatic(final String[] filePaths) {
+        if (sInstance == null || filePaths == null || filePaths.length == 0) return;
+        sInstance.runOnUiThread(() -> {
+            try {
+                try {
+                    android.os.StrictMode.VmPolicy.Builder builder = new android.os.StrictMode.VmPolicy.Builder();
+                    android.os.StrictMode.setVmPolicy(builder.build());
+                } catch (Exception ignored) {}
+
+                ArrayList<Uri> uris = new ArrayList<>();
+                for (String p : filePaths) {
+                    if (p == null || p.isEmpty()) continue;
+                    File f = new File(p);
+                    if (f.exists()) {
+                        uris.add(Uri.fromFile(f));
+                    }
+                }
+                if (uris.isEmpty()) return;
+
+                Intent intent = new Intent();
+                if (uris.size() == 1) {
+                    intent.setAction(Intent.ACTION_SEND);
+                    intent.putExtra(Intent.EXTRA_STREAM, uris.get(0));
+                } else {
+                    intent.setAction(Intent.ACTION_SEND_MULTIPLE);
+                    intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+                }
+                intent.setType("*/*");
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                Intent chooser = Intent.createChooser(intent, "Share via");
+                chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                sInstance.startActivity(chooser);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to share files: " + e.getMessage(), e);
+            }
+        });
+    }
+
     public static String getPathFromTreeUri(Context context, Uri treeUri) {
         if (treeUri == null) return null;
         try {
@@ -943,5 +991,140 @@ public class RubyActivity extends QtActivity {
             Log.w(TAG, "getPathFromTreeUri error: " + e.getMessage());
         }
         return treeUri.getPath();
+    }
+
+    /**
+     * Decode any audio format (OGG, MP3, AAC, FLAC, WAV) using Android MediaCodec
+     * and write a strict 44-byte canonical PCM WAV file for Swordigo Caver engine.
+     */
+    public static boolean decodeAudioToCanonicalWav(String inputPath, String outputPath) {
+        MediaExtractor extractor = null;
+        MediaCodec codec = null;
+        FileOutputStream fos = null;
+        try {
+            extractor = new MediaExtractor();
+            extractor.setDataSource(inputPath);
+            int audioTrackIndex = -1;
+            MediaFormat format = null;
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                MediaFormat f = extractor.getTrackFormat(i);
+                String mime = f.getString(MediaFormat.KEY_MIME);
+                if (mime != null && mime.startsWith("audio/")) {
+                    audioTrackIndex = i;
+                    format = f;
+                    break;
+                }
+            }
+            if (audioTrackIndex < 0 || format == null) return false;
+            extractor.selectTrack(audioTrackIndex);
+
+            String mime = format.getString(MediaFormat.KEY_MIME);
+            codec = MediaCodec.createDecoderByType(mime);
+            codec.configure(format, null, null, 0);
+            codec.start();
+
+            int sampleRate = format.containsKey(MediaFormat.KEY_SAMPLE_RATE) ?
+                format.getInteger(MediaFormat.KEY_SAMPLE_RATE) : 44100;
+            int channelCount = format.containsKey(MediaFormat.KEY_CHANNEL_COUNT) ?
+                format.getInteger(MediaFormat.KEY_CHANNEL_COUNT) : 2;
+
+            java.io.ByteArrayOutputStream pcmOut = new java.io.ByteArrayOutputStream();
+
+            MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+            boolean sawInputEOS = false;
+            boolean sawOutputEOS = false;
+            final long kTimeoutUs = 5000;
+
+            while (!sawOutputEOS) {
+                if (!sawInputEOS) {
+                    int inputIndex = codec.dequeueInputBuffer(kTimeoutUs);
+                    if (inputIndex >= 0) {
+                        java.nio.ByteBuffer inputBuffer = codec.getInputBuffer(inputIndex);
+                        int sampleSize = extractor.readSampleData(inputBuffer, 0);
+                        if (sampleSize < 0) {
+                            codec.queueInputBuffer(inputIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                            sawInputEOS = true;
+                        } else {
+                            codec.queueInputBuffer(inputIndex, 0, sampleSize, extractor.getSampleTime(), 0);
+                            extractor.advance();
+                        }
+                    }
+                }
+
+                int outputIndex = codec.dequeueOutputBuffer(info, kTimeoutUs);
+                if (outputIndex >= 0) {
+                    java.nio.ByteBuffer outputBuffer = codec.getOutputBuffer(outputIndex);
+                    if (info.size > 0 && outputBuffer != null) {
+                        byte[] chunk = new byte[info.size];
+                        outputBuffer.position(info.offset);
+                        outputBuffer.limit(info.offset + info.size);
+                        outputBuffer.get(chunk);
+                        pcmOut.write(chunk);
+                    }
+                    codec.releaseOutputBuffer(outputIndex, false);
+                    if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        sawOutputEOS = true;
+                    }
+                } else if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    MediaFormat newFormat = codec.getOutputFormat();
+                    if (newFormat.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                        sampleRate = newFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE);
+                    }
+                    if (newFormat.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                        channelCount = newFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+                    }
+                }
+            }
+
+            byte[] pcmData = pcmOut.toByteArray();
+            int pcmSize = pcmData.length;
+
+            // Write 44-byte canonical WAV header for Caver::GetAudioFileData
+            byte[] header = new byte[44];
+            header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+            int riffSize = 36 + pcmSize;
+            header[4] = (byte)(riffSize & 0xFF);
+            header[5] = (byte)((riffSize >> 8) & 0xFF);
+            header[6] = (byte)((riffSize >> 16) & 0xFF);
+            header[7] = (byte)((riffSize >> 24) & 0xFF);
+            header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+            header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+            header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0; // fmt size: 16
+            header[20] = 1; header[21] = 0; // PCM format: 1
+            header[22] = (byte)(channelCount & 0xFF);
+            header[23] = (byte)((channelCount >> 8) & 0xFF);
+            header[24] = (byte)(sampleRate & 0xFF);
+            header[25] = (byte)((sampleRate >> 8) & 0xFF);
+            header[26] = (byte)((sampleRate >> 16) & 0xFF);
+            header[27] = (byte)((sampleRate >> 24) & 0xFF);
+            int byteRate = sampleRate * channelCount * 2; // 16-bit
+            header[28] = (byte)(byteRate & 0xFF);
+            header[29] = (byte)((byteRate >> 8) & 0xFF);
+            header[30] = (byte)((byteRate >> 16) & 0xFF);
+            header[31] = (byte)((byteRate >> 24) & 0xFF);
+            int blockAlign = channelCount * 2;
+            header[32] = (byte)(blockAlign & 0xFF);
+            header[33] = (byte)((blockAlign >> 8) & 0xFF);
+            header[34] = 16; header[35] = 0; // 16-bit
+            header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+            header[40] = (byte)(pcmSize & 0xFF);
+            header[41] = (byte)((pcmSize >> 8) & 0xFF);
+            header[42] = (byte)((pcmSize >> 16) & 0xFF);
+            header[43] = (byte)((pcmSize >> 24) & 0xFF);
+
+            fos = new FileOutputStream(outputPath);
+            fos.write(header);
+            fos.write(pcmData);
+            fos.flush();
+            Log.i(TAG, "Successfully sanitized and transcoded audio to canonical WAV: " + outputPath);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "decodeAudioToCanonicalWav failed: " + e.getMessage(), e);
+            return false;
+        } finally {
+            try { if (fos != null) fos.close(); } catch (Exception ignored) {}
+            try { if (codec != null) { codec.stop(); codec.release(); } } catch (Exception ignored) {}
+            try { if (extractor != null) extractor.release(); } catch (Exception ignored) {}
+        }
     }
 }

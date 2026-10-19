@@ -26,6 +26,8 @@ Item {
     property int gizmoMode: 0
     /// False when nothing is selected.
     property bool hasSelection: false
+    /// Set true when selected object only supports 2D in-plane rotation (GroundMesh / WaterMesh)
+    property bool isPlanarOnly: false
     /// Show the four mode dots under the readout so the cycle target is
     /// discoverable without a label.
     property bool showModeDots: true
@@ -50,7 +52,7 @@ Item {
     readonly property string modeName: {
         switch (root.gizmoMode) {
         case 1: return "MOVE"
-        case 2: return "ROTATE"
+        case 2: return root.isPlanarOnly ? "ROLL (Z)" : "ROTATE"
         case 3: return "SCALE"
         default: return "VIEW"
         }
@@ -59,7 +61,7 @@ Item {
     readonly property string stepLabel: {
         switch (root.gizmoMode) {
         case 1: return "0.25 u"
-        case 2: return "15°"
+        case 2: return root.isPlanarOnly ? "15° (Roll)" : "15°"
         case 3: return "5%"
         default: return "pick a gizmo"
         }
@@ -221,14 +223,17 @@ Item {
                     anchors.fill: parent
                     visible: modelData !== null && modelData !== "center"
 
+                    readonly property bool isAxisDisabled: root.isPlanarOnly && root.gizmoMode === 2 && modelData.axis !== 2
                     readonly property color tone: visible ? root.axisColor(modelData.axis) : Theme.textMuted
 
                     radius: Theme.radiusMd
-                    color: cellArea.pressed ? Theme.alpha(cell.tone, 0.35)
-                                            : Theme.alpha(cell.tone, root.active ? 0.15 : 0.06)
-                    border.color: Theme.alpha(cell.tone, root.active ? 0.45 : 0.18)
+                    color: isAxisDisabled ? Theme.alpha(Theme.surface2, 0.3)
+                                          : (cellArea.pressed ? Theme.alpha(cell.tone, 0.35)
+                                                              : Theme.alpha(cell.tone, root.active ? 0.15 : 0.06))
+                    border.color: isAxisDisabled ? Theme.borderSubtle
+                                                 : Theme.alpha(cell.tone, root.active ? 0.45 : 0.18)
                     border.width: 1
-                    opacity: root.active ? 1.0 : 0.45
+                    opacity: isAxisDisabled ? 0.18 : (root.active ? 1.0 : 0.45)
 
                     Behavior on color { ColorAnimation { duration: Theme.durFast } }
 
@@ -239,30 +244,30 @@ Item {
                         Icon {
                             anchors.horizontalCenter: parent.horizontalCenter
                             visible: cell.visible
-                            name: "arrow-up"
-                            size: Theme.dp(15)
+                            name: cell.isAxisDisabled ? "lock" : "arrow-up"
+                            size: cell.isAxisDisabled ? Theme.dp(12) : Theme.dp(15)
                             weight: 2.2
-                            color: cell.tone
-                            rotation: cell.visible ? root.arrowRotation(modelData.axis, modelData.sign) : 0
+                            color: cell.isAxisDisabled ? Theme.textDisabled : cell.tone
+                            rotation: (cell.visible && !cell.isAxisDisabled) ? root.arrowRotation(modelData.axis, modelData.sign) : 0
                         }
 
                         Text {
                             anchors.horizontalCenter: parent.horizontalCenter
                             visible: cell.visible
                             text: cell.visible
-                                  ? root.axisLetter(modelData.axis) + (modelData.sign > 0 ? "+" : "-")
+                                  ? (cell.isAxisDisabled ? "LOCKED" : (root.axisLetter(modelData.axis) + (modelData.sign > 0 ? "+" : "-")))
                                   : ""
-                            font.pixelSize: Theme.dp(8)
+                            font.pixelSize: cell.isAxisDisabled ? Theme.dp(6) : Theme.dp(8)
                             font.family: Theme.monoFamily
                             font.weight: Font.Bold
-                            color: cell.tone
+                            color: cell.isAxisDisabled ? Theme.textDisabled : cell.tone
                         }
                     }
 
                     MouseArea {
                         id: cellArea
                         anchors.fill: parent
-                        enabled: root.active
+                        enabled: root.active && !cell.isAxisDisabled
                         onPressed: root.press(modelData.axis, modelData.sign)
                         onReleased: root.release()
                         onCanceled: root.release()

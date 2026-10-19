@@ -1,20 +1,28 @@
 import QtQuick
 import QtQuick.Controls
+import QtQuick.Layouts
 import ".."
 
-// Files-tab header: storage picker + current location + up + search.
+// Files-tab header: storage picker + path + search + overflow.
+//
+// The header is deliberately only two rows tall. Row 1 is the breadcrumb pill
+// with the search toggle and the overflow menu; row 2 is a search field that
+// only exists while the user is actually searching. Android mount paths are
+// aliased ("/storage/emulated/0" -> "Internal Storage") so the bar never reads
+// like a raw Linux path.
+//
 // Contract preserved: currentPath / currentFolder / searchVisible /
 // searchText(alias) and upClicked, storageRootsClicked,
 // storagePickerRequested, searchChanged, searchFilterChanged, pathSelected.
 Rectangle {
     id: root
 
-    height: searchVisible ? Theme.dp(106) : Theme.dp(56)
+    height: searchVisible ? Theme.dp(102) : Theme.dp(56)
     color: Theme.surface0
 
     property string currentPath: ""
     property string currentFolder: ""
-    property bool searchVisible: true
+    property bool searchVisible: false
     property alias searchText: searchField.text
     property bool isPathEditable: false
     property bool isRecursiveSearch: false
@@ -22,6 +30,7 @@ Rectangle {
     signal upClicked()
     signal storageRootsClicked()
     signal storagePickerRequested()
+    signal overflowRequested()
     signal searchChanged(string text)
     signal searchFilterChanged(string filterText)
     signal recursiveSearchRequested(string query)
@@ -29,6 +38,68 @@ Rectangle {
     signal pathSelected(string target)
 
     Behavior on height { NumberAnimation { duration: Theme.durMed; easing.type: Easing.OutCubic } }
+
+    /// Turn a filesystem path into display crumbs. Android's primary shared
+    /// volume is shown as "Internal Storage" instead of storage/emulated/0.
+    function buildBreadcrumbs(path) {
+        var p = path || "/"
+        var volume = "/storage/emulated/0"
+        var out = []
+        var i
+
+        if (p === volume || p.indexOf(volume + "/") === 0) {
+            out.push({
+                name: qsTr("Internal Storage"),
+                path: volume,
+                isLast: p === volume,
+                isStorage: true
+            })
+            var rest = p.substring(volume.length).split("/")
+            var parts = []
+            for (i = 0; i < rest.length; ++i) {
+                if (rest[i].length > 0) parts.push(rest[i])
+            }
+            var accum = volume
+            for (i = 0; i < parts.length; ++i) {
+                accum += "/" + parts[i]
+                out.push({
+                    name: parts[i],
+                    path: accum,
+                    isLast: i === parts.length - 1,
+                    isStorage: false
+                })
+            }
+            return out
+        }
+
+        if (p === "/") {
+            return [{ name: qsTr("Filesystem Root"), path: "/", isLast: true, isStorage: true }]
+        }
+
+        var clean = p.replace(/\\/g, "/")
+        var bits = clean.split("/")
+        var segs = []
+        for (i = 0; i < bits.length; ++i) {
+            if (bits[i].length > 0) segs.push(bits[i])
+        }
+        var acc = ""
+        for (i = 0; i < segs.length; ++i) {
+            acc += "/" + segs[i]
+            out.push({
+                name: segs[i],
+                path: acc,
+                isLast: i === segs.length - 1,
+                isStorage: false
+            })
+        }
+        return out
+    }
+
+    function beginPathEdit() {
+        directPathInput.text = root.currentPath
+        root.isPathEditable = true
+        directPathInput.forceActiveFocus()
+    }
 
     Rectangle {
         anchors.bottom: parent.bottom
@@ -38,24 +109,29 @@ Rectangle {
         color: Theme.borderSubtle
     }
 
-    Column {
+    ColumnLayout {
         anchors.fill: parent
         anchors.leftMargin: Theme.dp(Theme.spacingMd)
         anchors.rightMargin: Theme.dp(Theme.spacingMd)
         anchors.topMargin: Theme.dp(Theme.spacingSm)
+        anchors.bottomMargin: Theme.dp(Theme.spacingSm)
         spacing: Theme.dp(Theme.spacingSm)
 
-        // ── Row 1: storage | location | up ─────────────────────────────────
-        Row {
-            width: parent.width
-            height: Theme.dp(40)
-            spacing: Theme.dp(Theme.spacingSm)
+        // ── Row 1: storage | breadcrumb | search | overflow ────────────────
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.preferredHeight: Theme.dp(40)
+            spacing: Theme.dp(4)
 
             IconButton {
-                anchors.verticalCenter: parent.verticalCenter
+                Layout.preferredWidth: Theme.dp(38)
+                Layout.preferredHeight: Theme.dp(38)
+                Layout.alignment: Qt.AlignVCenter
                 iconName: "drive"
-                variant: "soft"
-                buttonSize: Theme.dp(40)
+                tint: Theme.accentInk
+                plate: "transparent"
+                plateEdge: "transparent"
+                buttonSize: Theme.dp(38)
                 iconSize: Theme.dp(20)
                 square: true
                 onClicked: {
@@ -64,263 +140,259 @@ Rectangle {
                 }
             }
 
-            Item {
+            Rectangle {
                 id: locationPill
-                anchors.verticalCenter: parent.verticalCenter
-                width: parent.width - Theme.dp(40) - Theme.dp(40) - Theme.dp(Theme.spacingSm) * 2 - ((typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.isResourceRoot) ? Theme.dp(40) + Theme.dp(Theme.spacingSm) : 0)
-                height: Theme.dp(40)
+                Layout.fillWidth: true
+                Layout.preferredHeight: Theme.dp(38)
+                radius: Theme.radiusMd
+                color: Theme.surface1
+                border.color: root.isPathEditable ? Theme.borderFocus : "transparent"
+                border.width: root.isPathEditable ? 1 : 0
+                clip: true
 
-                Rectangle {
+                // 1. Direct editable path input
+                RowLayout {
                     anchors.fill: parent
-                    radius: Theme.radiusMd
-                    color: Theme.surface1
-                    border.color: root.isPathEditable ? Theme.borderFocus : Theme.border
-                    border.width: 1
-                    clip: true
+                    anchors.leftMargin: Theme.dp(10)
+                    anchors.rightMargin: Theme.dp(4)
+                    spacing: Theme.dp(4)
+                    visible: root.isPathEditable
 
-                    // 1. Direct editable path input (Index FM PathBar style)
-                    Row {
-                        anchors.fill: parent
-                        anchors.leftMargin: Theme.dp(8)
-                        anchors.rightMargin: Theme.dp(6)
-                        spacing: Theme.dp(6)
-                        visible: root.isPathEditable
+                    Icon {
+                        Layout.alignment: Qt.AlignVCenter
+                        name: "folder"
+                        size: Theme.dp(15)
+                        color: Theme.accentInk
+                    }
 
-                        Icon {
-                            anchors.verticalCenter: parent.verticalCenter
-                            name: "folder"
-                            size: Theme.dp(16)
-                            color: Theme.accentInk
-                        }
-
-                        TextInput {
-                            id: directPathInput
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - Theme.dp(16) - Theme.dp(6) - Theme.dp(56)
-                            text: root.currentPath
-                            font.pixelSize: Theme.dp(Theme.fontSm)
-                            color: Theme.textPrimary
-                            clip: true
-                            selectByMouse: true
-                            onAccepted: {
-                                if (text.trim().length > 0) {
-                                    root.pathSelected(text.trim())
-                                }
-                                root.isPathEditable = false
+                    TextInput {
+                        id: directPathInput
+                        Layout.fillWidth: true
+                        Layout.alignment: Qt.AlignVCenter
+                        verticalAlignment: TextInput.AlignVCenter
+                        font.pixelSize: Theme.dp(Theme.fontSm)
+                        color: Theme.textPrimary
+                        clip: true
+                        selectByMouse: true
+                        onAccepted: {
+                            if (text.trim().length > 0) {
+                                root.pathSelected(text.trim())
                             }
-                        }
-
-                        IconButton {
-                            anchors.verticalCenter: parent.verticalCenter
-                            iconName: "check"
-                            buttonSize: Theme.dp(26)
-                            iconSize: Theme.dp(13)
-                            onClicked: {
-                                if (directPathInput.text.trim().length > 0) {
-                                    root.pathSelected(directPathInput.text.trim())
-                                }
-                                root.isPathEditable = false
-                            }
-                        }
-
-                        IconButton {
-                            anchors.verticalCenter: parent.verticalCenter
-                            iconName: "close"
-                            buttonSize: Theme.dp(26)
-                            iconSize: Theme.dp(13)
-                            onClicked: root.isPathEditable = false
+                            root.isPathEditable = false
                         }
                     }
 
-                    // 2. Interactive Segmented Breadcrumbs
-                    Flickable {
-                        id: breadcrumbFlickable
-                        anchors.fill: parent
-                        anchors.leftMargin: Theme.dp(8)
-                        anchors.rightMargin: Theme.dp(32)
-                        contentWidth: breadcrumbRow.implicitWidth + Theme.dp(16)
-                        boundsBehavior: Flickable.StopAtBounds
-                        flickableDirection: Flickable.HorizontalFlick
-                        clip: true
-                        visible: !root.isPathEditable
-
-                        onContentWidthChanged: {
-                            if (contentWidth > width) {
-                                contentX = contentWidth - width
-                            } else {
-                                contentX = 0
+                    IconButton {
+                        Layout.preferredWidth: Theme.dp(26)
+                        Layout.preferredHeight: Theme.dp(26)
+                        iconName: "check"
+                        buttonSize: Theme.dp(26)
+                        iconSize: Theme.dp(13)
+                        onClicked: {
+                            if (directPathInput.text.trim().length > 0) {
+                                root.pathSelected(directPathInput.text.trim())
                             }
+                            root.isPathEditable = false
                         }
+                    }
 
-                        Row {
-                            id: breadcrumbRow
-                            anchors.verticalCenter: parent.verticalCenter
-                            spacing: Theme.dp(3)
+                    IconButton {
+                        Layout.preferredWidth: Theme.dp(26)
+                        Layout.preferredHeight: Theme.dp(26)
+                        iconName: "close"
+                        buttonSize: Theme.dp(26)
+                        iconSize: Theme.dp(13)
+                        onClicked: root.isPathEditable = false
+                    }
+                }
 
-                            // Storage root drive button
-                            Rectangle {
+                // 2. Interactive segmented breadcrumbs
+                Flickable {
+                    id: breadcrumbFlickable
+                    anchors.fill: parent
+                    anchors.leftMargin: Theme.dp(10)
+                    anchors.rightMargin: Theme.dp(28)
+                    contentWidth: breadcrumbRow.implicitWidth
+                    contentHeight: height
+                    boundsBehavior: Flickable.StopAtBounds
+                    flickableDirection: Flickable.HorizontalFlick
+                    clip: true
+                    visible: !root.isPathEditable
+
+                    onContentWidthChanged: {
+                        contentX = contentWidth > width ? contentWidth - width : 0
+                    }
+                    onWidthChanged: {
+                        contentX = contentWidth > width ? contentWidth - width : 0
+                    }
+
+                    Row {
+                        id: breadcrumbRow
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: Theme.dp(1)
+
+                        Repeater {
+                            model: root.buildBreadcrumbs(root.currentPath)
+
+                            Row {
+                                id: crumbSegment
                                 anchors.verticalCenter: parent.verticalCenter
-                                height: Theme.dp(28)
-                                width: Theme.dp(28)
-                                radius: Theme.radiusSm
-                                color: rootMouse.pressed ? Theme.surface3 : "transparent"
+                                spacing: Theme.dp(1)
 
                                 Icon {
-                                    anchors.centerIn: parent
-                                    name: "drive"
-                                    size: Theme.dp(14)
-                                    color: Theme.accentInk
-                                }
-
-                                MouseArea {
-                                    id: rootMouse
-                                    anchors.fill: parent
-                                    onClicked: {
-                                        root.storageRootsClicked()
-                                        root.storagePickerRequested()
-                                    }
-                                }
-                            }
-
-                            Repeater {
-                                model: {
-                                    var p = root.currentPath || ""
-                                    if (!p || p === "/") return [{ name: "/", path: "/", isLast: true }]
-                                    var clean = p.replace(/\\/g, "/")
-                                    var parts = clean.split("/").filter(function(s) { return s.length > 0 })
-                                    var out = []
-                                    var accum = ""
-                                    for (var i = 0; i < parts.length; ++i) {
-                                        accum += "/" + parts[i]
-                                        out.push({
-                                            name: parts[i],
-                                            path: accum,
-                                            isLast: (i === parts.length - 1)
-                                        })
-                                    }
-                                    return out
-                                }
-
-                                Row {
                                     anchors.verticalCenter: parent.verticalCenter
-                                    spacing: Theme.dp(2)
+                                    visible: index > 0
+                                    name: "chevron-right"
+                                    size: Theme.dp(10)
+                                    color: Theme.textMuted
+                                }
 
-                                    Text {
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        text: "/"
-                                        font.pixelSize: Theme.dp(Theme.fontXs)
-                                        font.weight: Font.Bold
-                                        color: Theme.textMuted
-                                    }
+                                Rectangle {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    height: Theme.dp(28)
+                                    width: crumbContent.implicitWidth + Theme.dp(14)
+                                    radius: Theme.radiusSm
+                                    color: crumbMouse.pressed
+                                           ? Theme.surface3
+                                           : (modelData.isLast ? Theme.alpha(Theme.accentInk, 0.14) : "transparent")
 
-                                    Rectangle {
-                                        anchors.verticalCenter: parent.verticalCenter
-                                        height: Theme.dp(28)
-                                        width: segLabel.implicitWidth + Theme.dp(12)
-                                        radius: Theme.radiusSm
-                                        color: segMouse.pressed ? Theme.surface3 : (modelData.isLast ? Theme.alpha(Theme.accentEnd, 0.15) : "transparent")
-                                        border.color: modelData.isLast ? Theme.alpha(Theme.accentEnd, 0.35) : "transparent"
-                                        border.width: modelData.isLast ? 1 : 0
+                                    Row {
+                                        id: crumbContent
+                                        anchors.centerIn: parent
+                                        spacing: Theme.dp(4)
+
+                                        Icon {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            visible: modelData.isStorage
+                                            name: "drive"
+                                            size: Theme.dp(12)
+                                            color: Theme.accentInk
+                                        }
 
                                         Text {
-                                            id: segLabel
-                                            anchors.centerIn: parent
+                                            anchors.verticalCenter: parent.verticalCenter
                                             text: modelData.name
                                             font.pixelSize: Theme.dp(Theme.fontSm)
-                                            font.weight: modelData.isLast ? Font.Bold : Font.Normal
-                                            color: modelData.isLast ? Theme.accentInk : Theme.textPrimary
+                                            font.weight: modelData.isLast ? Font.DemiBold : Font.Normal
+                                            color: modelData.isLast ? Theme.accentInk : Theme.textSecondary
                                         }
+                                    }
 
-                                        MouseArea {
-                                            id: segMouse
-                                            anchors.fill: parent
-                                            onClicked: {
-                                                root.pathSelected(modelData.path)
-                                            }
-                                        }
+                                    MouseArea {
+                                        id: crumbMouse
+                                        anchors.fill: parent
+                                        onClicked: root.pathSelected(modelData.path)
                                     }
                                 }
                             }
                         }
                     }
+                }
 
-                    // Toggle Path Edit button (Index FM style)
-                    IconButton {
-                        anchors.right: parent.right
-                        anchors.rightMargin: Theme.dp(4)
-                        anchors.verticalCenter: parent.verticalCenter
-                        visible: !root.isPathEditable
-                        iconName: "pencil"
-                        buttonSize: Theme.dp(26)
-                        iconSize: Theme.dp(12)
-                        onClicked: {
-                            directPathInput.text = root.currentPath
-                            root.isPathEditable = true
-                        }
-                    }
+                // 3. Optional direct-path editing stays tucked into the pill
+                IconButton {
+                    anchors.right: parent.right
+                    anchors.rightMargin: Theme.dp(3)
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: !root.isPathEditable
+                    iconName: "pencil"
+                    tint: Theme.textMuted
+                    plate: "transparent"
+                    plateEdge: "transparent"
+                    buttonSize: Theme.dp(24)
+                    iconSize: Theme.dp(11)
+                    onClicked: root.beginPathEdit()
                 }
             }
 
+            // Only present when the current folder is a real Swordigo
+            // resource root; launching the in-engine runner is contextual.
             IconButton {
-                id: playEngineBtn
-                visible: typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.isResourceRoot && rubyFileModel.playInGameAvailable
-                anchors.verticalCenter: parent.verticalCenter
+                Layout.preferredWidth: Theme.dp(38)
+                Layout.preferredHeight: Theme.dp(38)
+                Layout.alignment: Qt.AlignVCenter
+                visible: typeof rubyFileModel !== "undefined" && rubyFileModel
+                         && rubyFileModel.isResourceRoot && rubyFileModel.playInGameAvailable
                 iconName: "play"
-                variant: "soft"
                 tint: "#10B981"
-                plate: Theme.alpha("#10B981", 0.18)
-                plateEdge: Theme.alpha("#10B981", 0.40)
-                buttonSize: Theme.dp(40)
-                iconSize: Theme.dp(20)
+                plate: Theme.alpha("#10B981", 0.14)
+                plateEdge: "transparent"
+                buttonSize: Theme.dp(38)
+                iconSize: Theme.dp(18)
                 square: true
-                onClicked: {
-                    if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
-                        rubyFileModel.launchGame()
-                    }
-                }
+                onClicked: rubyFileModel.launchGame()
             }
 
             IconButton {
-                anchors.verticalCenter: parent.verticalCenter
-                iconName: "arrow-up"
-                variant: "soft"
-                buttonSize: Theme.dp(40)
-                iconSize: Theme.dp(20)
+                Layout.preferredWidth: Theme.dp(38)
+                Layout.preferredHeight: Theme.dp(38)
+                Layout.alignment: Qt.AlignVCenter
+                iconName: "search"
+                tint: (root.searchVisible || searchField.text.length > 0) ? Theme.accentInk : Theme.textSecondary
+                plate: root.searchVisible ? Theme.alpha(Theme.accentInk, 0.14) : "transparent"
+                plateEdge: "transparent"
+                buttonSize: Theme.dp(38)
+                iconSize: Theme.dp(18)
                 square: true
-                enabled: root.currentPath !== "/"
-                onClicked: root.upClicked()
+                onClicked: root.searchVisible = !root.searchVisible
+            }
+
+            IconButton {
+                id: overflowButton
+                Layout.preferredWidth: Theme.dp(38)
+                Layout.preferredHeight: Theme.dp(38)
+                Layout.alignment: Qt.AlignVCenter
+                iconName: "more-vertical"
+                tint: Theme.textSecondary
+                plate: "transparent"
+                plateEdge: "transparent"
+                buttonSize: Theme.dp(38)
+                iconSize: Theme.dp(18)
+                square: true
+                onClicked: root.overflowRequested()
             }
         }
 
-        // ── Row 2: search ──────────────────────────────────────────────────
+        // ── Row 2: search (collapsible) ────────────────────────────────────
         Rectangle {
             id: searchContainer
-            width: parent.width
-            height: Theme.dp(40)
+            Layout.fillWidth: true
+            Layout.preferredHeight: Theme.dp(38)
+            visible: root.searchVisible
             radius: Theme.radiusMd
             color: Theme.surface1
-            border.color: searchField.activeFocus ? Theme.borderFocus : Theme.border
-            border.width: 1
-            visible: root.searchVisible
+            border.width: 0
 
-            Row {
+            RowLayout {
                 anchors.fill: parent
                 anchors.leftMargin: Theme.dp(Theme.spacingMd)
-                anchors.rightMargin: Theme.dp(Theme.spacingSm)
-                spacing: Theme.dp(Theme.spacingSm)
+                anchors.rightMargin: Theme.dp(Theme.spacingXs)
+                spacing: Theme.dp(Theme.spacingXs)
 
                 Icon {
-                    anchors.verticalCenter: parent.verticalCenter
+                    Layout.alignment: Qt.AlignVCenter
                     name: "search"
                     size: Theme.dp(Theme.iconSm)
                     color: searchField.activeFocus ? Theme.accentInk : Theme.textMuted
                 }
 
-                Item {
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: parent.width - Theme.dp(18) - Theme.dp(Theme.spacingSm) * 3
-                            - (clearButton.visible ? Theme.dp(24) : 0) - deepSearchBtn.width
-                    height: parent.height
+                TextInput {
+                    id: searchField
+                    Layout.fillWidth: true
+                    Layout.alignment: Qt.AlignVCenter
+                    verticalAlignment: TextInput.AlignVCenter
+                    color: Theme.textPrimary
+                    font.pixelSize: Theme.dp(Theme.fontMd)
+                    clip: true
+                    selectByMouse: true
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.isRecursiveSearch ? qsTr("Deep recursive search…") : qsTr("Search in this folder…")
+                        color: Theme.textMuted
+                        font.pixelSize: Theme.dp(Theme.fontMd)
+                        visible: !searchField.text && !searchField.activeFocus
+                    }
 
                     Timer {
                         id: searchDebounceTimer
@@ -335,45 +407,27 @@ Rectangle {
                         }
                     }
 
-                    TextInput {
-                        id: searchField
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: parent.width
-                        color: Theme.textPrimary
-                        font.pixelSize: Theme.dp(Theme.fontMd)
-                        clip: true
-                        selectByMouse: true
-
-                        Text {
-                            text: root.isRecursiveSearch ? qsTr("Deep recursive search…") : qsTr("Search in this folder…")
-                            color: Theme.textMuted
-                            font.pixelSize: Theme.dp(Theme.fontMd)
-                            visible: !searchField.text && !searchField.activeFocus
-                        }
-
-                        onTextChanged: {
-                            root.searchChanged(text)
-                            if (text.trim().length === 0) {
-                                searchDebounceTimer.stop()
-                                root.clearSearchRequested()
-                                root.searchFilterChanged("")
-                            } else {
-                                searchDebounceTimer.restart()
-                            }
+                    onTextChanged: {
+                        root.searchChanged(text)
+                        if (text.trim().length === 0) {
+                            searchDebounceTimer.stop()
+                            root.clearSearchRequested()
+                            root.searchFilterChanged("")
+                        } else {
+                            searchDebounceTimer.restart()
                         }
                     }
                 }
 
-                // Deep Recursive Search toggle (Index FM & HyprFM style)
+                // Deep recursive search toggle
                 Rectangle {
                     id: deepSearchBtn
-                    anchors.verticalCenter: parent.verticalCenter
-                    height: Theme.dp(26)
-                    width: deepSearchRow.implicitWidth + Theme.dp(12)
+                    Layout.preferredWidth: deepSearchRow.implicitWidth + Theme.dp(14)
+                    Layout.preferredHeight: Theme.dp(26)
+                    Layout.alignment: Qt.AlignVCenter
                     radius: Theme.radiusSm
-                    color: root.isRecursiveSearch ? Theme.alpha(Theme.accentInk, 0.22) : Theme.surface2
-                    border.color: root.isRecursiveSearch ? Theme.accentInk : Theme.borderSubtle
-                    border.width: 1
+                    color: root.isRecursiveSearch ? Theme.alpha(Theme.accentInk, 0.20) : Theme.surface2
+                    border.width: 0
 
                     Row {
                         id: deepSearchRow
@@ -391,7 +445,7 @@ Rectangle {
                             anchors.verticalCenter: parent.verticalCenter
                             text: qsTr("Deep")
                             font.pixelSize: Theme.dp(Theme.fontXs)
-                            font.weight: root.isRecursiveSearch ? Font.Bold : Font.Normal
+                            font.weight: root.isRecursiveSearch ? Font.DemiBold : Font.Normal
                             color: root.isRecursiveSearch ? Theme.accentInk : Theme.textMuted
                         }
                     }
@@ -413,9 +467,12 @@ Rectangle {
 
                 IconButton {
                     id: clearButton
-                    anchors.verticalCenter: parent.verticalCenter
+                    Layout.preferredWidth: Theme.dp(26)
+                    Layout.preferredHeight: Theme.dp(26)
                     visible: searchField.text.length > 0
                     iconName: "close"
+                    plate: "transparent"
+                    plateEdge: "transparent"
                     buttonSize: Theme.dp(26)
                     iconSize: Theme.dp(14)
                     onClicked: {
@@ -426,6 +483,12 @@ Rectangle {
                     }
                 }
             }
+        }
+    }
+
+    onSearchVisibleChanged: {
+        if (searchVisible) {
+            searchField.forceActiveFocus()
         }
     }
 }

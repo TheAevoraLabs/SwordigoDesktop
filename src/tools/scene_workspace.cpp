@@ -192,10 +192,13 @@ void object_render_matrix(const av::SceneObject& obj, float out[16]) {
     object_world_matrix(obj, out);
 
     // Apply ModelComponent rotations: Rx(XRotation) * Ry(YRotation)
-    if (obj.has_model_x_rotation || obj.has_model_y_rotation) {
+    // Only apply if not already applied in object_world_matrix via rot_x / rot_z
+    const float mx = (std::abs(obj.rot_x) < 1e-5f) ? obj.model_x_rotation : 0.0f;
+    const float my = (std::abs(obj.rot_z) < 1e-5f) ? obj.model_y_rotation : 0.0f;
+    if (std::abs(mx) > 1e-5f || std::abs(my) > 1e-5f) {
         float RX[16], RY[16], R_model[16], temp[16];
-        av::mat4_rotate_x(RX, obj.model_x_rotation * 180.0f / kPi);
-        av::mat4_rotate_y(RY, obj.model_y_rotation * 180.0f / kPi);
+        av::mat4_rotate_x(RX, mx * 180.0f / kPi);
+        av::mat4_rotate_y(RY, my * 180.0f / kPi);
         av::mat4_multiply(R_model, RX, RY);   // Three.js Euler order XYZ (Rx * Ry)
         av::mat4_multiply(temp, out, R_model);
         std::memcpy(out, temp, 16 * sizeof(float));

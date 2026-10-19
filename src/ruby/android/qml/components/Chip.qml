@@ -10,6 +10,9 @@ Rectangle {
     property string text: ""
     property string iconName: ""
     property bool selected: false
+    /// Draw the hairline outline. Dense toolbars set this false so the chips
+    /// read as tonal fills instead of a row of boxed buttons.
+    property bool outlined: true
     property color accent: Theme.accentEnd
     /// Optional trailing count badge.
     property int count: -1
@@ -20,9 +23,9 @@ Rectangle {
     implicitWidth: chipRow.implicitWidth + Theme.dp(26)
     width: implicitWidth
     radius: Theme.radiusPill
-    color: root.selected ? Theme.alpha(root.accent, 0.20) : Theme.surface2
-    border.color: root.selected ? root.accent : Theme.borderSubtle
-    border.width: 1
+    color: root.selected ? Theme.alpha(root.accent, 0.20) : (root.outlined ? Theme.surface2 : Theme.surface1)
+    border.color: root.outlined ? (root.selected ? root.accent : Theme.borderSubtle) : "transparent"
+    border.width: root.outlined ? 1 : 0
 
     Behavior on color { ColorAnimation { duration: Theme.durFast } }
     Behavior on border.color { ColorAnimation { duration: Theme.durFast } }

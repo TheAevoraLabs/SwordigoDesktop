@@ -52,50 +52,57 @@ ApplicationWindow {
         tabLayout.currentIndex = index
     }
 
-    Item {
-        focus: true
-        Keys.onBackPressed: (event) => {
-            if (mainStack.depth > 1) {
-                var current = mainStack.currentItem
-                if (current && typeof current.handleBack === "function") {
-                    current.handleBack()
-                    event.accepted = true
-                    return
-                }
-                mainStack.pop()
-                event.accepted = true
-            } else {
-                var currentTab = (tabLayout && typeof tabLayout.itemAt === "function")
-                                 ? tabLayout.itemAt(tabLayout.currentIndex)
-                                 : (tabLayout.children ? tabLayout.children[tabLayout.currentIndex] : null)
-                if (currentTab && typeof currentTab.handleBack === "function") {
-                    if (currentTab.handleBack()) {
-                        event.accepted = true
-                        return
-                    }
-                }
-                if (tabLayout.currentIndex !== 0) {
-                    window.switchTab(0)
-                    event.accepted = true
-                    return
-                }
-
-                // Gracefully move app to background without destroying RAM state
-                if (typeof androidContext !== "undefined" && androidContext && typeof androidContext.moveToBack === "function") {
-                    androidContext.moveToBack()
-                    event.accepted = true
-                    return
-                }
-            }
-        }
-    }
-
     // ── Global Fullscreen StackView (deep views) ───────────────────────────
+    // Android back is handled here rather than on a sibling focus item: key
+    // events bubble up the visual parent chain, so this still sees Back while
+    // a list, search field or dialog inside the current tab has focus.
     StackView {
         id: mainStack
         anchors.fill: parent
         initialItem: mainTabsView
         focus: true
+
+        Keys.onBackPressed: (event) => {
+            // A collision prompt is modal: do not let Back navigate away and
+            // leave the worker paused forever.
+            if (typeof rubyFileModel !== "undefined" && rubyFileModel
+                    && rubyFileModel.conflictActive) {
+                event.accepted = true
+                return
+            }
+
+            if (mainStack.depth > 1) {
+                var current = mainStack.currentItem
+                if (current && typeof current.handleBack === "function" && current.handleBack()) {
+                    event.accepted = true
+                    return
+                }
+                mainStack.pop()
+                event.accepted = true
+                return
+            }
+
+            var currentTab = (tabLayout && typeof tabLayout.itemAt === "function")
+                             ? tabLayout.itemAt(tabLayout.currentIndex)
+                             : (tabLayout.children ? tabLayout.children[tabLayout.currentIndex] : null)
+            if (currentTab && typeof currentTab.handleBack === "function" && currentTab.handleBack()) {
+                event.accepted = true
+                return
+            }
+
+            if (tabLayout.currentIndex !== 0) {
+                window.switchTab(0)
+                event.accepted = true
+                return
+            }
+
+            // At Home root, gracefully background the task instead of destroying
+            // the Qt runtime.
+            if (typeof androidContext !== "undefined" && androidContext && typeof androidContext.moveToBack === "function") {
+                androidContext.moveToBack()
+                event.accepted = true
+            }
+        }
 
         pushEnter: Transition {
             NumberAnimation { property: "opacity"; from: 0.0; to: 1.0; duration: Theme.durMed }
@@ -293,5 +300,13 @@ ApplicationWindow {
         GroundMeshStudioView {
             onBackRequested: mainStack.pop()
         }
+    }
+
+    // Global file-operation progress, collision prompt and result banner.
+    // Sits above the tab bar and the deep StackView so an operation that was
+    // started in Files stays visible after navigating elsewhere.
+    FileOperationOverlay {
+        anchors.fill: parent
+        z: 400
     }
 }

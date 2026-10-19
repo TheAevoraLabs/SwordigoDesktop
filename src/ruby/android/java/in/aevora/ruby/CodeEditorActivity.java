@@ -819,16 +819,29 @@ public class CodeEditorActivity extends Activity {
         mSaveBtn.setEnabled(false);
         mSaveBtn.setText("SAVING...");
 
-        final String content = mEditor.getText().toString();
         mIoExecutor.execute(() -> {
             String error = null;
+            String content = "";
             try {
-                error = nativeSaveFile(mFilePath, content, mIsFileriftTranscoded);
+                if (mEditor != null && mEditor.getText() != null) {
+                    content = mEditor.getText().toString();
+                }
+            } catch (OutOfMemoryError oom) {
+                error = "Out of memory while serializing editor buffer: " + oom.getMessage();
             } catch (Throwable t) {
-                error = t.getMessage();
+                error = "Failed to retrieve editor text: " + t.getMessage();
+            }
+
+            if (error == null) {
+                try {
+                    error = nativeSaveFile(mFilePath, content, mIsFileriftTranscoded);
+                } catch (Throwable t) {
+                    error = t.getMessage();
+                }
             }
 
             final String finalError = error;
+            final String finalContent = content;
             mHandler.post(() -> {
                 mSaveBtn.setEnabled(true);
                 if (finalError == null) {
@@ -838,9 +851,19 @@ public class CodeEditorActivity extends Activity {
                     if (onComplete != null) onComplete.run();
                 } else {
                     updateStatusIndicators();
+                    // Attempt emergency recovery write so modder's edits are never lost
+                    String recoveryNote = "";
+                    if (mFilePath != null && !mFilePath.isEmpty() && finalContent != null && !finalContent.isEmpty()) {
+                        File recFile = new File(mFilePath + ".recovery.txt");
+                        try (java.io.FileWriter fw = new java.io.FileWriter(recFile)) {
+                            fw.write(finalContent);
+                            recoveryNote = "\n\n(A recovery backup of your edits was saved to: " + recFile.getName() + ")";
+                        } catch (Throwable ignored) {}
+                    }
+
                     new AlertDialog.Builder(this)
-                        .setTitle("Compilation Error")
-                        .setMessage("Failed to compile and save markup:\n\n" + finalError)
+                        .setTitle("Compilation / Save Note")
+                        .setMessage("Failed to save:\n\n" + finalError + recoveryNote)
                         .setPositiveButton("Keep Editing", null)
                         .show();
                 }

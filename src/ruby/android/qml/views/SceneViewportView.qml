@@ -281,18 +281,11 @@ Item {
                 viewportItem.addTouchExclusionRect(pFly.x - padMargin, pFly.y - padMargin,
                                                   flyPad.width + padMargin * 2, flyPad.height + padMargin * 2)
 
-                if (centerGizmoBar.visible) {
+                if (typeof centerGizmoBar !== "undefined" && centerGizmoBar.visible) {
                     var pGizmoBar = controlDeck.mapToItem(viewportItem, centerGizmoBar.x, centerGizmoBar.y)
                     viewportItem.addTouchExclusionRect(pGizmoBar.x - padMargin, pGizmoBar.y - padMargin,
                                                       centerGizmoBar.width + padMargin * 2, centerGizmoBar.height + padMargin * 2)
                 }
-            }
-
-            // Floating GizmoPad (when armed)
-            if (gizmoPad.visible) {
-                var pGizmo = gizmoPad.mapToItem(viewportItem, 0, 0)
-                viewportItem.addTouchExclusionRect(pGizmo.x - padMargin, pGizmo.y - padMargin,
-                                                  gizmoPad.width + padMargin * 2, gizmoPad.height + padMargin * 2)
             }
 
             // Right-edge precision controls (D-Pad, Rotate buttons, Z-depth nudge buttons)
@@ -1915,10 +1908,76 @@ Item {
         anchors.rightMargin: Theme.dp(6)
         spacing: Theme.dp(4)
         z: 12
-        visible: root.controlsVisible && !root.inspectorOpen && root.consoleCollapsed && !root.inAnyMeshEdit
+        visible: root.controlsVisible && !root.inspectorOpen && !root.inAnyMeshEdit
         opacity: visible ? 1.0 : 0.0
 
         Behavior on opacity { NumberAnimation { duration: Theme.durFast } }
+
+        property int activeRotAxis: isPlanarMesh ? 2 : 1 // 0 = X (Pitch), 1 = Y (Yaw), 2 = Z (Roll)
+        readonly property bool hasSelectedObject: (typeof viewportItem !== "undefined" && viewportItem)
+                                                  ? (viewportItem.selectedObject >= 0)
+                                                  : false
+        readonly property bool isPlanarMesh: (typeof viewportItem !== "undefined" && viewportItem)
+                                             ? (viewportItem.canMeshEdit || viewportItem.isSelectedWater)
+                                             : false
+
+        // Current angle in degrees for the active axis (or camera yaw if no object selected)
+        readonly property real currentAngle: {
+            if (!hasSelectedObject) return (typeof viewportItem !== "undefined" && viewportItem) ? viewportItem.cameraYaw : 0.0
+            if (activeRotAxis === 0) return (typeof viewportItem !== "undefined" && viewportItem) ? viewportItem.selectedRotX : 0.0
+            if (activeRotAxis === 1) return (typeof viewportItem !== "undefined" && viewportItem) ? viewportItem.selectedRotY : 0.0
+            return (typeof viewportItem !== "undefined" && viewportItem) ? viewportItem.selectedRotZ : 0.0
+        }
+
+        // Active axis accent color
+        readonly property color activeAxisColor: {
+            if (!hasSelectedObject) return Theme.accentInk
+            if (isPlanarMesh) return Theme.colorMesh
+            if (activeRotAxis === 0) return "#E4675F" // Pitch X (Red)
+            if (activeRotAxis === 1) return "#4ED08A" // Yaw Y (Green)
+            return "#64C3FF"                          // Roll Z (Blue)
+        }
+
+        onIsPlanarMeshChanged: {
+            if (isPlanarMesh) activeRotAxis = 2
+        }
+
+        onHasSelectedObjectChanged: {
+            if (isPlanarMesh) activeRotAxis = 2
+            else if (hasSelectedObject && activeRotAxis === 2) activeRotAxis = 1
+        }
+
+        Timer {
+            id: rotHoldTimer
+            interval: 70
+            repeat: true
+            property real stepDeg: 0
+            property int targetAxis: 2
+            onTriggered: {
+                if (rightEdgeControls.hasSelectedObject) {
+                    viewportItem.rotateSelectedAxis(targetAxis, stepDeg)
+                } else {
+                    viewportItem.rotateSelectedZ(stepDeg)
+                }
+            }
+        }
+
+        function startRotHold(axis, deg) {
+            if (typeof screenOrientation !== "undefined" && screenOrientation)
+                screenOrientation.vibrateTouch(15)
+            rotHoldTimer.targetAxis = axis
+            rotHoldTimer.stepDeg = deg
+            if (rightEdgeControls.hasSelectedObject) {
+                viewportItem.rotateSelectedAxis(axis, deg)
+            } else {
+                viewportItem.rotateSelectedZ(deg)
+            }
+            rotHoldTimer.start()
+        }
+
+        function stopRotHold() {
+            rotHoldTimer.stop()
+        }
 
         // Row 1: Camera Mode & Frame
         Row {
@@ -1975,57 +2034,344 @@ Item {
             }
         }
 
-        // Row 2: Rotate CCW / CW (Enlarged 36x34dp touch targets)
-        Row {
+        // Row 2: Precision Case-Based Uniform Rotation Module (114dp width)
+        Column {
             anchors.right: parent.right
-            spacing: Theme.dp(4)
+            width: Theme.dp(114)
+            spacing: Theme.dp(3)
 
-            Rectangle {
-                width: Theme.dp(36)
-                height: Theme.dp(34)
-                radius: Theme.radiusSm
-                color: Theme.alpha(Theme.surface2, 0.90)
-                border.color: Theme.borderSubtle
-                border.width: 1
+            // Sub-row A: Mode / Axis Badge
+            // Case 1: 3D Model / Prop -> 3-way Segmented Buttons (X Pitch, Y Yaw, Z Roll)
+            Row {
+                visible: rightEdgeControls.hasSelectedObject && !rightEdgeControls.isPlanarMesh
+                width: parent.width
+                spacing: Theme.dp(3)
 
-                Icon {
-                    anchors.centerIn: parent
-                    name: "rotate-ccw"
-                    size: Theme.dp(16)
-                    color: Theme.textPrimary
-                }
-                MouseArea {
-                    anchors.fill: parent
-                    preventStealing: true
-                    onClicked: {
-                        if (typeof screenOrientation !== "undefined" && screenOrientation)
-                            screenOrientation.vibrateTouch(15)
-                        viewportItem.rotateSelectedZ(-15.0)
+                Repeater {
+                    model: [
+                        { axis: 0, label: "X", name: "Pitch", col: "#E4675F" },
+                        { axis: 1, label: "Y", name: "Yaw",   col: "#4ED08A" },
+                        { axis: 2, label: "Z", name: "Roll",  col: "#64C3FF" }
+                    ]
+                    delegate: Rectangle {
+                        width: Math.floor((Theme.dp(114) - Theme.dp(6)) / 3)
+                        height: Theme.dp(22)
+                        radius: Theme.radiusSm
+                        color: rightEdgeControls.activeRotAxis === modelData.axis
+                               ? Theme.alpha(modelData.col, 0.28)
+                               : Theme.alpha(Theme.surface2, 0.85)
+                        border.color: rightEdgeControls.activeRotAxis === modelData.axis
+                                      ? modelData.col
+                                      : Theme.borderSubtle
+                        border.width: 1
+
+                        Row {
+                            anchors.centerIn: parent
+                            spacing: Theme.dp(2)
+                            Rectangle {
+                                width: Theme.dp(5)
+                                height: Theme.dp(5)
+                                radius: width * 0.5
+                                color: modelData.col
+                            }
+                            Text {
+                                text: modelData.label
+                                font.pixelSize: Theme.dp(9)
+                                font.weight: Font.Bold
+                                color: rightEdgeControls.activeRotAxis === modelData.axis ? modelData.col : Theme.textPrimary
+                            }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (typeof screenOrientation !== "undefined" && screenOrientation)
+                                    screenOrientation.vibrateTouch(12)
+                                rightEdgeControls.activeRotAxis = modelData.axis
+                            }
+                        }
                     }
                 }
             }
 
+            // Case 2: 2D Planar Mesh (GroundMesh / WaterMesh) -> Planar Roll Badge
             Rectangle {
-                width: Theme.dp(36)
-                height: Theme.dp(34)
+                visible: rightEdgeControls.hasSelectedObject && rightEdgeControls.isPlanarMesh
+                width: parent.width
+                height: Theme.dp(20)
                 radius: Theme.radiusSm
-                color: Theme.alpha(Theme.surface2, 0.90)
-                border.color: Theme.borderSubtle
+                color: Theme.alpha(Theme.colorMesh, 0.15)
+                border.color: Theme.alpha(Theme.colorMesh, 0.40)
                 border.width: 1
 
-                Icon {
+                Row {
                     anchors.centerIn: parent
-                    name: "rotate"
-                    size: Theme.dp(16)
-                    color: Theme.textPrimary
+                    spacing: Theme.dp(4)
+                    Rectangle {
+                        width: Theme.dp(6)
+                        height: Theme.dp(6)
+                        radius: width * 0.5
+                        color: Theme.colorMesh
+                    }
+                    Text {
+                        text: qsTr("Roll · Z (Planar)")
+                        font.pixelSize: Theme.dp(9)
+                        font.weight: Font.DemiBold
+                        color: Theme.colorMesh
+                    }
                 }
-                MouseArea {
-                    anchors.fill: parent
-                    preventStealing: true
-                    onClicked: {
-                        if (typeof screenOrientation !== "undefined" && screenOrientation)
-                            screenOrientation.vibrateTouch(15)
-                        viewportItem.rotateSelectedZ(15.0)
+            }
+
+            // Case 3: No Selection -> Camera Yaw Badge
+            Rectangle {
+                visible: !rightEdgeControls.hasSelectedObject
+                width: parent.width
+                height: Theme.dp(20)
+                radius: Theme.radiusSm
+                color: Theme.alpha(Theme.accentInk, 0.15)
+                border.color: Theme.alpha(Theme.accentInk, 0.40)
+                border.width: 1
+
+                Row {
+                    anchors.centerIn: parent
+                    spacing: Theme.dp(4)
+                    Icon {
+                        name: "camera"
+                        size: Theme.dp(11)
+                        color: Theme.accentInk
+                    }
+                    Text {
+                        text: qsTr("Camera Orbit")
+                        font.pixelSize: Theme.dp(9)
+                        font.weight: Font.DemiBold
+                        color: Theme.accentInk
+                    }
+                }
+            }
+
+            // Sub-row B: Stepper & Live Angle Scrub Jogger
+            Row {
+                width: parent.width
+                spacing: Theme.dp(3)
+
+                // Rotate CCW / -15 deg button
+                Rectangle {
+                    width: Theme.dp(34)
+                    height: Theme.dp(30)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.90)
+                    border.color: Theme.borderSubtle
+                    border.width: 1
+
+                    Icon {
+                        anchors.centerIn: parent
+                        name: "rotate-ccw"
+                        size: Theme.dp(14)
+                        color: Theme.textPrimary
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        preventStealing: true
+                        onPressed: rightEdgeControls.startRotHold(rightEdgeControls.activeRotAxis, -15.0)
+                        onReleased: rightEdgeControls.stopRotHold()
+                        onCanceled: rightEdgeControls.stopRotHold()
+                    }
+                }
+
+                // Center Live Angle Readout & Scrub Jogger
+                Rectangle {
+                    width: Theme.dp(40)
+                    height: Theme.dp(30)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.95)
+                    border.color: rightEdgeControls.activeAxisColor
+                    border.width: 1
+
+                    Column {
+                        anchors.centerIn: parent
+                        spacing: 0
+                        Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: (rightEdgeControls.currentAngle > 0 ? "+" : "") + Math.round(rightEdgeControls.currentAngle) + "°"
+                            font.pixelSize: Theme.dp(10)
+                            font.weight: Font.Bold
+                            color: Theme.textPrimary
+                        }
+                        Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: !rightEdgeControls.hasSelectedObject ? "Yaw"
+                                  : (rightEdgeControls.activeRotAxis === 0 ? "Pitch"
+                                  : (rightEdgeControls.activeRotAxis === 1 ? "Yaw" : "Roll"))
+                            font.pixelSize: Theme.dp(7)
+                            font.weight: Font.DemiBold
+                            color: rightEdgeControls.activeAxisColor
+                        }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        preventStealing: true
+                        property real startX: 0
+                        property real startAngle: 0
+                        property bool scrubbing: false
+
+                        onPressed: (mouse) => {
+                            startX = mouse.x
+                            startAngle = rightEdgeControls.currentAngle
+                            scrubbing = false
+                        }
+
+                        onPositionChanged: (mouse) => {
+                            var dx = mouse.x - startX
+                            if (Math.abs(dx) > 3 || scrubbing) {
+                                scrubbing = true
+                                var newAngle = startAngle + dx * 0.75
+                                if (rightEdgeControls.hasSelectedObject) {
+                                    viewportItem.setSelectedRotationAngle(rightEdgeControls.activeRotAxis, newAngle)
+                                } else {
+                                    viewportItem.rotateSelectedZ(dx * 0.5)
+                                }
+                            }
+                        }
+
+                        onClicked: {
+                            if (!scrubbing) {
+                                if (typeof screenOrientation !== "undefined" && screenOrientation)
+                                    screenOrientation.vibrateTouch(18)
+                                if (rightEdgeControls.hasSelectedObject) {
+                                    viewportItem.setSelectedRotationAngle(rightEdgeControls.activeRotAxis, 0.0)
+                                } else {
+                                    viewportItem.setCameraPreset("front")
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Rotate CW / +15 deg button
+                Rectangle {
+                    width: Theme.dp(34)
+                    height: Theme.dp(30)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.90)
+                    border.color: Theme.borderSubtle
+                    border.width: 1
+
+                    Icon {
+                        anchors.centerIn: parent
+                        name: "rotate"
+                        size: Theme.dp(14)
+                        color: Theme.textPrimary
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        preventStealing: true
+                        onPressed: rightEdgeControls.startRotHold(rightEdgeControls.activeRotAxis, 15.0)
+                        onReleased: rightEdgeControls.stopRotHold()
+                        onCanceled: rightEdgeControls.stopRotHold()
+                    }
+                }
+            }
+
+            // Sub-row C: Quick Action Buttons (180°, 45°, 0° - Zero emojis)
+            Row {
+                width: parent.width
+                spacing: Theme.dp(3)
+
+                // Flip 180°
+                Rectangle {
+                    width: Math.floor((Theme.dp(114) - Theme.dp(6)) / 3)
+                    height: Theme.dp(20)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.85)
+                    border.color: Theme.borderSubtle
+                    border.width: 1
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "180°"
+                        font.pixelSize: Theme.dp(9)
+                        font.weight: Font.DemiBold
+                        color: Theme.textPrimary
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation)
+                                screenOrientation.vibrateTouch(15)
+                            if (rightEdgeControls.hasSelectedObject) {
+                                viewportItem.rotateSelectedAxis(rightEdgeControls.activeRotAxis, 180.0)
+                            } else {
+                                viewportItem.rotateSelectedZ(180.0)
+                            }
+                        }
+                    }
+                }
+
+                // Snap 45°
+                Rectangle {
+                    width: Math.floor((Theme.dp(114) - Theme.dp(6)) / 3)
+                    height: Theme.dp(20)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.85)
+                    border.color: Theme.borderSubtle
+                    border.width: 1
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "45°"
+                        font.pixelSize: Theme.dp(9)
+                        font.weight: Font.DemiBold
+                        color: Theme.textPrimary
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation)
+                                screenOrientation.vibrateTouch(15)
+                            var cur = rightEdgeControls.currentAngle
+                            var snapped = Math.round(cur / 45.0) * 45.0
+                            if (rightEdgeControls.hasSelectedObject) {
+                                viewportItem.setSelectedRotationAngle(rightEdgeControls.activeRotAxis, snapped)
+                            } else {
+                                viewportItem.rotateSelectedZ(snapped - cur)
+                            }
+                        }
+                    }
+                }
+
+                // Reset 0°
+                Rectangle {
+                    width: Math.floor((Theme.dp(114) - Theme.dp(6)) / 3)
+                    height: Theme.dp(20)
+                    radius: Theme.radiusSm
+                    color: Theme.alpha(Theme.surface2, 0.85)
+                    border.color: Theme.borderSubtle
+                    border.width: 1
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "0°"
+                        font.pixelSize: Theme.dp(9)
+                        font.weight: Font.DemiBold
+                        color: rightEdgeControls.activeAxisColor
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (typeof screenOrientation !== "undefined" && screenOrientation)
+                                screenOrientation.vibrateTouch(20)
+                            if (rightEdgeControls.hasSelectedObject) {
+                                viewportItem.setSelectedRotationAngle(rightEdgeControls.activeRotAxis, 0.0)
+                            } else {
+                                viewportItem.setCameraPreset("front")
+                            }
+                        }
                     }
                 }
             }
@@ -2352,7 +2698,7 @@ Item {
             onDollyRequested: (fwd, strafe) => viewportItem.dollyCamera(fwd, strafe)
         }
 
-        // Center Floating Gizmo Mode Pill
+        // Center Floating Gizmo Mode Pill (Small, icons only)
         GlassmorphicOverlay {
             id: centerGizmoBar
             anchors.horizontalCenter: parent.horizontalCenter
@@ -2419,34 +2765,6 @@ Item {
             onPanRequested: (vx, vy) => viewportItem.panCamera(vx, vy)
             onDollyRequested: (fwd, strafe) => viewportItem.dollyCamera(fwd, strafe)
         }
-    }
-
-    // ── Floating gizmo pad for precise object transforms ───────────────────
-    // Touch-first replacement for dragging a 3D gizmo handle, which a thumb is
-    // always covering. It only appears once a transform mode is armed AND an
-    // object is selected, so it never competes with camera navigation, and its
-    // axis buttons repeat while held — the touch equivalent of keeping a desktop
-    // gizmo drag alive. It pairs with the centre mode pill, which arms the mode.
-    GizmoPad {
-        id: gizmoPad
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.bottom: parent.bottom
-        anchors.bottomMargin: root.consoleHeight + Theme.dp(8)
-        cellSize: Theme.dp(30)
-        gizmoMode: viewportItem.gizmoMode
-        hasSelection: viewportItem.selectedObject >= 0
-        visible: root.controlsVisible && root.studioFits
-                 && viewportItem.gizmoMode > 0
-                 && viewportItem.selectedObject >= 0
-                 && !root.inAnyMeshEdit
-        z: 13
-        onNudged: (axis, steps) => viewportItem.nudgeSelected(axis, steps)
-        onModeCycleRequested: {
-            if (typeof screenOrientation !== "undefined" && screenOrientation)
-                screenOrientation.vibrateTouch(15)
-            viewportItem.gizmoMode = (viewportItem.gizmoMode + 1) % 4
-        }
-        onModeRequested: (mode) => viewportItem.gizmoMode = mode
     }
 
     // ── Outliner (left, full height, over the live viewport) ──────────────

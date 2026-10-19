@@ -1,4 +1,5 @@
 #include "ruby_file_model.h"
+#include "file_operations.h"
 #include <QThreadPool>
 #include <QGuiApplication>
 #include <QClipboard>
@@ -21,6 +22,8 @@
 #include <QDebug>
 #if defined(Q_OS_ANDROID)
 #  include <QJniObject>
+#  include <QJniEnvironment>
+#  include <QtCore/qnativeinterface.h>
 #endif
 
 
@@ -41,8 +44,93 @@ RubyFileModel::RubyFileModel(QObject* parent)
             m_currentDir = QDir::current();
         }
     }
+    m_operations = std::make_unique<FileOperations>();
+    connect(m_operations.get(), &FileOperations::stateChanged,
+            this, &RubyFileModel::operationStateChanged);
+    connect(m_operations.get(), &FileOperations::finished, this,
+            [this](int kind, bool ok, bool cancelled, const QString& summary,
+                   const QString&) {
+        // A successful cut/paste is the only time the clipboard is consumed.
+        if (ok && kind == int(FileOperations::MoveJob)) clearClipboard();
+        // Reload even after a partial failure or cancel: some items may have
+        // been copied/deleted before the stop, and the list must show reality.
+        m_allItems.clear();
+        // Deleting the folder you are standing in leaves the model on a dead
+        // path; step up once instead of showing an empty ghost view.
+        if (!QFileInfo(m_currentDir.absolutePath()).isDir()) {
+            QDir up = m_currentDir;
+            if (up.cdUp()) {
+                m_currentDir = up;
+                emit currentPathChanged();
+            }
+        }
+        reload();
+        if (!summary.isEmpty()) emit statusMessage(summary);
+        emit operationFinished(kind, ok, cancelled, summary);
+    });
+
     refreshStorageInfo();
     reload();
+}
+
+RubyFileModel::~RubyFileModel() = default;
+
+// ─── Async operation facade ────────────────────────────────────────────────
+
+bool RubyFileModel::operationBusy() const {
+    return m_operations && m_operations->busy();
+}
+
+QString RubyFileModel::operationTitle() const {
+    return m_operations ? m_operations->title() : QString();
+}
+
+QString RubyFileModel::operationDetail() const {
+    return m_operations ? m_operations->detail() : QString();
+}
+
+qreal RubyFileModel::operationProgress() const {
+    return m_operations ? m_operations->progress() : -1.0;
+}
+
+QString RubyFileModel::operationBytesStr() const {
+    return m_operations ? m_operations->bytesText() : QString();
+}
+
+QString RubyFileModel::operationItemsStr() const {
+    return m_operations ? m_operations->itemsText() : QString();
+}
+
+bool RubyFileModel::conflictActive() const {
+    return m_operations && m_operations->conflictActive();
+}
+
+QString RubyFileModel::conflictSourceName() const {
+    return m_operations ? QFileInfo(m_operations->conflictSource()).fileName() : QString();
+}
+
+QString RubyFileModel::conflictTargetName() const {
+    return m_operations ? QFileInfo(m_operations->conflictTarget()).fileName() : QString();
+}
+
+QString RubyFileModel::conflictTargetDir() const {
+    return m_operations ? QFileInfo(m_operations->conflictTarget()).absolutePath() : QString();
+}
+
+QString RubyFileModel::clipboardSummary() const {
+    if (m_clipboardPaths.isEmpty()) return QString();
+    if (m_clipboardPaths.size() == 1) {
+        return QFileInfo(m_clipboardPaths.first()).fileName();
+    }
+    return QStringLiteral("%1 items").arg(m_clipboardPaths.size());
+}
+
+void RubyFileModel::cancelFileOperation() {
+    if (m_operations) m_operations->cancel();
+}
+
+void RubyFileModel::resolveFileConflict(int decision, bool applyToAll) {
+    if (m_operations) m_operations->resolveConflict(decision, applyToAll);
 }
 
 int RubyFileModel::rowCount(const QModelIndex& parent) const {
@@ -129,20 +217,18 @@ void RubyFileModel::setFilter(const QString& text) {
 }
 
 bool RubyFileModel::deleteItem(const QString& path) {
-    QFileInfo fi(path);
-    bool success = false;
-    if (fi.isDir()) {
-        QDir dir(path);
-        success = dir.removeRecursively();
-    } else {
-        success = QFile::remove(path);
-    }
-    if (success) {
-        m_pinnedPaths.remove(path);
-        m_allItems.clear();
-        reload();
-    }
-    return success;
+    if (path.isEmpty()) return false;
+    // Queue the recursive delete on the worker; the model is reloaded by the
+    // finished() handler once the tree is actually gone. Never walk/remove a
+    // directory on the GUI thread.
+    m_pinnedPaths.remove(path);
+    m_selectedPaths.remove(path);
+    m_clipboardPaths.removeAll(path);
+    if (m_clipboardPath == path) m_clipboardPath.clear();
+    if (m_clipboardPaths.isEmpty()) m_clipboardIsCut = false;
+    emit selectionChanged();
+    emit clipboardChanged();
+    return m_operations && m_operations->remove(QStringList{path});
 }
 
 bool RubyFileModel::renameItem(const QString& path, const QString& newName) {
@@ -948,32 +1034,6 @@ qint64 RubyFileModel::calculate_dir_size(const QString& dir_path, int& out_files
     return total_bytes;
 }
 
-static bool zip_folder_recursive_impl(const QString& root_dir, const QString& current_dir, std::vector<zip::OutEntry>& entries) {
-    QDir dir(current_dir);
-    QFileInfoList list = dir.entryInfoList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden);
-    for (const auto& fi : list) {
-        if (fi.isDir()) {
-            if (!zip_folder_recursive_impl(root_dir, fi.absoluteFilePath(), entries)) {
-                return false;
-            }
-        } else {
-            QFile f(fi.absoluteFilePath());
-            if (f.open(QIODevice::ReadOnly)) {
-                QByteArray bytes = f.readAll();
-                f.close();
-                QString rel_path = QDir(root_dir).relativeFilePath(fi.absoluteFilePath());
-                rel_path.replace(QLatin1Char('\\'), QLatin1Char('/'));
-                zip::OutEntry e;
-                e.name = rel_path.toStdString();
-                e.data = std::string(bytes.constData(), bytes.size());
-                e.method = 8; // Deflate
-                entries.push_back(std::move(e));
-            }
-        }
-    }
-    return true;
-}
-
 void RubyFileModel::cutItem(const QString& path) {
     m_clipboardPath = path;
     m_clipboardPaths = { path };
@@ -998,129 +1058,51 @@ void RubyFileModel::clearClipboard() {
 }
 
 bool RubyFileModel::paste() {
-    if (m_clipboardPaths.isEmpty()) {
-        if (!m_clipboardPath.isEmpty()) {
-            m_clipboardPaths.append(m_clipboardPath);
-        } else {
-            return false;
-        }
+    if (!m_operations) return false;
+    if (m_clipboardPaths.isEmpty() && !m_clipboardPath.isEmpty()) {
+        m_clipboardPaths.append(m_clipboardPath);
     }
+    if (m_clipboardPaths.isEmpty()) return false;
 
-    int successCount = 0;
-    for (const QString& srcPath : m_clipboardPaths) {
-        QFileInfo src(srcPath);
-        if (!src.exists()) continue;
-
-        const QString dest = m_currentDir.filePath(src.fileName());
-        if (dest == srcPath) continue;
-
-        if (m_clipboardIsCut) {
-            bool moved = QFile::rename(srcPath, dest);
-            if (!moved) {
-                if (src.isDir()) {
-                    if (copy_dir_recursive(srcPath, dest)) {
-                        QDir(srcPath).removeRecursively();
-                        moved = true;
-                    }
-                } else {
-                    if (QFile::exists(dest)) QFile::remove(dest);
-                    if (QFile::copy(srcPath, dest)) {
-                        QFile::remove(srcPath);
-                        moved = true;
-                    }
-                }
-            }
-            if (moved) successCount++;
-        } else {
-            bool copied = false;
-            if (src.isDir()) {
-                copied = copy_dir_recursive(srcPath, dest);
-            } else {
-                if (QFile::exists(dest)) QFile::remove(dest);
-                copied = QFile::copy(srcPath, dest);
-            }
-            if (copied) successCount++;
-        }
-    }
-
-    if (m_clipboardIsCut) {
-        clearClipboard();
-    }
-
-    if (successCount > 0) {
-        emit statusMessage(m_clipboardIsCut ? QStringLiteral("Moved %1 item(s)").arg(successCount) : QStringLiteral("Pasted %1 item(s)").arg(successCount));
-        reload();
-        return true;
-    } else {
-        emit statusMessage(QStringLiteral("Failed to paste item(s)!"));
+    if (m_operations->busy()) {
+        emit statusMessage(QStringLiteral("Another file operation is still running"));
         return false;
     }
+
+    QStringList sources = m_clipboardPaths;
+    sources.removeAll(QString());
+    sources.removeDuplicates();
+    if (sources.isEmpty()) return false;
+
+    const QString dest = m_currentDir.absolutePath();
+    emit statusMessage(m_clipboardIsCut
+        ? QStringLiteral("Moving %1 item(s)…").arg(sources.size())
+        : QStringLiteral("Copying %1 item(s)…").arg(sources.size()));
+    return m_clipboardIsCut ? m_operations->move(sources, dest)
+                            : m_operations->copy(sources, dest);
 }
 
 bool RubyFileModel::compressToZip(const QString& targetPath, const QString& outZipPath) {
-    QFileInfo fi(targetPath);
-    if (!fi.exists()) {
+    if (!m_operations || targetPath.isEmpty()) return false;
+    if (!QFileInfo::exists(targetPath)) {
         emit statusMessage(QStringLiteral("Target item does not exist: %1").arg(targetPath));
         return false;
     }
-
-    QString destZip = outZipPath;
-    if (destZip.isEmpty()) {
-        destZip = fi.isDir() ? (targetPath + QStringLiteral(".zip")) : (fi.path() + QLatin1Char('/') + fi.completeBaseName() + QStringLiteral(".zip"));
-    }
-
-    std::vector<zip::OutEntry> entries;
-    if (fi.isDir()) {
-        if (!zip_folder_recursive_impl(targetPath, targetPath, entries)) {
-            emit statusMessage(QStringLiteral("Error reading folder for compression"));
-            return false;
-        }
-    } else {
-        QFile f(targetPath);
-        if (!f.open(QIODevice::ReadOnly)) {
-            emit statusMessage(QStringLiteral("Cannot read file for compression"));
-            return false;
-        }
-        QByteArray bytes = f.readAll();
-        f.close();
-        zip::OutEntry e;
-        e.name = fi.fileName().toStdString();
-        e.data = std::string(bytes.constData(), bytes.size());
-        e.method = 8;
-        entries.push_back(std::move(e));
-    }
-
-    emit statusMessage(QStringLiteral("Compressing to %1...").arg(QFileInfo(destZip).fileName()));
-    bool ok = zip::write_archive(destZip.toStdString(), entries);
-    if (ok) {
-        emit statusMessage(QStringLiteral("Created zip: %1 (%2 entries)").arg(QFileInfo(destZip).fileName()).arg(entries.size()));
-        reload();
-    } else {
-        emit statusMessage(QStringLiteral("Failed to write zip archive!"));
-    }
-    return ok;
+    return m_operations->archive(QStringList{targetPath}, outZipPath,
+                                 m_currentDir.absolutePath());
 }
 
 bool RubyFileModel::extractArchive(const QString& archivePath, bool toSubfolder) {
-    QFileInfo fi(archivePath);
+    if (!m_operations || archivePath.isEmpty()) return false;
+    const QFileInfo fi(archivePath);
     if (!fi.exists()) return false;
 
     QString destFolder = m_currentDir.absolutePath();
     if (toSubfolder) {
         destFolder = m_currentDir.filePath(fi.completeBaseName());
-        QDir().mkpath(destFolder);
     }
-
-    emit statusMessage(QStringLiteral("Extracting %1...").arg(fi.fileName()));
-    auto result = zip::extract_all(archivePath.toStdString(), destFolder.toStdString());
-    if (result.ok) {
-        emit statusMessage(QStringLiteral("Extracted %1 files").arg(result.extracted));
-        reload();
-        return true;
-    } else {
-        emit statusMessage(QStringLiteral("Extraction failed: %1").arg(QString::fromStdString(result.error)));
-        return false;
-    }
+    // extractAll() creates the destination (including the subfolder) itself.
+    return m_operations->extract(archivePath, destFolder);
 }
 
 QVariantList RubyFileModel::getArchiveEntries(const QString& archivePath) {
@@ -1328,6 +1310,157 @@ bool RubyFileModel::exportTextureToPng(const QString& texPath, const QString& ou
     return true;
 }
 
+bool RubyFileModel::sanitizeAudioForEngine(const QString& audioPath, bool replaceOriginal) {
+    if (audioPath.isEmpty()) return false;
+    QFileInfo fi(audioPath);
+    if (!fi.exists() || fi.isDir()) {
+        emit statusMessage(QStringLiteral("Audio file does not exist: ") + fi.fileName());
+        return false;
+    }
+
+    const QString ext = fi.suffix().toLower();
+    const QString targetWav = fi.absolutePath() + QLatin1Char('/') + fi.completeBaseName() + QStringLiteral(".wav");
+    const QString tempWav = fi.absolutePath() + QLatin1Char('/') + fi.completeBaseName() + QStringLiteral(".tmp_clean.wav");
+
+    bool success = false;
+
+    // Fast-path for WAV files: parse chunks, discard metadata (LIST, ID3, JUNK), and output pure canonical 44-byte WAV
+    if (ext == QStringLiteral("wav")) {
+        QFile in(audioPath);
+        if (in.open(QIODevice::ReadOnly)) {
+            QByteArray data = in.readAll();
+            in.close();
+
+            if (data.size() >= 44 && std::memcmp(data.constData(), "RIFF", 4) == 0 && std::memcmp(data.constData() + 8, "WAVE", 4) == 0) {
+                const char* raw = data.constData();
+                size_t offset = 12;
+                uint16_t audio_format = 0;
+                uint16_t num_channels = 0;
+                uint32_t sample_rate = 0;
+                uint16_t bits_per_sample = 0;
+                const char* pcm_data = nullptr;
+                size_t pcm_size = 0;
+
+                while (offset + 8 <= static_cast<size_t>(data.size())) {
+                    char cid[5] = {0};
+                    std::memcpy(cid, raw + offset, 4);
+                    uint32_t csize = 0;
+                    std::memcpy(&csize, raw + offset + 4, 4);
+                    offset += 8;
+
+                    if (std::memcmp(cid, "fmt ", 4) == 0 && csize >= 16 && offset + 16 <= static_cast<size_t>(data.size())) {
+                        std::memcpy(&audio_format, raw + offset, 2);
+                        std::memcpy(&num_channels, raw + offset + 2, 2);
+                        std::memcpy(&sample_rate, raw + offset + 4, 4);
+                        std::memcpy(&bits_per_sample, raw + offset + 14, 2);
+                    } else if (std::memcmp(cid, "data", 4) == 0) {
+                        pcm_data = raw + offset;
+                        pcm_size = std::min<size_t>(csize, data.size() - offset);
+                        break;
+                    }
+                    offset += csize;
+                    if (csize & 1) offset += 1;
+                }
+
+                if (pcm_data && pcm_size > 0 && num_channels > 0 && sample_rate > 0) {
+                    QByteArray converted_pcm;
+                    if (audio_format == 3 && bits_per_sample == 32) {
+                        // IEEE 32-bit float to 16-bit PCM conversion
+                        size_t num_floats = pcm_size / sizeof(float);
+                        converted_pcm.resize(static_cast<int>(num_floats * sizeof(int16_t)));
+                        const float* fptr = reinterpret_cast<const float*>(pcm_data);
+                        int16_t* sptr = reinterpret_cast<int16_t*>(converted_pcm.data());
+                        for (size_t i = 0; i < num_floats; ++i) {
+                            float v = std::clamp(fptr[i], -1.0f, 1.0f);
+                            sptr[i] = static_cast<int16_t>(v * 32767.0f);
+                        }
+                        pcm_data = converted_pcm.constData();
+                        pcm_size = converted_pcm.size();
+                        bits_per_sample = 16;
+                    }
+
+                    // Build canonical 44-byte WAV header strictly matching Caver::GetAudioFileData
+                    QByteArray outData;
+                    outData.resize(44 + static_cast<int>(pcm_size));
+                    char* h = outData.data();
+                    std::memcpy(h, "RIFF", 4);
+                    uint32_t riff_size = static_cast<uint32_t>(36 + pcm_size);
+                    std::memcpy(h + 4, &riff_size, 4);
+                    std::memcpy(h + 8, "WAVE", 4);
+                    std::memcpy(h + 12, "fmt ", 4);
+                    uint32_t fmt_size = 16;
+                    std::memcpy(h + 16, &fmt_size, 4);
+                    uint16_t fmt_tag = 1; // PCM
+                    std::memcpy(h + 20, &fmt_tag, 2);
+                    std::memcpy(h + 22, &num_channels, 2);
+                    std::memcpy(h + 24, &sample_rate, 4);
+                    uint32_t byte_rate = sample_rate * num_channels * (bits_per_sample / 8);
+                    std::memcpy(h + 28, &byte_rate, 4);
+                    uint16_t block_align = num_channels * (bits_per_sample / 8);
+                    std::memcpy(h + 32, &block_align, 2);
+                    std::memcpy(h + 34, &bits_per_sample, 2);
+                    std::memcpy(h + 36, "data", 4);
+                    uint32_t dsize = static_cast<uint32_t>(pcm_size);
+                    std::memcpy(h + 40, &dsize, 4);
+                    std::memcpy(h + 44, pcm_data, pcm_size);
+
+                    QFile out(tempWav);
+                    if (out.open(QIODevice::WriteOnly)) {
+                        out.write(outData);
+                        out.flush();
+                        out.close();
+                        success = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // If not a standard WAV or if parsing failed, try Android platform MediaCodec transcoder
+#if defined(Q_OS_ANDROID)
+    if (!success) {
+        QJniObject jIn = QJniObject::fromString(audioPath);
+        QJniObject jOut = QJniObject::fromString(tempWav);
+        jboolean ok = QJniObject::callStaticMethod<jboolean>(
+            "in/aevora/ruby/RubyActivity",
+            "decodeAudioToCanonicalWav",
+            "(Ljava/lang/String;Ljava/lang/String;)Z",
+            jIn.object<jstring>(),
+            jOut.object<jstring>()
+        );
+        success = (ok == JNI_TRUE);
+    }
+#endif
+
+    if (!success) {
+        emit statusMessage(QStringLiteral("Audio sanitization failed for: ") + fi.fileName());
+        return false;
+    }
+
+    // Replace original or write target canonical WAV
+    if (replaceOriginal && ext == QStringLiteral("wav")) {
+        QFile::remove(audioPath);
+        if (!QFile::rename(tempWav, audioPath)) {
+            QFile::copy(tempWav, audioPath);
+            QFile::remove(tempWav);
+        }
+        emit statusMessage(QStringLiteral("Fixed WAV for game engine (stripped tags): ") + fi.fileName());
+    } else {
+        if (replaceOriginal && ext != QStringLiteral("wav")) {
+            QFile::remove(audioPath); // remove non-compliant .ogg/.mp3
+        }
+        QFile::remove(targetWav);
+        if (!QFile::rename(tempWav, targetWav)) {
+            QFile::copy(tempWav, targetWav);
+            QFile::remove(tempWav);
+        }
+        emit statusMessage(QStringLiteral("Transcoded to engine canonical WAV: ") + QFileInfo(targetWav).fileName());
+    }
+
+    refresh();
+    return true;
+}
+
 void RubyFileModel::addRecentFile(const QString& path) {
     if (path.isEmpty()) return;
     QFileInfo fi(path);
@@ -1431,6 +1564,35 @@ void RubyFileModel::selectAll() {
     }
 }
 
+void RubyFileModel::invertSelection() {
+    for (auto& item : m_items) {
+        if (m_selectedPaths.contains(item.filePath)) {
+            m_selectedPaths.remove(item.filePath);
+            item.isSelected = false;
+        } else {
+            m_selectedPaths.insert(item.filePath);
+            item.isSelected = true;
+        }
+    }
+    if (!m_items.isEmpty()) {
+        emit dataChanged(index(0, 0), index(m_items.size() - 1, 0), {IsSelectedRole});
+    }
+    emit selectionChanged();
+}
+
+void RubyFileModel::removeSelectedPath(const QString& path) {
+    if (!m_selectedPaths.contains(path)) return;
+    m_selectedPaths.remove(path);
+    for (int i = 0; i < m_items.size(); ++i) {
+        if (m_items[i].filePath == path) {
+            m_items[i].isSelected = false;
+            emit dataChanged(index(i, 0), index(i, 0), {IsSelectedRole});
+            break;
+        }
+    }
+    emit selectionChanged();
+}
+
 void RubyFileModel::clearSelection() {
     if (m_selectedPaths.isEmpty()) return;
     m_selectedPaths.clear();
@@ -1447,6 +1609,24 @@ QStringList RubyFileModel::getSelectedPaths() const {
     return m_selectedPaths.values();
 }
 
+QVariantList RubyFileModel::getSelectedItems() const {
+    QVariantList list;
+    list.reserve(m_selectedPaths.size());
+    for (const QString& path : m_selectedPaths) {
+        QFileInfo fi(path);
+        if (!fi.exists()) continue;
+        QVariantMap m;
+        m[QStringLiteral("name")] = fi.fileName();
+        m[QStringLiteral("path")] = fi.absoluteFilePath();
+        m[QStringLiteral("isDir")] = fi.isDir();
+        m[QStringLiteral("fileType")] = detectFileType(fi);
+        m[QStringLiteral("sizeStr")] = fi.isDir() ? QStringLiteral("Folder") : formatSize(fi.size());
+        m[QStringLiteral("bytes")] = fi.size();
+        list.append(m);
+    }
+    return list;
+}
+
 QString RubyFileModel::getSelectedTotalBytesStr() const {
     qint64 total = 0;
     for (const auto& item : m_items) {
@@ -1457,29 +1637,57 @@ QString RubyFileModel::getSelectedTotalBytesStr() const {
     return formatSize(total);
 }
 
-bool RubyFileModel::deleteMultiple(const QStringList& paths) {
-    if (paths.isEmpty()) return false;
-    int successCount = 0;
-    for (const QString& p : paths) {
-        QFileInfo fi(p);
-        bool ok = false;
-        if (fi.isDir()) {
-            QDir d(p);
-            ok = d.removeRecursively();
-        } else {
-            ok = QFile::remove(p);
+void RubyFileModel::shareSelected() {
+    shareFiles(getSelectedPaths());
+}
+
+void RubyFileModel::shareFiles(const QStringList& paths) {
+    if (paths.isEmpty()) return;
+#if defined(Q_OS_ANDROID)
+    QJniObject activity = QNativeInterface::QAndroidApplication::context();
+    if (activity.isValid()) {
+        QJniEnvironment env;
+        jclass stringClass = env->FindClass("java/lang/String");
+        jobjectArray array = env->NewObjectArray(paths.size(), stringClass, nullptr);
+        for (int i = 0; i < paths.size(); ++i) {
+            jstring str = env->NewStringUTF(paths[i].toUtf8().constData());
+            env->SetObjectArrayElement(array, i, str);
+            env->DeleteLocalRef(str);
         }
-        if (ok) {
-            m_pinnedPaths.remove(p);
-            m_selectedPaths.remove(p);
-            successCount++;
+        activity.callMethod<void>("shareFiles", "([Ljava/lang/String;)V", array);
+        env->DeleteLocalRef(array);
+    }
+#else
+    emit statusMessage(QStringLiteral("Sharing %1 file(s)").arg(paths.size()));
+#endif
+}
+
+void RubyFileModel::sanitizeSelectedAudio() {
+    int fixed = 0;
+    for (const QString& p : m_selectedPaths) {
+        QFileInfo fi(p);
+        QString ext = fi.suffix().toLower();
+        if (ext == QLatin1String("wav") || ext == QLatin1String("ogg") || ext == QLatin1String("mp3")) {
+            if (sanitizeAudioForEngine(p, true)) {
+                fixed++;
+            }
         }
     }
-    emit statusMessage(QStringLiteral("Deleted %1 item(s)").arg(successCount));
-    m_allItems.clear();
-    reload();
+    emit statusMessage(QStringLiteral("Sanitized %1 audio file(s) for Swordigo engine").arg(fixed));
+}
+
+bool RubyFileModel::deleteMultiple(const QStringList& paths) {
+    if (paths.isEmpty() || !m_operations) return false;
+    for (const QString& p : paths) {
+        m_pinnedPaths.remove(p);
+        m_selectedPaths.remove(p);
+        m_clipboardPaths.removeAll(p);
+        if (m_clipboardPath == p) m_clipboardPath.clear();
+    }
+    if (m_clipboardPaths.isEmpty()) m_clipboardIsCut = false;
     emit selectionChanged();
-    return successCount > 0;
+    emit clipboardChanged();
+    return m_operations->remove(paths);
 }
 
 void RubyFileModel::copyMultiple(const QStringList& paths) {
@@ -1501,49 +1709,10 @@ void RubyFileModel::cutMultiple(const QStringList& paths) {
 }
 
 bool RubyFileModel::compressMultiple(const QStringList& paths, const QString& outZipPath) {
-    if (paths.isEmpty()) return false;
-    QString destZip = outZipPath;
-    if (destZip.isEmpty()) {
-        destZip = m_currentDir.filePath(QStringLiteral("Archive_%1.zip").arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_hhmmss"))));
-    }
-
-    std::vector<zip::OutEntry> entries;
-    for (const QString& targetPath : paths) {
-        QFileInfo fi(targetPath);
-        if (!fi.exists()) continue;
-        if (fi.isDir()) {
-            if (!zip_folder_recursive_impl(fi.dir().absolutePath(), targetPath, entries)) {
-                emit statusMessage(QStringLiteral("Error reading folder for compression: ") + fi.fileName());
-            }
-        } else {
-            QFile f(targetPath);
-            if (f.open(QIODevice::ReadOnly)) {
-                QByteArray bytes = f.readAll();
-                f.close();
-                zip::OutEntry e;
-                e.name = fi.fileName().toStdString();
-                e.data = std::string(bytes.constData(), bytes.size());
-                e.method = 8;
-                entries.push_back(std::move(e));
-            }
-        }
-    }
-
-    if (entries.empty()) {
-        emit statusMessage(QStringLiteral("No readable files to compress!"));
-        return false;
-    }
-
-    emit statusMessage(QStringLiteral("Compressing %1 files into %2...").arg(entries.size()).arg(QFileInfo(destZip).fileName()));
-    bool ok = zip::write_archive(destZip.toStdString(), entries);
-    if (ok) {
-        emit statusMessage(QStringLiteral("Created zip: %1 (%2 items)").arg(QFileInfo(destZip).fileName()).arg(entries.size()));
-        clearSelection();
-        reload();
-    } else {
-        emit statusMessage(QStringLiteral("Failed to create zip archive!"));
-    }
-    return ok;
+    if (paths.isEmpty() || !m_operations) return false;
+    const bool queued = m_operations->archive(paths, outZipPath, m_currentDir.absolutePath());
+    if (queued) clearSelection();
+    return queued;
 }
 
 // ── Deep Recursive Search (Index & HyprFM SearchEngine) ────────────────
@@ -1753,10 +1922,81 @@ QVariantMap RubyFileModel::getDetailedFileProperties(const QString& path) {
     perm += (p & QFile::ExeOther) ? 'x' : '-';
     map[QStringLiteral("permissions")] = perm;
 
+    int oct = 0;
+    if (p & QFile::ReadOwner)  oct |= 0400;
+    if (p & QFile::WriteOwner) oct |= 0200;
+    if (p & QFile::ExeOwner)   oct |= 0100;
+    if (p & QFile::ReadGroup)  oct |= 0040;
+    if (p & QFile::WriteGroup) oct |= 0020;
+    if (p & QFile::ExeGroup)   oct |= 0010;
+    if (p & QFile::ReadOther)  oct |= 0004;
+    if (p & QFile::WriteOther) oct |= 0002;
+    if (p & QFile::ExeOther)   oct |= 0001;
+    map[QStringLiteral("permissionsOctal")] = QString::asprintf("%04o", oct);
+
+    map[QStringLiteral("ownerRead")] = (p & QFile::ReadOwner) != 0;
+    map[QStringLiteral("ownerWrite")] = (p & QFile::WriteOwner) != 0;
+    map[QStringLiteral("ownerExecute")] = (p & QFile::ExeOwner) != 0;
+    map[QStringLiteral("groupRead")] = (p & QFile::ReadGroup) != 0;
+    map[QStringLiteral("groupWrite")] = (p & QFile::WriteGroup) != 0;
+    map[QStringLiteral("groupExecute")] = (p & QFile::ExeGroup) != 0;
+    map[QStringLiteral("otherRead")] = (p & QFile::ReadOther) != 0;
+    map[QStringLiteral("otherWrite")] = (p & QFile::WriteOther) != 0;
+    map[QStringLiteral("otherExecute")] = (p & QFile::ExeOther) != 0;
+
     map[QStringLiteral("owner")] = fi.owner();
     map[QStringLiteral("group")] = fi.group();
 
+    if (fi.isDir()) {
+        int files = 0;
+        int dirs = 0;
+        qint64 total = calculate_dir_size(fi.absoluteFilePath(), files, dirs);
+        map[QStringLiteral("filesCount")] = files;
+        map[QStringLiteral("dirsCount")] = dirs;
+        map[QStringLiteral("totalItemsCount")] = files + dirs;
+        map[QStringLiteral("recursiveSize")] = total;
+        map[QStringLiteral("recursiveSizeStr")] = formatSize(total);
+    }
+
     return map;
+}
+
+bool RubyFileModel::setFilePermission(const QString& path, const QString& user, const QString& perm, bool enable) {
+    QFile file(path);
+    if (!file.exists()) return false;
+    QFile::Permissions p = file.permissions();
+    QFile::Permission targetFlag = QFile::ReadOwner;
+
+    QString u = user.trimmed().toLower();
+    QString t = perm.trimmed().toLower();
+
+    if (u == QLatin1String("owner")) {
+        if (t == QLatin1String("read")) targetFlag = QFile::ReadOwner;
+        else if (t == QLatin1String("write")) targetFlag = QFile::WriteOwner;
+        else if (t == QLatin1String("execute")) targetFlag = QFile::ExeOwner;
+    } else if (u == QLatin1String("group")) {
+        if (t == QLatin1String("read")) targetFlag = QFile::ReadGroup;
+        else if (t == QLatin1String("write")) targetFlag = QFile::WriteGroup;
+        else if (t == QLatin1String("execute")) targetFlag = QFile::ExeGroup;
+    } else if (u == QLatin1String("other") || u == QLatin1String("everyone")) {
+        if (t == QLatin1String("read")) targetFlag = QFile::ReadOther;
+        else if (t == QLatin1String("write")) targetFlag = QFile::WriteOther;
+        else if (t == QLatin1String("execute")) targetFlag = QFile::ExeOther;
+    }
+
+    if (enable) {
+        p |= targetFlag;
+    } else {
+        p &= ~targetFlag;
+    }
+
+    bool ok = file.setPermissions(p);
+    if (ok) {
+        emit statusMessage(QStringLiteral("Updated permissions: ") + QFileInfo(path).fileName());
+    } else {
+        emit statusMessage(QStringLiteral("Failed to update permissions (insufficient rights)"));
+    }
+    return ok;
 }
 
 } // namespace ruby::android

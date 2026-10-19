@@ -475,6 +475,12 @@ bool scene_find_template(const SceneData& scene, const std::string& name,
 // mirrors scene_add_component: ClassName (1) + Identifier (2) + payload (101).
 SceneComponent scene_make_model_component(const std::string& model_name);
 
+/// Synchronizes obj.components so that a ModelComponent is present and reflects
+/// obj.rot_x (Pitch, Tag 4) and obj.rot_z (Yaw, Tag 2), matching Tag 6 (Roll, obj.rot_y).
+/// If obj is a template or model without a local ModelComponent, one is synthesized or
+/// copied from resolved_components so all 3 Euler rotation axes survive serialization.
+void scene_sync_model_rotation(SceneObject& obj);
+
 // LocalAABB (SceneObject field 8) = Rectangle { X, Y, W, H } fixed32 floats.
 std::string scene_build_local_aabb(float min_x, float min_y,
                                    float max_x, float max_y);

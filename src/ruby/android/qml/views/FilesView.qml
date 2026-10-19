@@ -13,8 +13,56 @@ Item {
     signal fileOpened(string path, string fileType)
     signal modelConvertRequested(string path)
 
+    function countLabel(n, singular, plural) {
+        return n + " " + (n === 1 ? singular : plural)
+    }
+
+    // Android back: peel the file manager one layer at a time instead of
+    // bouncing straight to the Home tab.
+    function handleBack() {
+        // Modals and sheets consume Back before directory navigation.
+        if (sortMenu.visible) { sortMenu.close(); return true }
+        if (headerMenu.visible) { headerMenu.close(); return true }
+        if (placesDrawer.visible) { placesDrawer.close(); return true }
+        if (filePreviewModal.visible) { filePreviewModal.close(); return true }
+        if (contextSheet.isOpen) { contextSheet.close(); return true }
+        if (createSheet.isOpen) { createSheet.close(); return true }
+        if (storageSheet.isOpen) { storageSheet.close(); return true }
+        if (newFileWizard.isOpen) { newFileWizard.close(); return true }
+        if (newFolderDialog.visible) { newFolderDialog.close(); return true }
+        if (podConvertDialog.isOpen) { podConvertDialog.close(); return true }
+        if (renameDialog.visible) { renameDialog.close(); return true }
+        if (deleteDialog.visible) { deleteDialog.close(); return true }
+        if (operationsBar.isExpanded) { operationsBar.isExpanded = false; return true }
+
+        if (breadcrumbs.isPathEditable) {
+            breadcrumbs.isPathEditable = false
+            return true
+        }
+        if (rubyFileModel.isSearchMode || breadcrumbs.searchVisible) {
+            breadcrumbs.searchText = ""
+            breadcrumbs.searchVisible = false
+            rubyFileModel.clearSearch()
+            return true
+        }
+        if (root.isSelectionMode) {
+            root.isSelectionMode = false
+            rubyFileModel.clearSelection()
+            return true
+        }
+        // Treat Internal Storage as the user-facing root: Back from there
+        // returns to the previous tab instead of walking through
+        // /storage/emulated mount directories.
+        var path = rubyFileModel.currentPath
+        if (path !== "/" && path !== "/storage/emulated/0") {
+            rubyFileModel.navigateUp()
+            return true
+        }
+        return false
+    }
+
     readonly property var categories: [
-        { label: qsTr("All"),       cat: "all",      icon: "grid"         },
+        { label: qsTr("All"),       cat: "all",      icon: ""             },
         { label: qsTr("Scenes"),    cat: "scene",    icon: "map"          },
         { label: qsTr("Templates"), cat: "scl",      icon: "layers"       },
         { label: qsTr("Models"),    cat: "models",   icon: "cube"         },
@@ -54,87 +102,14 @@ Item {
             onClearSearchRequested: {
                 rubyFileModel.clearSearch()
             }
-        }
-
-        // ── Index FM Storage & Deep Search Status Strip ────────────────────
-        Rectangle {
-            width: parent.width
-            height: Theme.dp(24)
-            color: Theme.surface0
-
-            // Normal storage & folder status
-            Row {
-                anchors.left: parent.left
-                anchors.leftMargin: Theme.dp(Theme.spacingMd)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Theme.dp(Theme.spacingSm)
-                visible: !rubyFileModel.isSearchMode
-
-                Icon {
-                    anchors.verticalCenter: parent.verticalCenter
-                    name: "drive"
-                    size: Theme.dp(11)
-                    color: Theme.accentInk
-                }
-
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: (rubyFileModel.availableStorageStr ? (rubyFileModel.availableStorageStr + " free") : "") + "  ·  " + rubyFileModel.statusText
-                    font.pixelSize: Theme.dp(Theme.fontXs)
-                    color: Theme.textMuted
-                }
-            }
-
-            // Deep Search results strip
-            Row {
-                anchors.left: parent.left
-                anchors.leftMargin: Theme.dp(Theme.spacingMd)
-                anchors.right: parent.right
-                anchors.rightMargin: Theme.dp(Theme.spacingMd)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Theme.dp(Theme.spacingSm)
-                visible: rubyFileModel.isSearchMode
-
-                Icon {
-                    anchors.verticalCenter: parent.verticalCenter
-                    name: "layers"
-                    size: Theme.dp(12)
-                    color: Theme.accentInk
-                }
-
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: rubyFileModel.isSearching
-                          ? qsTr("Searching subdirectories…")
-                          : qsTr("Deep Search: Found %1 matches").arg(rubyFileModel.searchResultCount)
-                    font.pixelSize: Theme.dp(Theme.fontXs)
-                    font.weight: Font.DemiBold
-                    color: Theme.accentInk
-                }
-
-                Item { width: Theme.dp(10); height: 1 }
-
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: qsTr("Exit Search")
-                    font.pixelSize: Theme.dp(Theme.fontXs)
-                    font.weight: Font.Bold
-                    color: Theme.colorErrorBright
-                    visible: !rubyFileModel.isSearching
-
-                    MouseArea {
-                        anchors.fill: parent
-                        onClicked: {
-                            breadcrumbs.searchText = ""
-                            rubyFileModel.clearSearch()
-                        }
-                    }
-                }
+            onOverflowRequested: {
+                headerMenu.popup()
             }
         }
 
         // ── Category chips + view controls ─────────────────────────────────
         Item {
+            id: filterBar
             width: parent.width
             height: Theme.dp(48)
 
@@ -142,7 +117,7 @@ Item {
                 id: chipRow
                 anchors.left: parent.left
                 anchors.leftMargin: Theme.dp(Theme.spacingMd)
-                anchors.right: viewControls.left
+                anchors.right: filterDivider.left
                 anchors.rightMargin: Theme.dp(Theme.spacingSm)
                 anchors.verticalCenter: parent.verticalCenter
                 height: Theme.dp(34)
@@ -157,10 +132,25 @@ Item {
                     anchors.verticalCenter: parent.verticalCenter
                     text: modelData.label
                     iconName: modelData.icon
+                    outlined: false
                     accent: Theme.colorForType(modelData.cat === "all" ? "generic" : modelData.cat)
                     selected: rubyFileModel.category === modelData.cat
                     onClicked: rubyFileModel.setCategory(modelData.cat)
                 }
+            }
+
+            // The divider owns the boundary: the chip strip is clipped before
+            // this line, so a long category label can never slide under the
+            // view buttons.
+            Rectangle {
+                id: filterDivider
+                anchors.right: viewControls.left
+                anchors.rightMargin: Theme.dp(Theme.spacingSm)
+                anchors.verticalCenter: parent.verticalCenter
+                width: 1
+                height: Theme.dp(20)
+                color: Theme.border
+                visible: chipRow.width > Theme.dp(40)
             }
 
             Row {
@@ -168,31 +158,14 @@ Item {
                 anchors.right: parent.right
                 anchors.rightMargin: Theme.dp(Theme.spacingMd)
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: Theme.dp(Theme.spacingXs)
+                spacing: 0
 
-                // Multi-select toggle button (Index FM SelectionBar style)
-                IconButton {
-                    iconName: root.isSelectionMode ? "check-square" : "check"
-                    tint: root.isSelectionMode ? Theme.accentInk : Theme.textMuted
-                    plate: root.isSelectionMode ? Theme.alpha(Theme.accentInk, 0.20) : "transparent"
-                    plateEdge: root.isSelectionMode ? Theme.alpha(Theme.accentInk, 0.40) : "transparent"
-                    buttonSize: Theme.dp(34)
-                    iconSize: Theme.dp(16)
-                    square: true
-                    onClicked: {
-                        root.isSelectionMode = !root.isSelectionMode
-                        if (!root.isSelectionMode) {
-                            rubyFileModel.clearSelection()
-                        }
-                    }
-                }
-
-                // Grid / List toggle button (Index FM ViewMode style)
+                // Grid / List toggle button
                 IconButton {
                     iconName: root.viewMode === "grid" ? "list" : "grid"
                     tint: root.viewMode === "grid" ? Theme.accentInk : Theme.textMuted
-                    plate: root.viewMode === "grid" ? Theme.alpha(Theme.accentInk, 0.20) : "transparent"
-                    plateEdge: root.viewMode === "grid" ? Theme.alpha(Theme.accentInk, 0.40) : "transparent"
+                    plate: "transparent"
+                    plateEdge: "transparent"
                     buttonSize: Theme.dp(34)
                     iconSize: Theme.dp(16)
                     square: true
@@ -203,27 +176,20 @@ Item {
 
                 IconButton {
                     iconName: "sort"
+                    tint: Theme.textSecondary
+                    plate: "transparent"
+                    plateEdge: "transparent"
                     buttonSize: Theme.dp(34)
                     iconSize: Theme.dp(18)
                     square: true
                     onClicked: sortMenu.popup(this)
-                }
-
-                IconButton {
-                    iconName: rubyFileModel.showHidden ? "eye" : "eye-off"
-                    tint: rubyFileModel.showHidden ? Theme.accentInk : Theme.textMuted
-                    plate: rubyFileModel.showHidden ? Theme.alpha(Theme.accentInk, 0.14) : "transparent"
-                    plateEdge: rubyFileModel.showHidden ? Theme.alpha(Theme.accentInk, 0.28) : "transparent"
-                    buttonSize: Theme.dp(34)
-                    iconSize: Theme.dp(18)
-                    square: true
-                    onClicked: rubyFileModel.setShowHidden(!rubyFileModel.showHidden)
                 }
             }
         }
 
         // ── Smooth non-blocking folder scan & search progress bar ─────────
         Item {
+            id: scanProgress
             width: parent.width
             height: Theme.dp(3)
             visible: rubyFileModel.isLoading || rubyFileModel.isSearching
@@ -249,11 +215,96 @@ Item {
             }
         }
 
+        // ── Single metadata line (replaces the old duplicate status bars) ──
+        Item {
+            id: metaBar
+            width: parent.width
+            height: Theme.dp(26)
+
+            Row {
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.dp(Theme.spacingMd)
+                anchors.right: parent.right
+                anchors.rightMargin: Theme.dp(Theme.spacingMd)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.dp(6)
+                visible: !rubyFileModel.isSearchMode
+
+                Icon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "drive"
+                    size: Theme.dp(11)
+                    color: Theme.textMuted
+                }
+
+                Text {
+                    width: parent.width - Theme.dp(17)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.countLabel(rubyFileModel.dirCount, qsTr("folder"), qsTr("folders"))
+                          + "  ·  " + root.countLabel(rubyFileModel.fileCount, qsTr("file"), qsTr("files"))
+                          + (rubyFileModel.availableStorageStr.length > 0 ? "  ·  " + rubyFileModel.availableStorageStr + qsTr(" free") : "")
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    color: Theme.textMuted
+                    elide: Text.ElideRight
+                }
+            }
+
+            Row {
+                anchors.left: parent.left
+                anchors.leftMargin: Theme.dp(Theme.spacingMd)
+                anchors.right: exitSearchText.left
+                anchors.rightMargin: Theme.dp(Theme.spacingSm)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Theme.dp(6)
+                visible: rubyFileModel.isSearchMode
+
+                Icon {
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "layers"
+                    size: Theme.dp(12)
+                    color: Theme.accentInk
+                }
+
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: rubyFileModel.isSearching
+                          ? qsTr("Searching subdirectories…")
+                          : root.countLabel(rubyFileModel.searchResultCount, qsTr("match"), qsTr("matches"))
+                    font.pixelSize: Theme.dp(Theme.fontXs)
+                    font.weight: Font.DemiBold
+                    color: Theme.accentInk
+                    elide: Text.ElideRight
+                }
+            }
+
+            Text {
+                id: exitSearchText
+                anchors.right: parent.right
+                anchors.rightMargin: Theme.dp(Theme.spacingMd)
+                anchors.verticalCenter: parent.verticalCenter
+                visible: rubyFileModel.isSearchMode && !rubyFileModel.isSearching
+                text: qsTr("Exit search")
+                font.pixelSize: Theme.dp(Theme.fontXs)
+                font.weight: Font.DemiBold
+                color: Theme.colorErrorBright
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        breadcrumbs.searchText = ""
+                        breadcrumbs.searchVisible = false
+                        rubyFileModel.clearSearch()
+                    }
+                }
+            }
+        }
+
         // ── Dual View Container (List View & Grid View - Index FM style) ──
         Item {
             id: viewContainer
             width: parent.width
-            height: parent.height - breadcrumbs.height - Theme.dp(24) - Theme.dp(48) - Theme.dp(3) - statusBar.height
+            height: parent.height - breadcrumbs.height - filterBar.height
+                    - (scanProgress.visible ? scanProgress.height : 0) - metaBar.height
             clip: true
 
             // 1. Detailed List View
@@ -302,7 +353,11 @@ Item {
 
                     onRowLongPressed: {
                         if (!model || !model.filePath) return
-                        if (!root.isSelectionMode) {
+                        var low = (model.filePath || "").toLowerCase()
+                        var isAudio = (model.fileType === "audio" || low.endsWith(".ogg") || low.endsWith(".wav") || low.endsWith(".mp3"))
+                        if (!root.isSelectionMode && isAudio) {
+                            popContext()
+                        } else if (!root.isSelectionMode) {
                             root.isSelectionMode = true
                             rubyFileModel.setItemSelected(model.filePath, true)
                         } else {
@@ -336,6 +391,12 @@ Item {
                     onPinToggled: {
                         rubyFileModel.togglePin(model.filePath)
                     }
+                }
+
+                // Keep the last row clear of the floating selection dock.
+                footer: Item {
+                    width: fileListView.width
+                    height: operationsBar.active ? Theme.dp(80) : Theme.dp(8)
                 }
             }
 
@@ -388,7 +449,11 @@ Item {
 
                     onCardLongPressed: {
                         if (!model || !model.filePath) return
-                        if (!root.isSelectionMode) {
+                        var low = (model.filePath || "").toLowerCase()
+                        var isAudio = (model.fileType === "audio" || low.endsWith(".ogg") || low.endsWith(".wav") || low.endsWith(".mp3"))
+                        if (!root.isSelectionMode && isAudio) {
+                            popContext()
+                        } else if (!root.isSelectionMode) {
                             root.isSelectionMode = true
                             rubyFileModel.setItemSelected(model.filePath, true)
                         } else {
@@ -414,6 +479,11 @@ Item {
                         if (!model || !model.filePath) return
                         rubyFileModel.togglePin(model.filePath)
                     }
+                }
+
+                footer: Item {
+                    width: fileGridView.width
+                    height: operationsBar.active ? Theme.dp(80) : Theme.dp(8)
                 }
             }
 
@@ -466,51 +536,6 @@ Item {
             }
         }
 
-        // ── Status bar (legacy wording) ────────────────────────────────────
-        Rectangle {
-            id: statusBar
-            width: parent.width
-            height: Theme.dp(30)
-            color: Theme.surface0
-
-            Rectangle {
-                anchors.top: parent.top
-                anchors.left: parent.left
-                anchors.right: parent.right
-                height: 1
-                color: Theme.borderSubtle
-            }
-
-            Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Theme.dp(Theme.spacingMd)
-                anchors.verticalCenter: parent.verticalCenter
-                text: rubyFileModel.statusText
-                font.pixelSize: Theme.dp(Theme.fontXs)
-                color: Theme.textMuted
-            }
-
-            Row {
-                anchors.right: parent.right
-                anchors.rightMargin: Theme.dp(Theme.spacingMd)
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: Theme.dp(Theme.spacingXs)
-
-                Icon {
-                    anchors.verticalCenter: parent.verticalCenter
-                    name: "pin"
-                    size: Theme.dp(11)
-                    color: Theme.colorWarning
-                }
-
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: qsTr("swipe rows for actions")
-                    font.pixelSize: Theme.dp(Theme.fontXs)
-                    color: Theme.textDisabled
-                }
-            }
-        }
     }
 
     // ── Sort menu (legacy option set, same order) ──────────────────────────
@@ -546,6 +571,43 @@ Item {
         }
     }
 
+    // ── Header overflow (selection, hidden files, navigation) ─────────────
+    Menu {
+        id: headerMenu
+        width: Theme.dp(230)
+
+        MenuItem {
+            text: rubyFileModel.canPaste
+                  ? qsTr("Paste “%1”").arg(rubyFileModel.clipboardSummary)
+                  : qsTr("Paste")
+            enabled: rubyFileModel.canPaste
+            onTriggered: rubyFileModel.paste()
+        }
+        MenuSeparator {}
+        MenuItem {
+            text: qsTr("Select items")
+            onTriggered: root.isSelectionMode = true
+        }
+        MenuItem {
+            text: rubyFileModel.showHidden ? qsTr("Hide hidden files") : qsTr("Show hidden files")
+            onTriggered: rubyFileModel.setShowHidden(!rubyFileModel.showHidden)
+        }
+        MenuSeparator {}
+        MenuItem {
+            text: qsTr("Edit path")
+            onTriggered: breadcrumbs.beginPathEdit()
+        }
+        MenuItem {
+            text: qsTr("Storage locations")
+            onTriggered: placesDrawer.open()
+        }
+        MenuItem {
+            text: qsTr("Go up")
+            enabled: rubyFileModel.currentPath !== "/"
+            onTriggered: rubyFileModel.navigateUp()
+        }
+    }
+
     // ── OperationsBar (Batch / Single file quick action dock) ──────────────
     OperationsBar {
         id: operationsBar
@@ -554,8 +616,8 @@ Item {
         anchors.bottom: parent.bottom
         anchors.leftMargin: Theme.dp(Theme.spacingMd)
         anchors.rightMargin: Theme.dp(Theme.spacingMd)
-        anchors.bottomMargin: Theme.dp(16)
-        z: 10
+        anchors.bottomMargin: Theme.dp(12)
+        z: 20
 
         selectedCount: root.isSelectionMode ? rubyFileModel.selectedCount : (operationsBar.targetPath.length > 0 ? 1 : 0)
         totalSizeStr: root.isSelectionMode ? rubyFileModel.getSelectedTotalBytesStr() : ""
@@ -568,28 +630,29 @@ Item {
         }
 
         onZipRequested: (path) => {
-            if (root.isSelectionMode && rubyFileModel.selectedCount > 1) {
-                operationsBar.isBusy = true
-                operationsBar.statusText = qsTr("Compressing %1 files…").arg(rubyFileModel.selectedCount)
-                rubyFileModel.compressMultiple(rubyFileModel.getSelectedPaths())
-                operationsBar.isBusy = false
+            if (root.isSelectionMode && rubyFileModel.selectedCount > 0) {
+                var selected = rubyFileModel.getSelectedPaths()
+                if (selected.length > 1) {
+                    rubyFileModel.compressMultiple(selected)
+                } else if (selected.length === 1) {
+                    rubyFileModel.compressToZip(selected[0])
+                }
                 root.isSelectionMode = false
                 rubyFileModel.clearSelection()
             } else {
                 var p = path || operationsBar.targetPath
                 if (!p) return
-                operationsBar.isBusy = true
-                operationsBar.statusText = qsTr("Compressing…")
                 rubyFileModel.compressToZip(p)
-                operationsBar.isBusy = false
                 operationsBar.targetPath = ""
                 operationsBar.targetFileName = ""
             }
         }
 
         onCopyRequested: (path) => {
-            if (root.isSelectionMode && rubyFileModel.selectedCount > 1) {
-                rubyFileModel.copyMultiple(rubyFileModel.getSelectedPaths())
+            if (root.isSelectionMode && rubyFileModel.selectedCount > 0) {
+                var selected = rubyFileModel.getSelectedPaths()
+                if (selected.length > 1) rubyFileModel.copyMultiple(selected)
+                else if (selected.length === 1) rubyFileModel.copyItem(selected[0])
                 root.isSelectionMode = false
                 rubyFileModel.clearSelection()
             } else {
@@ -602,8 +665,10 @@ Item {
         }
 
         onCutRequested: (path) => {
-            if (root.isSelectionMode && rubyFileModel.selectedCount > 1) {
-                rubyFileModel.cutMultiple(rubyFileModel.getSelectedPaths())
+            if (root.isSelectionMode && rubyFileModel.selectedCount > 0) {
+                var selected = rubyFileModel.getSelectedPaths()
+                if (selected.length > 1) rubyFileModel.cutMultiple(selected)
+                else if (selected.length === 1) rubyFileModel.cutItem(selected[0])
                 root.isSelectionMode = false
                 rubyFileModel.clearSelection()
             } else {
@@ -616,7 +681,7 @@ Item {
         }
 
         onDeleteRequested: (path) => {
-            if (root.isSelectionMode && rubyFileModel.selectedCount > 1) {
+            if (root.isSelectionMode && rubyFileModel.selectedCount > 0) {
                 deleteDialog.isBatch = true
                 deleteDialog.targetPaths = rubyFileModel.getSelectedPaths()
                 deleteDialog.targetName = qsTr("%1 selected items").arg(rubyFileModel.selectedCount)
@@ -630,6 +695,43 @@ Item {
                 deleteDialog.open()
             }
         }
+
+        onSelectAllRequested: {
+            rubyFileModel.selectAll()
+        }
+
+        onInvertSelectionRequested: {
+            rubyFileModel.invertSelection()
+        }
+
+        onClearSelectionRequested: {
+            root.isSelectionMode = false
+            rubyFileModel.clearSelection()
+            operationsBar.targetPath = ""
+            operationsBar.targetFileName = ""
+        }
+
+        onShareRequested: (path) => {
+            if (root.isSelectionMode && rubyFileModel.selectedCount > 0) {
+                rubyFileModel.shareSelected()
+            } else {
+                var p = path || operationsBar.targetPath
+                if (p && p.length > 0) {
+                    rubyFileModel.shareFiles([p])
+                }
+            }
+        }
+
+        onSanitizeAudioRequested: {
+            rubyFileModel.sanitizeSelectedAudio()
+        }
+
+        onRemoveSelectedRequested: (path) => {
+            rubyFileModel.removeSelectedPath(path)
+            if (rubyFileModel.selectedCount === 0) {
+                root.isSelectionMode = false
+            }
+        }
     }
 
     // ── Floating Action Button (Create) ────────────────────────────────────
@@ -638,7 +740,7 @@ Item {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
         anchors.rightMargin: Theme.dp(Theme.spacingLg)
-        anchors.bottomMargin: Theme.dp(44)
+        anchors.bottomMargin: Theme.dp(16)
         width: Theme.dp(56)
         height: Theme.dp(56)
         radius: Theme.dp(28)
@@ -674,6 +776,74 @@ Item {
             anchors.right: parent.right
             anchors.top: parent.top
             spacing: Theme.dp(Theme.spacingSm)
+
+            // Clipboard: paste the cut/copied items into this folder. The
+            // engine streams them on a worker thread; the overlay shows
+            // progress and any name collisions.
+            Rectangle {
+                width: parent.width
+                height: Theme.dp(58)
+                radius: Theme.radiusMd
+                visible: rubyFileModel.canPaste
+                color: pasteMouse.pressed ? Theme.surface2 : Theme.surface1
+                border.color: pasteMouse.pressed ? Theme.borderFocus : Theme.borderSubtle
+                border.width: 1
+
+                Row {
+                    anchors.fill: parent
+                    anchors.margins: Theme.dp(10)
+                    spacing: Theme.dp(12)
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Theme.dp(38)
+                        height: Theme.dp(38)
+                        radius: Theme.dp(19)
+                        color: Theme.alpha(Theme.accentInk, 0.18)
+
+                        Icon {
+                            anchors.centerIn: parent
+                            name: "clipboard"
+                            size: Theme.dp(18)
+                            color: Theme.accentInk
+                        }
+                    }
+
+                    Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - Theme.dp(50)
+                        spacing: Theme.dp(2)
+
+                        Text {
+                            text: rubyFileModel.clipboardIsCut
+                                  ? qsTr("Move “%1” here").arg(rubyFileModel.clipboardSummary)
+                                  : qsTr("Paste “%1” here").arg(rubyFileModel.clipboardSummary)
+                            font.pixelSize: Theme.dp(Theme.fontMd)
+                            font.weight: Font.DemiBold
+                            color: Theme.textPrimary
+                            elide: Text.ElideRight
+                            width: parent.width
+                        }
+
+                        Text {
+                            text: qsTr("Runs in the background with progress and cancel")
+                            font.pixelSize: Theme.dp(Theme.fontXs)
+                            color: Theme.textMuted
+                            elide: Text.ElideRight
+                            width: parent.width
+                        }
+                    }
+                }
+
+                MouseArea {
+                    id: pasteMouse
+                    anchors.fill: parent
+                    onClicked: {
+                        createSheet.close()
+                        rubyFileModel.paste()
+                    }
+                }
+            }
 
             // Option 1: New File Wizard
             Rectangle {
@@ -1105,6 +1275,24 @@ Item {
                 onClicked: {
                     contextSheet.close()
                     rubyFileModel.exportTextureToPng(contextSheet.targetFilePath)
+                }
+            }
+
+            MenuRow {
+                width: parent.width
+                visible: !contextSheet.targetIsDir && (
+                    contextSheet.targetFileType === "audio" ||
+                    contextSheet.targetFilePath.toLowerCase().endsWith(".ogg") ||
+                    contextSheet.targetFilePath.toLowerCase().endsWith(".wav") ||
+                    contextSheet.targetFilePath.toLowerCase().endsWith(".mp3")
+                )
+                iconName: "music"
+                accent: true
+                text: qsTr("Sanitize Audio for Game (Fix Crash / Canonical WAV)")
+                onClicked: {
+                    var p = contextSheet.targetFilePath
+                    contextSheet.close()
+                    rubyFileModel.sanitizeAudioForEngine(p, true)
                 }
             }
 

@@ -19,6 +19,8 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -127,6 +129,7 @@ public class GameActivity extends Activity {
 
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        configureFullscreenWindow();
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
 
         String resourceDir = getIntent().getStringExtra("resource_dir");
@@ -265,15 +268,84 @@ public class GameActivity extends Activity {
         parent.addView(btn);
     }
 
+    /**
+     * Draw edge-to-edge, including behind the display cutout, before the first
+     * frame. On API 30+ this is what prevents the black status-bar strip that
+     * used to sit above the game surface.
+     */
+    private void configureFullscreenWindow() {
+        Window window = getWindow();
+        if (window == null) return;
+
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false);
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            WindowManager.LayoutParams lp = window.getAttributes();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                lp.layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+            } else {
+                lp.layoutInDisplayCutoutMode =
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            }
+            window.setAttributes(lp);
+        }
+    }
+
+    /**
+     * Sticky immersive mode. Applied to the window decor (not the GLSurfaceView)
+     * so the status bar, gesture nav pill and cutout inset are all gone while
+     * the game owns the full display.
+     */
     private void enableImmersiveMode() {
-        if (glSurfaceView == null) return;
-        int flags = View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                | View.SYSTEM_UI_FLAG_FULLSCREEN
-                | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+        Window window = getWindow();
+        if (window == null) return;
+
+        View decor = window.getDecorView();
+        if (decor == null) return;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            window.setDecorFitsSystemWindows(false);
+            // Use the decor view's controller: Window.getInsetsController()
+            // dereferences mDecor, which is null if this runs before the first
+            // setContentView (and throws on Samsung/One UI).
+            WindowInsetsController controller = decor.getWindowInsetsController();
+            if (controller != null) {
+                controller.hide(
+                        WindowInsets.Type.statusBars()
+                        | WindowInsets.Type.navigationBars()
+                        | WindowInsets.Type.captionBar()
+                );
+                controller.setSystemBarsBehavior(
+                        WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            }
+        }
+
+        decor.setSystemUiVisibility(
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                 | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
-        glSurfaceView.setSystemUiVisibility(flags);
+                | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_FULLSCREEN);
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            enableImmersiveMode();
+        }
+    }
+
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        enableImmersiveMode();
     }
 
     private void setupNativeEnvironment(String apkPath) {

@@ -37,6 +37,7 @@ set(RUBY_MOBILE_SOURCES
     # compiles.
     ${CMAKE_CURRENT_SOURCE_DIR}/stb_image_impl.c
     ${CMAKE_CURRENT_SOURCE_DIR}/ruby_file_model.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/file_operations.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ruby_audio_bridge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ruby_texture_provider.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ruby_highlighter_bridge.cpp
@@ -102,6 +103,7 @@ set(RUBY_MOBILE_SOURCES
     ${SRC_DIR}/platform/pvrtc_decoder.cpp
     ${SRC_DIR}/platform/astc_decoder.cpp
     ${SRC_DIR}/platform/zip_archive.cpp
+    ${SRC_DIR}/platform/zip_stream.cpp
     ${SRC_DIR}/platform/scl_parser.cpp
     ${SRC_DIR}/platform/data_path.cpp
     ${SRC_DIR}/platform/font_fallback.cpp

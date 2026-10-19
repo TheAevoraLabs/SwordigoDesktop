@@ -6,6 +6,7 @@
 #include "tools/scene_workspace.h"
 #include "tools/rubymesh_meta.h"
 #include "tools/rubywater_meta.h"
+#include "platform/protobuf_reader.h"
 #include <QThreadPool>
 #include <QOpenGLFramebufferObject>
 #include <QOpenGLFunctions>
@@ -46,6 +47,9 @@ static inline void calc_object_world_matrix(const av::SceneObject& obj, float ou
     m.rotate(obj.rot_y * kRadToDeg, 0.0f, 0.0f, 1.0f);
     float s = obj.template_scaling;
     m.scale(obj.scale_x * s, obj.scale_y * s, obj.scale_z * s);
+    if (obj.has_model_origin) {
+        m.translate(-obj.model_origin[0], -obj.model_origin[1], -obj.model_origin[2]);
+    }
     std::memcpy(out, m.constData(), 16 * sizeof(float));
 }
 
@@ -75,15 +79,6 @@ static inline void calc_object_render_matrix(const av::SceneObject& obj, float o
     m.rotate(obj.rot_y * kRadToDeg, 0.0f, 0.0f, 1.0f);
     float s = obj.template_scaling;
     m.scale(obj.scale_x * s, obj.scale_y * s, obj.scale_z * s);
-
-    if (obj.has_model_x_rotation || obj.has_model_y_rotation) {
-        if (obj.has_model_x_rotation) {
-            m.rotate(obj.model_x_rotation * kRadToDeg, 1.0f, 0.0f, 0.0f);
-        }
-        if (obj.has_model_y_rotation) {
-            m.rotate(obj.model_y_rotation * kRadToDeg, 0.0f, 1.0f, 0.0f);
-        }
-    }
 
     if (obj.has_model_origin) {
         m.translate(-obj.model_origin[0], -obj.model_origin[1], -obj.model_origin[2]);
@@ -372,6 +367,24 @@ static std::vector<fs::path> build_asset_roots(const fs::path& scene_or_model_pa
     return roots;
 }
 
+static inline bool decode_scene_local_aabb(const av::SceneObject& obj, float out[4]) {
+    if (obj.local_aabb.empty()) return false;
+    float vals[4] = {0, 0, 0, 0};
+    int found = 0;
+    try {
+        proto::Reader reader(obj.local_aabb);
+        proto::Field f;
+        while (reader.read_field(f)) {
+            if (f.wire_type != proto::WIRE_I32 || f.field_number < 1 || f.field_number > 4) continue;
+            vals[f.field_number - 1] = f.float_val;
+            if (++found == 4) break;
+        }
+    } catch (...) { return false; }
+    if (found < 4) return false;
+    out[0] = vals[0]; out[1] = vals[1]; out[2] = vals[2]; out[3] = vals[3];
+    return true;
+}
+
 class RubyViewportRenderer : public QQuickFramebufferObject::Renderer, protected QOpenGLFunctions {
 public:
     RubyViewportRenderer() {
@@ -566,7 +579,14 @@ public:
 
                 for (size_t i = 0; i < m_sceneObjects.size(); ++i) {
                     const auto& obj = m_sceneObjects[i];
-                    if (obj.hidden) continue;
+                    const bool is_logic = obj.is_spawn_point || obj.is_portal || obj.is_camera ||
+                                          (obj.template_name == "cameraFocusShape") ||
+                                          (obj.name.find("camfocus") != std::string::npos) ||
+                                          (obj.name.find("focus") != std::string::npos) ||
+                                          (obj.name.find("camera_focus") != std::string::npos) ||
+                                          (obj.name.rfind("spawn", 0) == 0) ||
+                                          (obj.name.rfind("portal", 0) == 0);
+                    if (obj.hidden && !is_logic) continue;
 
                     // Bounds-driven culling. m_bounds is rebuilt only when the
                     // scene (or its geometry) changes, so a still scene pays
@@ -687,38 +707,9 @@ public:
                 }
                 m_shader->release();
 
-                // Draw batched logic markers in ONE pass with m_unlitShader bound once
+                // Draw specialized logic markers & overlays (Spawns, Portals, Focus Areas, Triggers)
                 if (!markerIndices.empty() && m_unlitShader && m_unlitShader->isLinked()) {
-                    m_unlitShader->bind();
-                    m_unlitShader->setUniformValue("uProj", proj);
-                    glBindBuffer(GL_ARRAY_BUFFER, m_cubeVbo);
-                    glEnableVertexAttribArray(0);
-                    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
-
-                    for (size_t mi : markerIndices) {
-                        const auto& mobj = m_sceneObjects[mi];
-                        float outMat[16];
-                        calc_object_world_matrix(mobj, outMat);
-                        QMatrix4x4 objWorld;
-                        std::memcpy(objWorld.data(), outMat, 16 * sizeof(float));
-                        m_unlitShader->setUniformValue("uModelView", view * objWorld);
-
-                        if (int(mi) == m_selectedObject) {
-                            m_unlitShader->setUniformValue("uColor", QVector4D(0.88f, 0.42f, 0.46f, 1.0f));
-                        } else if (mobj.is_portal) {
-                            m_unlitShader->setUniformValue("uColor", QVector4D(0.24f, 0.60f, 0.96f, 0.85f));
-                        } else if (mobj.is_spawn_point) {
-                            m_unlitShader->setUniformValue("uColor", QVector4D(0.96f, 0.76f, 0.20f, 0.85f));
-                        } else if (mobj.is_camera) {
-                            m_unlitShader->setUniformValue("uColor", QVector4D(0.20f, 0.85f, 0.80f, 0.85f));
-                        } else {
-                            m_unlitShader->setUniformValue("uColor", QVector4D(0.40f, 0.44f, 0.52f, 0.5f));
-                        }
-                        glDrawArrays(GL_LINES, 0, 24);
-                    }
-                    glDisableVertexAttribArray(0);
-                    glBindBuffer(GL_ARRAY_BUFFER, 0);
-                    m_unlitShader->release();
+                    renderLogicEntities(view, proj, markerIndices);
                 }
             }
         }
@@ -1633,35 +1624,385 @@ private:
         glDisable(GL_BLEND);
     }
 
-    void renderObjectMarker(const QMatrix4x4& mv, const QMatrix4x4& proj, const av::SceneObject& obj, bool selected) {
-        if (!m_unlitShader || !m_unlitShader->isLinked()) return;
+    void renderLogicEntities(const QMatrix4x4& view, const QMatrix4x4& proj, const std::vector<size_t>& markerIndices) {
+        if (markerIndices.empty() || !m_unlitShader || !m_unlitShader->isLinked()) return;
+
         m_unlitShader->bind();
         m_unlitShader->setUniformValue("uProj", proj);
-        m_unlitShader->setUniformValue("uModelView", mv);
+        glEnableVertexAttribArray(0);
 
-        if (selected) {
-            // Ruby Crimson active selection outline
-            m_unlitShader->setUniformValue("uColor", QVector4D(0.88f, 0.42f, 0.46f, 1.0f));
-        } else if (obj.is_portal) {
-            // Portal: deep luminous blue
-            m_unlitShader->setUniformValue("uColor", QVector4D(0.24f, 0.60f, 0.96f, 0.85f));
-        } else if (obj.is_spawn_point) {
-            // Spawn point: gold
-            m_unlitShader->setUniformValue("uColor", QVector4D(0.96f, 0.76f, 0.20f, 0.85f));
-        } else if (obj.is_camera) {
-            // Camera: cyan
-            m_unlitShader->setUniformValue("uColor", QVector4D(0.20f, 0.85f, 0.80f, 0.85f));
-        } else {
-            // Default logic marker: subtle slate
-            m_unlitShader->setUniformValue("uColor", QVector4D(0.40f, 0.44f, 0.52f, 0.5f));
+        for (size_t mi : markerIndices) {
+            const auto& mobj = m_sceneObjects[mi];
+            const bool is_sel = (int(mi) == m_selectedObject);
+
+            float outMat[16];
+            calc_object_world_matrix(mobj, outMat);
+            QMatrix4x4 objWorld;
+            std::memcpy(objWorld.data(), outMat, 16 * sizeof(float));
+            m_unlitShader->setUniformValue("uModelView", view * objWorld);
+
+            const bool is_spawn = mobj.is_spawn_point || (mobj.name.rfind("spawn", 0) == 0);
+            const bool is_spawn_default = (mobj.name == "spawn_default");
+            const bool is_portal = mobj.is_portal || (mobj.name.rfind("portal", 0) == 0) || (mobj.template_name.rfind("portal", 0) == 0);
+            const bool is_focus = mobj.is_camera || (mobj.template_name == "cameraFocusShape") ||
+                                  (mobj.name.find("camfocus") != std::string::npos) ||
+                                  (mobj.name.find("focus") != std::string::npos) ||
+                                  (mobj.name.find("camera_focus") != std::string::npos);
+
+            if (is_spawn) {
+                // ── 1. Spawn Point (Golden beacon + 3D facing direction arrow) ──
+                std::vector<float> verts;
+                verts.reserve(160);
+
+                // Octagonal ground ring
+                constexpr int kRingSegments = 8;
+                constexpr float kPi = 3.14159265358979323846f;
+                const float R = 28.0f;
+                for (int k = 0; k < kRingSegments; ++k) {
+                    float a0 = k * (2.0f * kPi / kRingSegments);
+                    float a1 = (k + 1) * (2.0f * kPi / kRingSegments);
+                    verts.push_back(R * std::cos(a0)); verts.push_back(0.0f); verts.push_back(R * std::sin(a0));
+                    verts.push_back(R * std::cos(a1)); verts.push_back(0.0f); verts.push_back(R * std::sin(a1));
+                }
+                // Ground crosshairs
+                verts.push_back(-R); verts.push_back(0.0f); verts.push_back(0.0f);
+                verts.push_back( R); verts.push_back(0.0f); verts.push_back(0.0f);
+                verts.push_back(0.0f); verts.push_back(0.0f); verts.push_back(-R);
+                verts.push_back(0.0f); verts.push_back(0.0f); verts.push_back( R);
+
+                // Spire corner pillars
+                const float cornerPos[4][2] = {{-16.0f, -16.0f}, {16.0f, -16.0f}, {16.0f, 16.0f}, {-16.0f, 16.0f}};
+                for (int c = 0; c < 4; ++c) {
+                    verts.push_back(cornerPos[c][0]); verts.push_back(0.0f); verts.push_back(cornerPos[c][1]);
+                    verts.push_back(0.0f); verts.push_back(68.0f); verts.push_back(0.0f);
+                }
+
+                // Spire collar ring at y = 30
+                for (int c = 0; c < 4; ++c) {
+                    int c2 = (c + 1) % 4;
+                    verts.push_back(cornerPos[c][0] * 0.5f); verts.push_back(30.0f); verts.push_back(cornerPos[c][1] * 0.5f);
+                    verts.push_back(cornerPos[c2][0] * 0.5f); verts.push_back(30.0f); verts.push_back(cornerPos[c2][1] * 0.5f);
+                }
+
+                // Floating diamond cap at (0, 78, 0)
+                const float ds = 11.0f;
+                const float topPt[3] = {0.0f, 78.0f + ds, 0.0f};
+                const float botPt[3] = {0.0f, 78.0f - ds, 0.0f};
+                const float dMid[4][3] = {{-ds, 78.0f, 0.0f}, {0.0f, 78.0f, ds}, {ds, 78.0f, 0.0f}, {0.0f, 78.0f, -ds}};
+                for (int d = 0; d < 4; ++d) {
+                    int d2 = (d + 1) % 4;
+                    verts.push_back(topPt[0]); verts.push_back(topPt[1]); verts.push_back(topPt[2]);
+                    verts.push_back(dMid[d][0]); verts.push_back(dMid[d][1]); verts.push_back(dMid[d][2]);
+
+                    verts.push_back(botPt[0]); verts.push_back(botPt[1]); verts.push_back(botPt[2]);
+                    verts.push_back(dMid[d][0]); verts.push_back(dMid[d][1]); verts.push_back(dMid[d][2]);
+
+                    verts.push_back(dMid[d][0]); verts.push_back(dMid[d][1]); verts.push_back(dMid[d][2]);
+                    verts.push_back(dMid[d2][0]); verts.push_back(dMid[d2][1]); verts.push_back(dMid[d2][2]);
+                }
+
+                // 3D Directional Facing Arrow
+                const float facing = (mobj.spawn_facing < 0) ? -1.0f : 1.0f;
+                const float ay = 30.0f;
+                // Main shaft
+                verts.push_back(0.0f); verts.push_back(ay); verts.push_back(0.0f);
+                verts.push_back(facing * 58.0f); verts.push_back(ay); verts.push_back(0.0f);
+
+                // Arrowhead 3D cone/chevron pointing towards facing direction
+                const float tipX = facing * 68.0f;
+                const float baseWingX = facing * 46.0f;
+                const float wings[4][3] = {
+                    {baseWingX, ay + 12.0f, 0.0f},
+                    {baseWingX, ay - 12.0f, 0.0f},
+                    {baseWingX, ay, 12.0f},
+                    {baseWingX, ay, -12.0f}
+                };
+                for (int w = 0; w < 4; ++w) {
+                    int w2 = (w + 1) % 4;
+                    // tip to wing
+                    verts.push_back(tipX); verts.push_back(ay); verts.push_back(0.0f);
+                    verts.push_back(wings[w][0]); verts.push_back(wings[w][1]); verts.push_back(wings[w][2]);
+                    // wing to wing
+                    verts.push_back(wings[w][0]); verts.push_back(wings[w][1]); verts.push_back(wings[w][2]);
+                    verts.push_back(wings[w2][0]); verts.push_back(wings[w2][1]); verts.push_back(wings[w2][2]);
+                }
+                // Second rear chevron for clear visibility from afar
+                const float chevX = facing * 32.0f;
+                const float chevBackX = facing * 20.0f;
+                verts.push_back(chevX); verts.push_back(ay); verts.push_back(0.0f);
+                verts.push_back(chevBackX); verts.push_back(ay + 8.0f); verts.push_back(0.0f);
+                verts.push_back(chevX); verts.push_back(ay); verts.push_back(0.0f);
+                verts.push_back(chevBackX); verts.push_back(ay - 8.0f); verts.push_back(0.0f);
+
+                // Spawn default hero star burst on ground
+                if (is_spawn_default) {
+                    for (int s = 0; s < 8; ++s) {
+                        float ang = s * (2.0f * kPi / 8.0f);
+                        verts.push_back(R * 0.4f * std::cos(ang)); verts.push_back(0.0f); verts.push_back(R * 0.4f * std::sin(ang));
+                        verts.push_back(R * 1.35f * std::cos(ang)); verts.push_back(0.0f); verts.push_back(R * 1.35f * std::sin(ang));
+                    }
+                }
+
+                QVector4D col = is_sel
+                    ? QVector4D(0.20f, 0.90f, 1.0f, 1.0f)
+                    : (is_spawn_default ? QVector4D(1.0f, 0.84f, 0.05f, 0.95f) : QVector4D(0.25f, 0.95f, 0.35f, 0.90f));
+
+                m_unlitShader->setUniformValue("uColor", col);
+                glLineWidth(is_sel ? 2.5f : 1.8f);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, verts.data());
+                glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(verts.size() / 3));
+
+            } else if (is_portal) {
+                // ── 2. Portal (Mystical archway / gateway frame with ethereal energy) ──
+                float aabb[4];
+                bool has_aabb = decode_scene_local_aabb(mobj, aabb);
+                float hw = 45.0f, h = 180.0f, by = 0.0f;
+                if (has_aabb && aabb[2] > 20.0f && aabb[3] > 40.0f) {
+                    hw = std::max(35.0f, aabb[2] * 0.5f);
+                    h = std::max(80.0f, aabb[3]);
+                    by = aabb[1];
+                }
+
+                std::vector<float> archVerts;
+                archVerts.reserve(180);
+
+                const float zFront = 14.0f, zBack = -14.0f;
+                const float pillarTopY = by + h * 0.68f;
+                const float archApexY = by + h;
+
+                auto addArchProfile = [&](float z) {
+                    // Left pillar
+                    archVerts.push_back(-hw); archVerts.push_back(by); archVerts.push_back(z);
+                    archVerts.push_back(-hw); archVerts.push_back(pillarTopY); archVerts.push_back(z);
+                    // Right pillar
+                    archVerts.push_back( hw); archVerts.push_back(by); archVerts.push_back(z);
+                    archVerts.push_back( hw); archVerts.push_back(pillarTopY); archVerts.push_back(z);
+                    // Threshold base
+                    archVerts.push_back(-hw); archVerts.push_back(by); archVerts.push_back(z);
+                    archVerts.push_back( hw); archVerts.push_back(by); archVerts.push_back(z);
+                    // Curved arch top (6 segments)
+                    constexpr int kArchSegs = 6;
+                    constexpr float kPi = 3.14159265358979323846f;
+                    for (int s = 0; s < kArchSegs; ++s) {
+                        float th0 = kPi - s * (kPi / kArchSegs);
+                        float th1 = kPi - (s + 1) * (kPi / kArchSegs);
+                        float xA = hw * std::cos(th0);
+                        float yA = pillarTopY + (archApexY - pillarTopY) * std::sin(th0);
+                        float xB = hw * std::cos(th1);
+                        float yB = pillarTopY + (archApexY - pillarTopY) * std::sin(th1);
+                        archVerts.push_back(xA); archVerts.push_back(yA); archVerts.push_back(z);
+                        archVerts.push_back(xB); archVerts.push_back(yB); archVerts.push_back(z);
+                    }
+                };
+
+                addArchProfile(zFront);
+                addArchProfile(zBack);
+
+                // Z struts connecting front and back archway
+                const float strutPts[5][2] = {
+                    {-hw, by}, {hw, by},
+                    {-hw, pillarTopY}, {hw, pillarTopY},
+                    {0.0f, archApexY}
+                };
+                for (int s = 0; s < 5; ++s) {
+                    archVerts.push_back(strutPts[s][0]); archVerts.push_back(strutPts[s][1]); archVerts.push_back(zFront);
+                    archVerts.push_back(strutPts[s][0]); archVerts.push_back(strutPts[s][1]); archVerts.push_back(zBack);
+                }
+
+                // Draw outer stone/mystic archway frame
+                QVector4D frameCol = is_sel ? QVector4D(0.25f, 0.85f, 1.0f, 1.0f) : QVector4D(0.78f, 0.35f, 1.0f, 0.95f);
+                m_unlitShader->setUniformValue("uColor", frameCol);
+                glLineWidth(is_sel ? 2.5f : 1.8f);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, archVerts.data());
+                glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(archVerts.size() / 3));
+
+                // Inner ethereal portal vortex (Cyan)
+                std::vector<float> etherVerts;
+                etherVerts.reserve(64);
+                const float cy = by + h * 0.52f;
+                const float dw = hw * 0.65f, dh = h * 0.30f;
+                // Diamond
+                etherVerts.push_back(0.0f); etherVerts.push_back(cy + dh); etherVerts.push_back(0.0f);
+                etherVerts.push_back( dw);  etherVerts.push_back(cy);      etherVerts.push_back(0.0f);
+                etherVerts.push_back( dw);  etherVerts.push_back(cy);      etherVerts.push_back(0.0f);
+                etherVerts.push_back(0.0f); etherVerts.push_back(cy - dh); etherVerts.push_back(0.0f);
+                etherVerts.push_back(0.0f); etherVerts.push_back(cy - dh); etherVerts.push_back(0.0f);
+                etherVerts.push_back(-dw);  etherVerts.push_back(cy);      etherVerts.push_back(0.0f);
+                etherVerts.push_back(-dw);  etherVerts.push_back(cy);      etherVerts.push_back(0.0f);
+                etherVerts.push_back(0.0f); etherVerts.push_back(cy + dh); etherVerts.push_back(0.0f);
+                // Inner concentric diamond
+                etherVerts.push_back(0.0f);      etherVerts.push_back(cy + dh*0.5f); etherVerts.push_back(0.0f);
+                etherVerts.push_back( dw*0.5f);  etherVerts.push_back(cy);           etherVerts.push_back(0.0f);
+                etherVerts.push_back( dw*0.5f);  etherVerts.push_back(cy);           etherVerts.push_back(0.0f);
+                etherVerts.push_back(0.0f);      etherVerts.push_back(cy - dh*0.5f); etherVerts.push_back(0.0f);
+                etherVerts.push_back(0.0f);      etherVerts.push_back(cy - dh*0.5f); etherVerts.push_back(0.0f);
+                etherVerts.push_back(-dw*0.5f);  etherVerts.push_back(cy);           etherVerts.push_back(0.0f);
+                etherVerts.push_back(-dw*0.5f);  etherVerts.push_back(cy);           etherVerts.push_back(0.0f);
+                etherVerts.push_back(0.0f);      etherVerts.push_back(cy + dh*0.5f); etherVerts.push_back(0.0f);
+                // Converging gateway beams
+                etherVerts.push_back(-hw * 0.6f); etherVerts.push_back(by); etherVerts.push_back(0.0f);
+                etherVerts.push_back(0.0f); etherVerts.push_back(by + h * 0.88f); etherVerts.push_back(0.0f);
+                etherVerts.push_back( hw * 0.6f); etherVerts.push_back(by); etherVerts.push_back(0.0f);
+                etherVerts.push_back(0.0f); etherVerts.push_back(by + h * 0.88f); etherVerts.push_back(0.0f);
+
+                QVector4D etherCol = is_sel ? QVector4D(1.0f, 0.90f, 0.20f, 0.95f) : QVector4D(0.20f, 0.92f, 1.0f, 0.85f);
+                m_unlitShader->setUniformValue("uColor", etherCol);
+                glLineWidth(1.6f);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, etherVerts.data());
+                glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(etherVerts.size() / 3));
+
+            } else if (is_focus) {
+                // ── 3. Camera Focus Area / cameraFocusShape (Viewfinder Framing Volume) ──
+                float aabb[4];
+                bool has_aabb = decode_scene_local_aabb(mobj, aabb);
+                float x0 = -300.0f, y0 = -150.0f, w = 600.0f, h = 300.0f;
+                if (has_aabb && aabb[2] > 10.0f && aabb[3] > 10.0f) {
+                    x0 = aabb[0]; y0 = aabb[1]; w = aabb[2]; h = aabb[3];
+                }
+                const float x1 = x0 + w, y1 = y0 + h;
+                const float cx = x0 + w * 0.5f, cy = y0 + h * 0.5f;
+                const float zt = 12.0f;
+
+                std::vector<float> boxVerts;
+                boxVerts.reserve(160);
+
+                // Front & Back rectangles
+                auto addBoxPlane = [&](float z) {
+                    boxVerts.push_back(x0); boxVerts.push_back(y0); boxVerts.push_back(z);
+                    boxVerts.push_back(x1); boxVerts.push_back(y0); boxVerts.push_back(z);
+
+                    boxVerts.push_back(x1); boxVerts.push_back(y0); boxVerts.push_back(z);
+                    boxVerts.push_back(x1); boxVerts.push_back(y1); boxVerts.push_back(z);
+
+                    boxVerts.push_back(x1); boxVerts.push_back(y1); boxVerts.push_back(z);
+                    boxVerts.push_back(x0); boxVerts.push_back(y1); boxVerts.push_back(z);
+
+                    boxVerts.push_back(x0); boxVerts.push_back(y1); boxVerts.push_back(z);
+                    boxVerts.push_back(x0); boxVerts.push_back(y0); boxVerts.push_back(z);
+                };
+                addBoxPlane( zt);
+                addBoxPlane(-zt);
+
+                // 4 Depth struts
+                boxVerts.push_back(x0); boxVerts.push_back(y0); boxVerts.push_back(zt);
+                boxVerts.push_back(x0); boxVerts.push_back(y0); boxVerts.push_back(-zt);
+
+                boxVerts.push_back(x1); boxVerts.push_back(y0); boxVerts.push_back(zt);
+                boxVerts.push_back(x1); boxVerts.push_back(y0); boxVerts.push_back(-zt);
+
+                boxVerts.push_back(x1); boxVerts.push_back(y1); boxVerts.push_back(zt);
+                boxVerts.push_back(x1); boxVerts.push_back(y1); boxVerts.push_back(-zt);
+
+                boxVerts.push_back(x0); boxVerts.push_back(y1); boxVerts.push_back(zt);
+                boxVerts.push_back(x0); boxVerts.push_back(y1); boxVerts.push_back(-zt);
+
+                QVector4D frameCol = is_sel ? QVector4D(1.0f, 0.85f, 0.15f, 1.0f) : QVector4D(0.18f, 0.85f, 0.95f, 0.80f);
+                m_unlitShader->setUniformValue("uColor", frameCol);
+                glLineWidth(is_sel ? 2.5f : 1.5f);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, boxVerts.data());
+                glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(boxVerts.size() / 3));
+
+                // Viewfinder Reticle & Camera Frustum
+                std::vector<float> reticleVerts;
+                reticleVerts.reserve(120);
+
+                // 4 Corner Viewfinder Brackets [ ]
+                const float bsize = std::min(45.0f, std::min(w, h) * 0.20f);
+                // Top-Left
+                reticleVerts.push_back(x0); reticleVerts.push_back(y1); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x0 + bsize); reticleVerts.push_back(y1); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x0); reticleVerts.push_back(y1); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x0); reticleVerts.push_back(y1 - bsize); reticleVerts.push_back(zt);
+                // Top-Right
+                reticleVerts.push_back(x1); reticleVerts.push_back(y1); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x1 - bsize); reticleVerts.push_back(y1); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x1); reticleVerts.push_back(y1); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x1); reticleVerts.push_back(y1 - bsize); reticleVerts.push_back(zt);
+                // Bottom-Left
+                reticleVerts.push_back(x0); reticleVerts.push_back(y0); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x0 + bsize); reticleVerts.push_back(y0); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x0); reticleVerts.push_back(y0); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x0); reticleVerts.push_back(y0 + bsize); reticleVerts.push_back(zt);
+                // Bottom-Right
+                reticleVerts.push_back(x1); reticleVerts.push_back(y0); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x1 - bsize); reticleVerts.push_back(y0); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x1); reticleVerts.push_back(y0); reticleVerts.push_back(zt);
+                reticleVerts.push_back(x1); reticleVerts.push_back(y0 + bsize); reticleVerts.push_back(zt);
+
+                // Center Crosshair (+)
+                const float rsize = std::min(35.0f, std::min(w, h) * 0.15f);
+                reticleVerts.push_back(cx - rsize); reticleVerts.push_back(cy); reticleVerts.push_back(zt);
+                reticleVerts.push_back(cx - rsize * 0.3f); reticleVerts.push_back(cy); reticleVerts.push_back(zt);
+                reticleVerts.push_back(cx + rsize * 0.3f); reticleVerts.push_back(cy); reticleVerts.push_back(zt);
+                reticleVerts.push_back(cx + rsize); reticleVerts.push_back(cy); reticleVerts.push_back(zt);
+
+                reticleVerts.push_back(cx); reticleVerts.push_back(cy - rsize); reticleVerts.push_back(zt);
+                reticleVerts.push_back(cx); reticleVerts.push_back(cy - rsize * 0.3f); reticleVerts.push_back(zt);
+                reticleVerts.push_back(cx); reticleVerts.push_back(cy + rsize * 0.3f); reticleVerts.push_back(zt);
+                reticleVerts.push_back(cx); reticleVerts.push_back(cy + rsize); reticleVerts.push_back(zt);
+
+                // 3D Camera Frustum Eye Pyramid
+                const float camEyeZ = zt + 65.0f;
+                const float cCamW = std::min(40.0f, w * 0.15f);
+                const float cCamH = std::min(25.0f, h * 0.15f);
+                reticleVerts.push_back(cx); reticleVerts.push_back(cy); reticleVerts.push_back(camEyeZ);
+                reticleVerts.push_back(cx - cCamW); reticleVerts.push_back(cy + cCamH); reticleVerts.push_back(zt);
+
+                reticleVerts.push_back(cx); reticleVerts.push_back(cy); reticleVerts.push_back(camEyeZ);
+                reticleVerts.push_back(cx + cCamW); reticleVerts.push_back(cy + cCamH); reticleVerts.push_back(zt);
+
+                reticleVerts.push_back(cx); reticleVerts.push_back(cy); reticleVerts.push_back(camEyeZ);
+                reticleVerts.push_back(cx + cCamW); reticleVerts.push_back(cy - cCamH); reticleVerts.push_back(zt);
+
+                reticleVerts.push_back(cx); reticleVerts.push_back(cy); reticleVerts.push_back(camEyeZ);
+                reticleVerts.push_back(cx - cCamW); reticleVerts.push_back(cy - cCamH); reticleVerts.push_back(zt);
+
+                QVector4D reticleCol = is_sel ? QVector4D(1.0f, 1.0f, 1.0f, 0.95f) : QVector4D(0.40f, 0.95f, 1.0f, 0.90f);
+                m_unlitShader->setUniformValue("uColor", reticleCol);
+                glLineWidth(2.2f);
+                glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, reticleVerts.data());
+                glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(reticleVerts.size() / 3));
+
+            } else {
+                // ── 4. Generic Logic Marker (cube or custom AABB) ──
+                float aabb[4];
+                bool has_aabb = decode_scene_local_aabb(mobj, aabb);
+                if (has_aabb && (aabb[2] > 10.0f || aabb[3] > 10.0f)) {
+                    const float x0 = aabb[0], y0 = aabb[1];
+                    const float x1 = x0 + aabb[2], y1 = y0 + aabb[3];
+                    const float zt = 12.0f;
+                    float bverts[24 * 3] = {
+                        x0, y0,  zt,  x1, y0,  zt,
+                        x1, y0,  zt,  x1, y1,  zt,
+                        x1, y1,  zt,  x0, y1,  zt,
+                        x0, y1,  zt,  x0, y0,  zt,
+
+                        x0, y0, -zt,  x1, y0, -zt,
+                        x1, y0, -zt,  x1, y1, -zt,
+                        x1, y1, -zt,  x0, y1, -zt,
+                        x0, y1, -zt,  x0, y0, -zt,
+
+                        x0, y0,  zt,  x0, y0, -zt,
+                        x1, y0,  zt,  x1, y0, -zt,
+                        x1, y1,  zt,  x1, y1, -zt,
+                        x0, y1,  zt,  x0, y1, -zt
+                    };
+                    m_unlitShader->setUniformValue("uColor", is_sel ? QVector4D(0.88f, 0.42f, 0.46f, 1.0f) : QVector4D(0.45f, 0.55f, 0.70f, 0.65f));
+                    glLineWidth(is_sel ? 2.5f : 1.5f);
+                    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, bverts);
+                    glDrawArrays(GL_LINES, 0, 24);
+                } else {
+                    glBindBuffer(GL_ARRAY_BUFFER, m_cubeVbo);
+                    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
+                    m_unlitShader->setUniformValue("uColor", is_sel ? QVector4D(0.88f, 0.42f, 0.46f, 1.0f) : QVector4D(0.40f, 0.44f, 0.52f, 0.5f));
+                    glLineWidth(1.5f);
+                    glDrawArrays(GL_LINES, 0, 24);
+                    glBindBuffer(GL_ARRAY_BUFFER, 0);
+                }
+            }
         }
 
-        glBindBuffer(GL_ARRAY_BUFFER, m_cubeVbo);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), nullptr);
-        glDrawArrays(GL_LINES, 0, 24);
         glDisableVertexAttribArray(0);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
         m_unlitShader->release();
     }
 
@@ -2318,6 +2659,27 @@ float RubyQuickViewport::selectedRot() const {
     return std::round(m_cameraYaw);
 }
 
+float RubyQuickViewport::selectedRotX() const {
+    if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        return m_scene.objects[m_selectedObject].rot_x * 180.0f / M_PI;
+    }
+    return 0.0f;
+}
+
+float RubyQuickViewport::selectedRotY() const {
+    if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        return m_scene.objects[m_selectedObject].rot_z * 180.0f / M_PI; // yaw
+    }
+    return 0.0f;
+}
+
+float RubyQuickViewport::selectedRotZ() const {
+    if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        return m_scene.objects[m_selectedObject].rot_y * 180.0f / M_PI; // roll
+    }
+    return 0.0f;
+}
+
 float RubyQuickViewport::selectedScale() const {
     if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
         return m_scene.objects[m_selectedObject].scale_x * m_scene.objects[m_selectedObject].template_scaling;
@@ -2461,6 +2823,7 @@ void RubyQuickViewport::rotateSelectedZ(float angleDeg) {
         auto& obj = m_scene.objects[m_selectedObject];
         // Tag 6 in Swordigo .scene format is rot_y (in-plane 2.5D rotation)
         obj.rot_y += angleDeg * M_PI / 180.0f;
+        av::scene_sync_model_rotation(obj);
         touch_scene(/*geometry_changed=*/false);
         markDirty(true);
         emit objectTransformChanged();
@@ -2469,6 +2832,150 @@ void RubyQuickViewport::rotateSelectedZ(float angleDeg) {
     } else {
         m_cameraYaw += angleDeg;
         emit cameraChanged();
+        update();
+    }
+}
+
+void RubyQuickViewport::rotateSelectedX(float angleDeg) {
+    if (m_meshEditActive || m_waterEditActive) return;
+    if (canMeshEdit() || isSelectedWater()) return; // GroundMesh & WaterMesh are strictly planar
+    if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        constexpr qint64 kRotateUndoCoalesceMs = 900;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (m_lastNudgeMs == 0 || now - m_lastNudgeMs > kRotateUndoCoalesceMs) {
+            pushUndoSnapshot();
+        }
+        m_lastNudgeMs = now;
+
+        auto& obj = m_scene.objects[m_selectedObject];
+        obj.rot_x += angleDeg * M_PI / 180.0f;
+        obj.model_x_rotation = obj.rot_x;
+        obj.has_model_x_rotation = (std::abs(obj.rot_x) > 1e-5f);
+        av::scene_sync_model_rotation(obj);
+        touch_scene(/*geometry_changed=*/false);
+        markDirty(true);
+        emit objectTransformChanged();
+        emit selectedObjectChanged();
+        update();
+    }
+}
+
+void RubyQuickViewport::rotateSelectedY(float angleDeg) {
+    if (m_meshEditActive || m_waterEditActive) return;
+    if (canMeshEdit() || isSelectedWater()) return; // GroundMesh & WaterMesh are strictly planar
+    if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        constexpr qint64 kRotateUndoCoalesceMs = 900;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (m_lastNudgeMs == 0 || now - m_lastNudgeMs > kRotateUndoCoalesceMs) {
+            pushUndoSnapshot();
+        }
+        m_lastNudgeMs = now;
+
+        auto& obj = m_scene.objects[m_selectedObject];
+        obj.rot_z += angleDeg * M_PI / 180.0f; // yaw around vertical Y axis
+        obj.model_y_rotation = obj.rot_z;
+        obj.has_model_y_rotation = (std::abs(obj.rot_z) > 1e-5f);
+        av::scene_sync_model_rotation(obj);
+        touch_scene(/*geometry_changed=*/false);
+        markDirty(true);
+        emit objectTransformChanged();
+        emit selectedObjectChanged();
+        update();
+    }
+}
+
+void RubyQuickViewport::resetSelectedRotation() {
+    if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        pushUndoSnapshot();
+        auto& obj = m_scene.objects[m_selectedObject];
+        obj.rot_x = 0.0f;
+        obj.rot_y = 0.0f;
+        obj.rot_z = 0.0f;
+        obj.model_x_rotation = 0.0f;
+        obj.has_model_x_rotation = false;
+        obj.model_y_rotation = 0.0f;
+        obj.has_model_y_rotation = false;
+        av::scene_sync_model_rotation(obj);
+        touch_scene(/*geometry_changed=*/false);
+        markDirty(true);
+        emit objectTransformChanged();
+        emit selectedObjectChanged();
+        update();
+    }
+}
+
+void RubyQuickViewport::rotateSelectedAxis(int axis, float angleDeg) {
+    if (axis == 0) rotateSelectedX(angleDeg);
+    else if (axis == 1) rotateSelectedY(angleDeg);
+    else rotateSelectedZ(angleDeg);
+}
+
+void RubyQuickViewport::setSelectedRotationAngle(int axis, float angleDeg) {
+    if (m_meshEditActive || m_waterEditActive) return;
+    if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        constexpr qint64 kRotateUndoCoalesceMs = 600;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (m_lastNudgeMs == 0 || now - m_lastNudgeMs > kRotateUndoCoalesceMs) {
+            pushUndoSnapshot();
+        }
+        m_lastNudgeMs = now;
+
+        auto& obj = m_scene.objects[m_selectedObject];
+        const float rad = angleDeg * M_PI / 180.0f;
+        if (axis == 0 && !canMeshEdit() && !isSelectedWater()) {
+            obj.rot_x = rad;
+            obj.model_x_rotation = rad;
+            obj.has_model_x_rotation = (std::abs(rad) > 1e-5f);
+        } else if (axis == 1 && !canMeshEdit() && !isSelectedWater()) {
+            obj.rot_z = rad;
+            obj.model_y_rotation = rad;
+            obj.has_model_y_rotation = (std::abs(rad) > 1e-5f);
+        } else if (axis == 2) {
+            obj.rot_y = rad;
+        }
+        av::scene_sync_model_rotation(obj);
+        touch_scene(/*geometry_changed=*/false);
+        markDirty(true);
+        emit objectTransformChanged();
+        emit selectedObjectChanged();
+        update();
+    }
+}
+
+void RubyQuickViewport::setSelectedScaleValue(float scale) {
+    if (m_meshEditActive || m_waterEditActive) return;
+    if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        constexpr qint64 kScaleUndoCoalesceMs = 600;
+        const qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (m_lastNudgeMs == 0 || now - m_lastNudgeMs > kScaleUndoCoalesceMs) {
+            pushUndoSnapshot();
+        }
+        m_lastNudgeMs = now;
+
+        auto& obj = m_scene.objects[m_selectedObject];
+        const float s = std::max(0.01f, scale);
+        obj.scale_x = s;
+        obj.scale_y = s;
+        obj.scale_z = s;
+        touch_scene(/*geometry_changed=*/false);
+        markDirty(true);
+        emit objectTransformChanged();
+        emit selectedObjectChanged();
+        update();
+    }
+}
+
+void RubyQuickViewport::snapSelectedToGrid(float gridSize) {
+    if (m_selectedObject >= 0 && m_selectedObject < int(m_scene.objects.size())) {
+        pushUndoSnapshot();
+        auto& obj = m_scene.objects[m_selectedObject];
+        if (gridSize <= 0.0f) gridSize = 1.0f;
+        obj.pos_x = std::round(obj.pos_x / gridSize) * gridSize;
+        obj.pos_y = std::round(obj.pos_y / gridSize) * gridSize;
+        touch_scene(/*geometry_changed=*/false);
+        markDirty(true);
+        emit objectTransformChanged();
+        emit selectedObjectChanged();
         update();
     }
 }
@@ -3046,6 +3553,7 @@ void RubyQuickViewport::selectObject(int idx) {
         m_selectedObject = idx;
         m_lastNudgeMs = 0;
         emit selectedObjectChanged();
+        emit objectTransformChanged();
         emit selectedWaterChanged();
         emit selectedWaterPropertiesChanged();
         update();
@@ -3238,10 +3746,21 @@ int RubyQuickViewport::pickObjectAtInternal(float x, float y, bool allow_cycle) 
                 lmax[0] =  half; lmax[1] =  half; lmax[2] =  half;
             }
         } else {
-            // Logic marker
-            const float half = std::max(40.0f, 30.0f * std::max(0.2f, std::abs(obj.scale_x * obj.template_scaling)));
-            lmin[0] = -half; lmin[1] = -half; lmin[2] = -half;
-            lmax[0] =  half; lmax[1] =  half; lmax[2] =  half;
+            // Logic marker (spawns, portals, focus areas, triggers)
+            float aabb[4];
+            if (decode_scene_local_aabb(obj, aabb) && (aabb[2] > 10.0f || aabb[3] > 10.0f)) {
+                const float pad = 12.0f;
+                lmin[0] = aabb[0] - pad;
+                lmin[1] = aabb[1] - pad;
+                lmin[2] = -25.0f;
+                lmax[0] = aabb[0] + aabb[2] + pad;
+                lmax[1] = aabb[1] + aabb[3] + pad;
+                lmax[2] =  25.0f;
+            } else {
+                const float half = std::max(40.0f, 30.0f * std::max(0.2f, std::abs(obj.scale_x * obj.template_scaling)));
+                lmin[0] = -half; lmin[1] = -half; lmin[2] = -half;
+                lmax[0] =  half; lmax[1] =  half; lmax[2] =  half;
+            }
         }
 
         float bmin[3], bmax[3];
@@ -7615,9 +8134,22 @@ bool RubyQuickViewport::nudgeSelected(int axis, float steps) {
             // axis 0 (X) -> rot_x (pitch)
             // axis 1 (Y) -> rot_z (yaw around vertical Y)
             // axis 2 (Z) -> rot_y (roll in 2.5D plane, Tag 6)
-        if (axis == 0)      obj.rot_x += steps * kRotateStep;
-        else if (axis == 1) obj.rot_z += steps * kRotateStep;
-        else                obj.rot_y += steps * kRotateStep;
+        if (canMeshEdit() || isSelectedWater()) {
+            obj.rot_y += steps * kRotateStep;
+        } else {
+            if (axis == 0) {
+                obj.rot_x += steps * kRotateStep;
+                obj.model_x_rotation = obj.rot_x;
+                obj.has_model_x_rotation = (std::abs(obj.rot_x) > 1e-5f);
+            } else if (axis == 1) {
+                obj.rot_z += steps * kRotateStep;
+                obj.model_y_rotation = obj.rot_z;
+                obj.has_model_y_rotation = (std::abs(obj.rot_z) > 1e-5f);
+            } else {
+                obj.rot_y += steps * kRotateStep;
+            }
+        }
+        av::scene_sync_model_rotation(obj);
         break;
 
     case 3: { // Scale — Tag 7 stores ONE uniform Scaling float, so a nudge is
@@ -7677,15 +8209,28 @@ QVariantMap RubyQuickViewport::getSelectedObjectData() {
         // stored internally in radians (that is what object_world_matrix and
         // scene_save expect). Previously only rotY was converted, so an
         // inspector that read rotX and wrote it back drifted by 57.3x.
-        map["rotX"] = obj.rot_x * 180.0f / M_PI;
-        map["rotY"] = obj.rot_y * 180.0f / M_PI;
-        map["rotZ"] = obj.rot_z * 180.0f / M_PI;
+        map["rotX"] = obj.rot_x * 180.0f / M_PI; // Pitch (X)
+        map["rotY"] = obj.rot_z * 180.0f / M_PI; // Yaw (Y)
+        map["rotZ"] = obj.rot_y * 180.0f / M_PI; // Roll (Z)
         map["scaleX"] = obj.scale_x;
         map["scaleY"] = obj.scale_y;
         map["scaleZ"] = obj.scale_z;
 
         bool isGm = canMeshEdit();
+        bool isWater = isSelectedWater();
+        bool isModel = !obj.mesh_name.empty();
+        if (!isModel) {
+            const auto& comps = obj.components.empty() ? obj.resolved_components : obj.components;
+            for (const auto& c : comps) {
+                if (c.payload_field == 101 || c.type_name == "Model" || c.type_name == "ModelComponent") {
+                    isModel = true;
+                    break;
+                }
+            }
+        }
         map["isGroundMesh"] = isGm;
+        map["isWater"] = isWater;
+        map["isModel"] = isModel;
         if (isGm) {
             map["topTexture"] = getGroundMeshTopTexture();
             map["groundTexture"] = getGroundMeshFrontTexture();
@@ -7741,15 +8286,20 @@ void RubyQuickViewport::applyTransform(float px, float py, float pz, float rx, f
         obj.pos_y = py;
         obj.pos_z = pz;
         // Degrees in, radians stored — symmetric with getSelectedObjectData().
-        obj.rot_x = rx * M_PI / 180.0f;
-        obj.rot_y = ry * M_PI / 180.0f;
-        obj.rot_z = rz * M_PI / 180.0f;
+        obj.rot_x = rx * M_PI / 180.0f; // Pitch (X)
+        obj.rot_z = ry * M_PI / 180.0f; // Yaw (Y)
+        obj.rot_y = rz * M_PI / 180.0f; // Roll (Z)
+        obj.model_x_rotation = obj.rot_x;
+        obj.has_model_x_rotation = (std::abs(obj.rot_x) > 1e-5f);
+        obj.model_y_rotation = obj.rot_z;
+        obj.has_model_y_rotation = (std::abs(obj.rot_z) > 1e-5f);
         obj.scale_x = sx;
         obj.scale_y = sy;
         obj.scale_z = sz;
         if (isSelectedWater()) {
             propagateWaterCompanionDelta(m_selectedObject, dx, dy, dz);
         }
+        av::scene_sync_model_rotation(obj);
         touch_scene(/*geometry_changed=*/false);
         markDirty(true);
         emit objectTransformChanged();

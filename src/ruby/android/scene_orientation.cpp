@@ -380,18 +380,9 @@ Java_in_aevora_ruby_CodeEditorActivity_nativeLoadFile(
         env->DeleteLocalRef(jtype);
     }
 
-    // Convert result_text into a Java String safely using UTF-8 constructor
-    jbyteArray jbytes = env->NewByteArray(result_text.size());
-    if (!jbytes) return nullptr;
-    env->SetByteArrayRegion(jbytes, 0, result_text.size(), reinterpret_cast<const jbyte*>(result_text.data()));
-    jclass strClass = env->FindClass("java/lang/String");
-    jstring utf8Charset = env->NewStringUTF("UTF-8");
-    jmethodID strCtor = env->GetMethodID(strClass, "<init>", "([BLjava/lang/String;)V");
-    jstring resStr = static_cast<jstring>(env->NewObject(strClass, strCtor, jbytes, utf8Charset));
-    env->DeleteLocalRef(jbytes);
-    env->DeleteLocalRef(utf8Charset);
-    env->DeleteLocalRef(strClass);
-    return resStr;
+    // Convert result_text into a Java String safely via QString UTF-16
+    QString qstr = QString::fromUtf8(result_text.data(), static_cast<int>(result_text.size()));
+    return env->NewString(reinterpret_cast<const jchar*>(qstr.utf16()), static_cast<jsize>(qstr.length()));
 }
 
 JNIEXPORT jstring JNICALL
@@ -411,20 +402,18 @@ Java_in_aevora_ruby_CodeEditorActivity_nativeSaveFile(
         return env->NewStringUTF("Target file path is empty");
     }
 
-    // Extract content bytes as UTF-8
-    jclass strClass = env->GetObjectClass(jcontent);
-    jmethodID getBytesMethod = env->GetMethodID(strClass, "getBytes", "(Ljava/lang/String;)[B");
-    jstring utf8Charset = env->NewStringUTF("UTF-8");
-    jbyteArray jbytes = static_cast<jbyteArray>(env->CallObjectMethod(jcontent, getBytesMethod, utf8Charset));
-    env->DeleteLocalRef(utf8Charset);
-    env->DeleteLocalRef(strClass);
-
+    // Extract content safely via JNI UTF-16 with zero reflection
     std::string content;
-    if (jbytes) {
-        jsize len = env->GetArrayLength(jbytes);
-        content.resize(len);
-        env->GetByteArrayRegion(jbytes, 0, len, reinterpret_cast<jbyte*>(&content[0]));
-        env->DeleteLocalRef(jbytes);
+    const jchar* u16 = env->GetStringChars(jcontent, nullptr);
+    jsize u16_len = env->GetStringLength(jcontent);
+    if (u16 && u16_len > 0) {
+        QString qcontent = QString::fromUtf16(reinterpret_cast<const char16_t*>(u16), u16_len);
+        QByteArray utf8 = qcontent.toUtf8();
+        content.assign(utf8.constData(), utf8.size());
+    }
+    if (u16) env->ReleaseStringChars(jcontent, u16);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
     }
 
     std::string detected_type = filerift::detect_filetype(file_path, content);
@@ -456,16 +445,28 @@ Java_in_aevora_ruby_CodeEditorActivity_nativeSaveFile(
     std::string temp_path = file_path + ".tmp_ruby_save";
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) {
-        return env->NewStringUTF(("Failed to create temporary file: " + temp_path).c_str());
+        // Direct write fallback if temp file creation fails (e.g. Scoped Storage / permissions)
+        std::ofstream direct_out(file_path, std::ios::binary | std::ios::trunc);
+        if (!direct_out.is_open()) {
+            return env->NewStringUTF(("Failed to open target file for writing: " + file_path).c_str());
+        }
+        direct_out.write(bytes_to_write.data(), bytes_to_write.size());
+        direct_out.flush();
+        if (!direct_out.good()) {
+            return env->NewStringUTF("Failed to write data directly to target file");
+        }
+        return nullptr;
     }
+
     out.write(bytes_to_write.data(), bytes_to_write.size());
     out.flush();
-    if (!out.good()) {
-        out.close();
+    const bool write_ok = out.good();
+    out.close();
+
+    if (!write_ok) {
         std::remove(temp_path.c_str());
         return env->NewStringUTF("Failed to write data to disk");
     }
-    out.close();
 
     // Rename temp file to target path
     if (std::rename(temp_path.c_str(), file_path.c_str()) != 0) {
