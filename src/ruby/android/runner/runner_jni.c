@@ -2,6 +2,7 @@
 #include "runner_scene.h"
 #include "runner_music.h"
 #include "runner_crasher.h"
+#include "runner_plugins.h"
 #include <jni.h>
 #include <android/log.h>
 
@@ -12,6 +13,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
     LOGI("JNI_OnLoad called for ruby_runner");
     runner_init_jvm(vm);
+    runner_plugins_set_jvm(vm);
     runner_init_crasher();
     return JNI_VERSION_1_6;
 }
@@ -83,4 +85,24 @@ Java_in_aevora_ruby_GameActivity_isBootSceneReady(JNIEnv *env, jclass clazz) {
     (void)env;
     (void)clazz;
     return runner_boot_scene_supported();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_in_aevora_ruby_GameActivity_loadRuntimePlugin(JNIEnv *env, jclass clazz, jstring pluginPath) {
+    (void)clazz;
+    if (!pluginPath) return JNI_FALSE;
+    const char *path = (*env)->GetStringUTFChars(env, pluginPath, NULL);
+    jboolean ok = JNI_FALSE;
+    if (path) {
+        ok = (runner_load_plugin(path) == 0) ? JNI_TRUE : JNI_FALSE;
+        (*env)->ReleaseStringUTFChars(env, pluginPath, path);
+    }
+    return ok;
+}
+
+JNIEXPORT void JNICALL
+Java_in_aevora_ruby_GameActivity_unloadRuntimePlugin(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    runner_unload_plugin();
 }

@@ -145,6 +145,10 @@ public class CodeEditorActivity extends Activity {
 
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService mIoExecutor = Executors.newSingleThreadExecutor();
+    // Set once the activity is torn down. A load or save job that finishes after
+    // that must not touch the released Sora editor or post UI work to a dead
+    // window (which throws BadTokenException).
+    private volatile boolean mDestroyed = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -754,6 +758,7 @@ public class CodeEditorActivity extends Activity {
             final String finalError = loadError;
 
             mHandler.post(() -> {
+                if (mDestroyed || isFinishing()) return;
                 if (finalContent != null) {
                     mIsFileriftTranscoded = finalIsFilerift;
                     mFileType = finalType;
@@ -816,36 +821,56 @@ public class CodeEditorActivity extends Activity {
             return;
         }
 
+        // Sora's buffer is not thread-safe and is released in onDestroy, so it
+        // must be serialised here on the main thread, not on the I/O worker
+        // that used to call getText().toString() while the user was typing.
+        String captured = "";
+        String captureError = null;
+        try {
+            if (mEditor != null && mEditor.getText() != null) {
+                captured = mEditor.getText().toString();
+            }
+        } catch (OutOfMemoryError oom) {
+            captureError = "Out of memory while serializing editor buffer: " + oom.getMessage();
+        } catch (Throwable t) {
+            captureError = "Failed to retrieve editor text: " + t.getMessage();
+        }
+
         mSaveBtn.setEnabled(false);
         mSaveBtn.setText("SAVING...");
 
-        mIoExecutor.execute(() -> {
-            String error = null;
-            String content = "";
-            try {
-                if (mEditor != null && mEditor.getText() != null) {
-                    content = mEditor.getText().toString();
-                }
-            } catch (OutOfMemoryError oom) {
-                error = "Out of memory while serializing editor buffer: " + oom.getMessage();
-            } catch (Throwable t) {
-                error = "Failed to retrieve editor text: " + t.getMessage();
-            }
+        final String content = captured;
+        final String path = mFilePath;
+        final boolean transcode = mIsFileriftTranscoded;
+        final String initialError = captureError;
 
+        mIoExecutor.execute(() -> {
+            String error = initialError;
             if (error == null) {
                 try {
-                    error = nativeSaveFile(mFilePath, content, mIsFileriftTranscoded);
+                    error = nativeSaveFile(path, content, transcode);
                 } catch (Throwable t) {
                     error = t.getMessage();
                 }
             }
 
             final String finalError = error;
-            final String finalContent = content;
             mHandler.post(() -> {
+                if (mDestroyed || isFinishing()) return;
                 mSaveBtn.setEnabled(true);
+                mSaveBtn.setText("SAVE");
                 if (finalError == null) {
-                    mIsModified = false;
+                    // Only clear the dirty flag when the buffer still matches what
+                    // was written; typing during the save must stay unsaved.
+                    String current = null;
+                    try {
+                        current = (mEditor != null && mEditor.getText() != null)
+                            ? mEditor.getText().toString() : null;
+                    } catch (Throwable ignored) {}
+                    if (content.equals(current)) {
+                        mIsModified = false;
+                    }
+                    clearRecoveryFile();
                     updateStatusIndicators();
                     Toast.makeText(this, "File saved successfully", Toast.LENGTH_SHORT).show();
                     if (onComplete != null) onComplete.run();
@@ -853,10 +878,12 @@ public class CodeEditorActivity extends Activity {
                     updateStatusIndicators();
                     // Attempt emergency recovery write so modder's edits are never lost
                     String recoveryNote = "";
-                    if (mFilePath != null && !mFilePath.isEmpty() && finalContent != null && !finalContent.isEmpty()) {
-                        File recFile = new File(mFilePath + ".recovery.txt");
-                        try (java.io.FileWriter fw = new java.io.FileWriter(recFile)) {
-                            fw.write(finalContent);
+                    if (path != null && !path.isEmpty() && !content.isEmpty()) {
+                        File recFile = new File(path + ".recovery.txt");
+                        try (java.io.Writer fw = new java.io.OutputStreamWriter(
+                                new java.io.FileOutputStream(recFile),
+                                java.nio.charset.StandardCharsets.UTF_8)) {
+                            fw.write(content);
                             recoveryNote = "\n\n(A recovery backup of your edits was saved to: " + recFile.getName() + ")";
                         } catch (Throwable ignored) {}
                     }
@@ -869,6 +896,16 @@ public class CodeEditorActivity extends Activity {
                 }
             });
         });
+    }
+
+    // A recovery file is only meaningful until the next successful save; leaving
+    // it behind makes every later save show a stale "backup" from an old error.
+    private void clearRecoveryFile() {
+        if (mFilePath == null || mFilePath.isEmpty()) return;
+        File recFile = new File(mFilePath + ".recovery.txt");
+        if (recFile.exists() && !recFile.delete()) {
+            Log.w(TAG, "Could not remove stale recovery file " + recFile.getName());
+        }
     }
 
     private void handle3DViewAction() {
@@ -1019,9 +1056,15 @@ public class CodeEditorActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        super.onDestroy();
+        mDestroyed = true;
+        // Drop queued UI work, then let an in-flight write finish before the
+        // editor (and its buffer) goes away; shutdownNow() would interrupt a
+        // native save mid-write.
+        mHandler.removeCallbacksAndMessages(null);
+        mIoExecutor.shutdown();
         if (mEditor != null) {
             mEditor.release();
         }
+        super.onDestroy();
     }
 }

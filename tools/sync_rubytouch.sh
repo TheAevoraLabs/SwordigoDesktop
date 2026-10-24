@@ -37,6 +37,12 @@ if [ -d "${ROOT_DIR}/src/ruby/android/libs" ]; then
     cp -r "${ROOT_DIR}/src/ruby/android/libs/"* "${DEST_DIR}/src/ruby/android/libs/"
 fi
 
+# Ensure APK assets (runtime plugins) are synced
+if [ -d "${ROOT_DIR}/src/ruby/android/assets" ]; then
+    mkdir -p "${DEST_DIR}/src/ruby/android/assets"
+    cp -r "${ROOT_DIR}/src/ruby/android/assets/"* "${DEST_DIR}/src/ruby/android/assets/"
+fi
+
 echo "--> Syncing src/tools/..."
 mkdir -p "${DEST_DIR}/src/tools"
 rsync -a --delete \
@@ -168,6 +174,7 @@ binw/
 *.apk
 *.aab
 *.so
+!src/ruby/android/assets/**/*.so
 *.dex
 *.zip
 *.tar.gz

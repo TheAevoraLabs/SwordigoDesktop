@@ -16,6 +16,7 @@
 #include "ruby_tools_bridge.h"
 #include "ruby_settings_bridge.h"
 #include "scene_orientation.h"
+#include "ruby/core/project/ruby_project.h"
 
 #if defined(Q_OS_ANDROID)
 #include <QJniObject>
@@ -69,6 +70,7 @@ int main(int argc, char* argv[]) {
     engine.rootContext()->setContextProperty("audioBridge", &audioBridge);
     engine.rootContext()->setContextProperty("screenOrientation", &screenOrientation);
     engine.rootContext()->setContextProperty("androidContext", &screenOrientation);
+    engine.rootContext()->setContextProperty("rubyProject", &ruby::core::RubyProject::instance());
 
     engine.addImportPath(QStringLiteral("assets:/qml"));
     engine.addImportPath(QStringLiteral("assets:/--bundled-resources--/qml"));

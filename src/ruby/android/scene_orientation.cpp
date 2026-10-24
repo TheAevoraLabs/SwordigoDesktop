@@ -4,6 +4,9 @@
 #include <QGuiApplication>
 #include <QScreen>
 #include <QDebug>
+#include <QFile>
+#include <QFileInfo>
+#include <QSaveFile>
 #include <fstream>
 #include <cstdio>
 
@@ -296,6 +299,31 @@ Java_in_aevora_ruby_RubyActivity_nativeOnPickerResult(
     }, Qt::QueuedConnection);
 }
 
+namespace {
+
+// A code editor has no business opening a 200 MB asset: reading it, expanding
+// it into a QString and then into Sora's buffer multiplies the footprint.
+constexpr qint64 kMaxEditorFileBytes = 64ll * 1024 * 1024;
+
+#if defined(__ANDROID__)
+#  include <android/log.h>
+#  define RUBY_SAVE_LOG(...) __android_log_print(ANDROID_LOG_INFO, "RubySave", __VA_ARGS__)
+#else
+#  define RUBY_SAVE_LOG(...) do {} while (0)
+#endif
+
+// Surface a failure to Java as an exception, which CodeEditorActivity already
+// catches and displays in its "Load Error" dialog. Returning nullptr instead
+// would only show "Unknown error".
+jstring throw_editor_error(JNIEnv* env, const std::string& message) {
+    if (jclass ex = env->FindClass("java/lang/IllegalStateException")) {
+        env->ThrowNew(ex, message.c_str());
+    }
+    return nullptr;
+}
+
+} // namespace
+
 JNIEXPORT jstring JNICALL
 Java_in_aevora_ruby_CodeEditorActivity_nativeLoadFile(
     JNIEnv* env, jclass clazz, jstring jpath, jbooleanArray outIsFilerift, jobjectArray outFileType)
@@ -309,13 +337,20 @@ Java_in_aevora_ruby_CodeEditorActivity_nativeLoadFile(
 
     if (file_path.empty()) return nullptr;
 
-    std::ifstream file(file_path, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
+    QFile file(QString::fromStdString(file_path));
+    if (!file.open(QIODevice::ReadOnly)) {
         return nullptr;
     }
-    const auto size = file.tellg();
-    if (size <= 0) {
+    if (file.size() > kMaxEditorFileBytes) {
         file.close();
+        return throw_editor_error(env, "File is larger than the " +
+            std::to_string(kMaxEditorFileBytes / (1024 * 1024)) +
+            " MB editor limit: " + file_path);
+    }
+
+    const QByteArray raw = file.readAll();
+    file.close();
+    if (raw.isEmpty()) {
         if (outIsFilerift && env->GetArrayLength(outIsFilerift) > 0) {
             jboolean false_val = JNI_FALSE;
             env->SetBooleanArrayRegion(outIsFilerift, 0, 1, &false_val);
@@ -323,24 +358,15 @@ Java_in_aevora_ruby_CodeEditorActivity_nativeLoadFile(
         return env->NewStringUTF("");
     }
 
-    std::string bytes(static_cast<size_t>(size), '\0');
-    file.seekg(0, std::ios::beg);
-    file.read(&bytes[0], size);
-    file.close();
-
+    std::string bytes(raw.constData(), static_cast<size_t>(raw.size()));
     std::string detected_type = filerift::detect_filetype(file_path, bytes);
-    bool is_supported = filerift::is_supported_filetype(detected_type);
+    const bool is_supported = filerift::is_supported_filetype(detected_type);
 
-    bool is_already_text = false;
-    if (bytes.size() >= 4) {
-        if (bytes.rfind("## FileRift", 0) == 0 ||
-            bytes.rfind("syntax =", 0) == 0 ||
-            bytes.rfind("scene ", 0) == 0 ||
-            bytes.rfind("scl ", 0) == 0 ||
-            bytes.rfind("Object{", 0) == 0) {
-            is_already_text = true;
-        }
-    }
+    // Sniff text vs binary by content, not by a short list of prefixes. A
+    // decoded asset that starts with a preserved '# comment' used to look
+    // binary, and real protobuf that happened to begin with "Object{" looked
+    // like markup.
+    const bool is_already_text = filerift::looks_like_markup_text(bytes);
 
     std::string result_text;
     bool is_filerift = false;
@@ -350,21 +376,27 @@ Java_in_aevora_ruby_CodeEditorActivity_nativeLoadFile(
             result_text = std::move(bytes);
             is_filerift = true;
         } else {
-            // Binary protobuf -> decode via FileRift
-            try {
-                std::string decoded = filerift::decode_protobuf(bytes, detected_type);
-                if (!decoded.empty()) {
-                    result_text = std::move(decoded);
-                    is_filerift = true;
-                } else {
-                    result_text = std::move(bytes);
-                    is_filerift = false;
-                }
-            } catch (const std::exception& e) {
-                result_text = std::move(bytes);
-                is_filerift = false;
+            // Binary protobuf -> decode via FileRift. Without a decoded view
+            // there is nothing safe to show: handing the raw protobuf to the
+            // text editor used to replace every NUL with U+FFFD, and the next
+            // save wrote that mojibake back over the asset.
+            std::string decode_error;
+            std::string decoded = filerift::decode_protobuf(bytes, detected_type, &decode_error);
+            if (decoded.empty()) {
+                return throw_editor_error(env,
+                    "Cannot decode " + QFileInfo(QString::fromStdString(file_path)).fileName().toStdString() +
+                    " as " + detected_type + ": " +
+                    (decode_error.empty() ? std::string("unknown decode error") : decode_error));
             }
+            result_text = std::move(decoded);
+            is_filerift = true;
         }
+    } else if (!is_already_text) {
+        // A binary asset the editor cannot represent as text.
+        return throw_editor_error(env,
+            "Not a text file and not a supported Swordigo format (" +
+            (detected_type.empty() ? std::string("unknown extension") : detected_type) +
+            "). Open it in the asset viewer instead.");
     } else {
         result_text = std::move(bytes);
         is_filerift = false;
@@ -424,66 +456,69 @@ Java_in_aevora_ruby_CodeEditorActivity_nativeSaveFile(
         }
     }
 
+    const bool supported = filerift::is_supported_filetype(detected_type);
     std::string bytes_to_write;
+    RUBY_SAVE_LOG("nativeSaveFile: path=%s transcode=%d supported=%d content=%zu",
+                  file_path.c_str(), (int)transcodeFilerift, (int)supported, content.size());
 
-    if (transcodeFilerift && filerift::is_supported_filetype(detected_type)) {
+    if (transcodeFilerift && supported) {
+        // `content` is Sora's text buffer. If it is not text at all, the
+        // editor was showing something it could not represent; encoding it
+        // would produce a file worse than the original.
+        if (!filerift::looks_like_markup_text(content)) {
+            return env->NewStringUTF("Editor buffer is not text; refusing to encode it over a binary asset");
+        }
         try {
             bytes_to_write = filerift::recode_markup(content, detected_type);
+            RUBY_SAVE_LOG("nativeSaveFile: recode -> %zu bytes", bytes_to_write.size());
             if (bytes_to_write.empty()) {
                 return env->NewStringUTF("FileRift compilation produced empty output");
             }
         } catch (const std::exception& e) {
+            RUBY_SAVE_LOG("nativeSaveFile: recode threw: %s", e.what());
             return env->NewStringUTF(e.what());
         } catch (...) {
             return env->NewStringUTF("Unknown FileRift encoding error");
         }
     } else {
+        // Raw-text mode. Writing UTF-8 over a binary protobuf asset leaves a
+        // file neither the engine nor the 3D view can load, so check what is
+        // actually on disk before replacing it.
+        if (supported) {
+            QFile existing(QString::fromStdString(file_path));
+            bool binary_on_disk = false;
+            if (existing.open(QIODevice::ReadOnly)) {
+                const QByteArray head = existing.read(4096);
+                binary_on_disk = !filerift::looks_like_markup_text(
+                    std::string(head.constData(), static_cast<size_t>(head.size())));
+            }
+            if (binary_on_disk) {
+                return env->NewStringUTF(("Refusing to overwrite binary " + detected_type +
+                    " asset with plain text: reopen the file so it is decoded first").c_str());
+            }
+        }
         bytes_to_write = std::move(content);
     }
 
-    // Atomic write to avoid data loss / corruption: write to temp file then rename
-    std::string temp_path = file_path + ".tmp_ruby_save";
-    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-        // Direct write fallback if temp file creation fails (e.g. Scoped Storage / permissions)
-        std::ofstream direct_out(file_path, std::ios::binary | std::ios::trunc);
-        if (!direct_out.is_open()) {
-            return env->NewStringUTF(("Failed to open target file for writing: " + file_path).c_str());
-        }
-        direct_out.write(bytes_to_write.data(), bytes_to_write.size());
-        direct_out.flush();
-        if (!direct_out.good()) {
-            return env->NewStringUTF("Failed to write data directly to target file");
-        }
-        return nullptr;
+    // QSaveFile writes a uniquely named sibling, flushes it and renames it over
+    // the target: no predictable ".tmp_ruby_save" name an attacker can
+    // pre-create as a symlink, and no truncate-then-fail window that leaves the
+    // original asset empty.
+    QSaveFile out(QString::fromStdString(file_path));
+    RUBY_SAVE_LOG("nativeSaveFile: opening QSaveFile");
+    if (!out.open(QIODevice::WriteOnly)) {
+        RUBY_SAVE_LOG("nativeSaveFile: QSaveFile open FAILED: %s", out.errorString().toStdString().c_str());
+        return env->NewStringUTF(("Failed to open target file for writing: " + file_path).c_str());
+    }
+    if (out.write(bytes_to_write.data(), static_cast<qint64>(bytes_to_write.size())) !=
+            static_cast<qint64>(bytes_to_write.size()) || !out.commit()) {
+        out.cancelWriting();
+        RUBY_SAVE_LOG("nativeSaveFile: write/commit FAILED: %s", out.errorString().toStdString().c_str());
+        return env->NewStringUTF(("Failed to write data to " + file_path + ": " +
+                                  out.errorString().toStdString()).c_str());
     }
 
-    out.write(bytes_to_write.data(), bytes_to_write.size());
-    out.flush();
-    const bool write_ok = out.good();
-    out.close();
-
-    if (!write_ok) {
-        std::remove(temp_path.c_str());
-        return env->NewStringUTF("Failed to write data to disk");
-    }
-
-    // Rename temp file to target path
-    if (std::rename(temp_path.c_str(), file_path.c_str()) != 0) {
-        std::ifstream src(temp_path, std::ios::binary);
-        std::ofstream dst(file_path, std::ios::binary | std::ios::trunc);
-        if (src.is_open() && dst.is_open()) {
-            dst << src.rdbuf();
-            dst.flush();
-            src.close();
-            dst.close();
-            std::remove(temp_path.c_str());
-        } else {
-            std::remove(temp_path.c_str());
-            return env->NewStringUTF("Failed to replace target file with saved data");
-        }
-    }
-
+    RUBY_SAVE_LOG("nativeSaveFile: saved OK");
     return nullptr;
 }
 

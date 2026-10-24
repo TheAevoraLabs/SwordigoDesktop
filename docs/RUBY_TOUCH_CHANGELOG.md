@@ -5,6 +5,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 > **Repository move (2026-09-26):** development moved from GitHub (`TheAevoraLabs`, terminated by automated moderation) to GitLab — [AevoralabsIN/RubyTouch](https://gitlab.com/AevoralabsIN/RubyTouch) — with a mirror at [quantumcreeper/RubyTouch](https://codeberg.org/quantumcreeper/RubyTouch). `github.com` links in older entries below are historical.
 
+## [1.4.5b] - 2026-10-20
+
+### Fixed
+- **Files-tab search button froze and ANR-killed the app (`BreadcrumbHeader.qml`)**: tapping the breadcrumb magnifier called `forceActiveFocus()` on the search field while its row was still hidden (the `visible:` binding re-evaluates after the change handler). Qt 6.6's Android-only `ImEnterKeyType` probe walks the tab-focus chain from the focus item and can never return from an *invisible* item, so `qtMainLoopThread` spun at 100% forever until Android killed the process. Focus is now deferred with `Qt.callLater` until the row is actually on screen. Verified on device (Galaxy A36): GUI thread stays idle where it previously pegged a core and died to an ANR.
+- **Deep-search worker-thread data race (`ruby_file_model.cpp`)**: `searchRecursive()` read `m_pinnedPaths`/`m_selectedPaths` from a pool thread while the GUI thread mutates them (implicit-shared `QSet` — a use-after-free waiting to happen mid-search). The sets are now snapshotted on the GUI thread, matching the existing `reload()` pattern.
+- **Intermittent native crash when saving `.scl`/`.scene` from the text editor (`filerift.cpp`)**: the `@compile` path ran the Lua 5.1 parser directly on the editor's Java I/O thread (1 MB stack). Deeply nested scene-AI chunks recurse past that limit and SIGSEGV the whole app — content-dependent, which is why only *some* scenes crashed on save. Compilation now runs on a 16 MB-stack worker thread on Android, with the previous behaviour as fallback.
+- **Lua dual-form regulation (`filerift.cpp` / `filerift.h`)**: Swordigo stores every Program chunk twice — plaintext source (field 1) and Lua 5.1 bytecode (field 2) — and the shipped engine executes only the bytecode. Chunks that already *are* Lua 5.1 bytecode (`\x1bLua…`) are now passed through byte-identical instead of being fed back through `luaL_loadbuffer`; Lua 5.1's undump performs no integrity checks beyond the header, so truncated or foreign dumps crashed the app.
+
 ## [1.4.5] - 2026-10-19
 
 ### Added

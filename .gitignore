@@ -38,6 +38,7 @@ bin/libs/libsre.so
 *.so
 *.so.*
 !src/ruby/android/libs/**/*.so
+!src/ruby/android/assets/**/*.so
 # Old source snapshots (archived in trash/)
 # Archives (game asset bundles, compressed builds, etc.)
 *.zip
@@ -80,6 +81,9 @@ rl_libGlossHook.so
 rl_*.so
 # Game assets (copyrighted, not distributed)
 assets/
+!src/ruby/android/assets/
+!src/ruby/android/assets/**
+!src/ruby/android/assets/**/*.so
 # -------- COPYRIGHTED GAME MUSIC --------
 # Original Swordigo + RLSwordigo music — copyrighted
 /res/

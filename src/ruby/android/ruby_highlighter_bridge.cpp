@@ -126,12 +126,11 @@ bool RubyCodeBridge::loadFile(const QString& path) {
     QString ext = fi.suffix().toLower();
     const bool is_scl_or_scene = (ext == QStringLiteral("scene") || ext == QStringLiteral("scl"));
 
-    // Check if FileRift binary protobuf transcoding is needed for .scene / .scl
-    bool is_already_text = bytes.startsWith("## FileRift") ||
-                           bytes.startsWith("syntax =") ||
-                           bytes.startsWith("scl ") ||
-                           bytes.startsWith("scene ") ||
-                           bytes.startsWith("Object{");
+    // Text vs binary is decided by content, not by a prefix list: a decoded
+    // file that starts with a preserved '# comment' is still markup, and a
+    // protobuf blob that happens to start with "Object{" is still binary.
+    const std::string raw(bytes.constData(), static_cast<size_t>(bytes.size()));
+    const bool is_already_text = ::filerift::looks_like_markup_text(raw);
 
     if (is_scl_or_scene) {
         const std::string schema_type = (ext == QStringLiteral("scene")) ? "scene" : "scl";
@@ -139,20 +138,28 @@ bool RubyCodeBridge::loadFile(const QString& path) {
             m_content = QString::fromUtf8(bytes);
             m_isFileriftTranscoded = true;
         } else {
-            try {
-                std::string decoded_text = ::filerift::decode_protobuf(std::string(bytes.constData(), bytes.size()), schema_type);
-                if (!decoded_text.empty()) {
-                    m_content = QString::fromStdString(decoded_text);
-                    m_isFileriftTranscoded = true;
-                } else {
-                    m_content = QString::fromUtf8(bytes);
-                    m_isFileriftTranscoded = false;
-                }
-            } catch (...) {
-                m_content = QString::fromUtf8(bytes);
+            // Never fall back to showing raw protobuf: the editor would render
+            // replacement characters and the next save would write that over
+            // the asset.
+            std::string decode_error;
+            std::string decoded_text = ::filerift::decode_protobuf(raw, schema_type, &decode_error);
+            if (decoded_text.empty()) {
+                m_isLoading = false;
                 m_isFileriftTranscoded = false;
+                emit loadingChanged();
+                emit statusMessage(QStringLiteral("Cannot decode %1: %2")
+                    .arg(fi.fileName(), QString::fromStdString(decode_error)));
+                return false;
             }
+            m_content = QString::fromStdString(decoded_text);
+            m_isFileriftTranscoded = true;
         }
+    } else if (!is_already_text) {
+        m_isLoading = false;
+        m_isFileriftTranscoded = false;
+        emit loadingChanged();
+        emit statusMessage(QStringLiteral("%1 is not a text file").arg(fi.fileName()));
+        return false;
     } else {
         m_content = QString::fromUtf8(bytes);
         m_isFileriftTranscoded = false;

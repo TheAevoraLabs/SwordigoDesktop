@@ -18,6 +18,10 @@ extern "C" {
 #include <lauxlib.h>
 }
 
+#ifdef __ANDROID__
+#include <pthread.h>
+#endif
+
 /*
  * FileRift C++ Port - Stage 1 - MrSinup
  * 
@@ -28,13 +32,14 @@ extern "C" {
  * - CLI configuration profiles config.py support.
  */
 
-extern "C" const char* sre_vfs_resolve_path(const char* filename, char* buf) {
-    if (!filename || !buf) return filename;
-    std::strcpy(buf, filename);
-    return buf;
-}
-
 namespace filerift {
+
+// Defensive limits for untrusted project data. Swordigo's real assets are
+// tiny next to these; they exist so a crafted scene, save, or markup file
+// cannot exhaust the stack or memory of the editor process.
+static constexpr int kMaxMessageNesting = 256;
+static constexpr int kMaxLuaSearchDepth = 64;
+static constexpr size_t kMaxLuaBytecodeBytes = 64u * 1024u * 1024u;
 
 struct FieldSchema {
     uint32_t field_number;
@@ -44,53 +49,240 @@ struct FieldSchema {
 };
 
 static int lua_writer_cb(lua_State* L, const void* p, size_t sz, void* ud) {
+    (void)L;
     std::string* out = static_cast<std::string*>(ud);
     out->append(static_cast<const char*>(p), sz);
     return 0;
 }
 
+// Swordigo stores every Program chunk twice: plaintext source (field 1) AND a
+// precompiled Lua 5.1 chunk (field 2) — and the shipped engine's
+// Program::LoadIntoState() ignores field 1 entirely and executes field 2.
+// The editors regulate that pairing here:
+//   * source   -> compiled to fresh Lua 5.1 bytecode (the `@compile` directive)
+//   * bytecode -> passed through byte-identical, never re-parsed
+// Re-parsing a precompiled chunk is forbidden: Lua 5.1's undump performs no
+// integrity checks beyond the 12-byte header, so a truncated, foreign-endian
+// or otherwise mangled dump walks invalid memory and takes the app down.
+static bool looks_like_lua51_bytecode(const std::string& s) {
+    return !s.empty() && static_cast<unsigned char>(s[0]) == 0x1b;
+}
+
+// Lua 5.1 binary chunk header (lundump.c). 12 bytes:
+//   0..3  ESC "Lua"   4 version (0x51)   5 format (0)
+//   6 endianness (1 = little)            7 sizeof(int)
+//   8 sizeof(size_t)  9 sizeof(Instruction)
+//  10 sizeof(lua_Number)                11 integral flag (num == 1)
+// Only the signature is otherwise checked before undump starts walking the
+// proto tree, so every remaining byte decides whether the loader reads a valid
+// chunk or arbitrary memory. Anything the host build could not load must never
+// be written into a Program's field 2.
+static constexpr size_t kLua51HeaderSize = 12;
+
+static std::string to_hex_byte(unsigned char value) {
+    static const char* digits = "0123456789abcdef";
+    std::string out;
+    out += digits[(value >> 4) & 0x0f];
+    out += digits[value & 0x0f];
+    return out;
+}
+
+static std::string lua51_header_problem(const std::string& chunk) {
+    if (chunk.size() < kLua51HeaderSize) {
+        return "truncated Lua chunk header (" + std::to_string(chunk.size()) +
+               " of " + std::to_string(kLua51HeaderSize) + " bytes)";
+    }
+    const unsigned char* h = reinterpret_cast<const unsigned char*>(chunk.data());
+    if (h[0] != 0x1b || h[1] != 'L' || h[2] != 'u' || h[3] != 'a')
+        return "missing Lua chunk signature";
+    if (h[4] != 0x51)
+        return "not a Lua 5.1 chunk (version 0x" + to_hex_byte(h[4]) + ")";
+    if (h[5] != 0)
+        return "unsupported Lua chunk format " + std::to_string(h[5]);
+    if (h[6] != 1)
+        return "Lua chunk is not little-endian";
+    if (h[7] != 4)
+        return "Lua chunk was built with sizeof(int)=" + std::to_string(h[7]);
+    if (h[8] != sizeof(size_t))
+        return "Lua chunk targets a " + std::to_string(h[8] * 8) + "-bit size_t but this build uses " +
+               std::to_string(sizeof(size_t) * 8) + "-bit (compile it on the target platform)";
+    if (h[9] != 4)
+        return "Lua chunk was built with sizeof(Instruction)=" + std::to_string(h[9]);
+    if (h[10] != 8)
+        return "Lua chunk was built with a " + std::to_string(h[10] * 8) + "-bit lua_Number";
+    if (h[11] != 0)
+        return "Lua chunk uses an integer lua_Number format";
+    return "";
+}
+
+// ── UTF-8 / markup-vs-binary sniffing ──────────────────────────────────────
+// FileRift markup is always UTF-8 text. Protobuf payloads are arbitrary bytes,
+// so "decodes as UTF-8 and contains no NULs" is a far more reliable test than
+// the prefix lists the editors used to compare against: a decoded file that
+// starts with a preserved comment ('# ...') used to be mistaken for binary.
+static bool is_valid_utf8(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t extra = 0;
+        if (c < 0x80) { ++i; continue; }
+        if ((c & 0xe0) == 0xc0) { extra = 1; if (c < 0xc2) return false; }
+        else if ((c & 0xf0) == 0xe0) { extra = 2; }
+        else if ((c & 0xf8) == 0xf0) { extra = 3; if (c > 0xf4) return false; }
+        else return false;
+        if (i + extra >= s.size()) return false;
+        for (size_t k = 1; k <= extra; ++k) {
+            if ((static_cast<unsigned char>(s[i + k]) & 0xc0) != 0x80) return false;
+        }
+        i += extra + 1;
+    }
+    return true;
+}
+
+bool looks_like_markup_text(const std::string& bytes) {
+    if (bytes.empty()) return true;
+    for (unsigned char c : bytes) {
+        // NUL and the C0 controls FileRift never emits (it uses \n, \r, \t).
+        if (c == 0 || (c < 0x20 && c != '\n' && c != '\r' && c != '\t') || c == 0x7f)
+            return false;
+    }
+    return is_valid_utf8(bytes);
+}
+
+// One-line comments only: FileRift stores a comment per source line, so a
+// payload with an embedded newline could re-emit as markup and inject tags.
+static std::string sanitize_comment_line(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (unsigned char c : text) {
+        if (c == '\n' || c == '\r') out += ' ';
+        else if (c == '\t' || (c >= 0x20 && c != 0x7f)) out += static_cast<char>(c);
+    }
+    return out;
+}
+
+namespace {
+struct LuaCompileJob {
+    const std::string* source = nullptr;
+    const std::string* name = nullptr;
+    std::string bytecode;
+    std::string error_text;
+    int status = -1;  // 0 = dumped OK, non-zero = lua load/dump error
+
+    void run() {
+        lua_State* L = luaL_newstate();
+        if (!L) {
+            error_text = "failed to create Lua state";
+            status = 1;
+            return;
+        }
+
+        luaL_openlibs(L);
+
+        status = luaL_loadbuffer(L, source->c_str(), source->size(), name->c_str());
+        if (status != 0) {
+            const char* msg = lua_tostring(L, -1);
+            error_text = msg ? msg : "unknown Lua compile error";
+            lua_close(L);
+            return;
+        }
+
+        status = lua_dump(L, lua_writer_cb, &bytecode);
+        lua_close(L);
+    }
+};
+}  // namespace
+
+#ifdef __ANDROID__
+static void* lua_compile_entry(void* ud) {
+    static_cast<LuaCompileJob*>(ud)->run();
+    return nullptr;
+}
+#endif
+
 std::string compile_lua_to_bytecode(const std::string& source, const std::string& name,
                                     std::string* error) {
     if (error) error->clear();
-    lua_State* L = luaL_newstate();
-    if (!L) {
-        if (error) *error = "failed to create Lua state";
-        std::cerr << "Failed to create Lua state for compilation" << std::endl;
+
+    if (source.empty()) {
+        if (error) *error = "empty Lua chunk";
         return "";
     }
-    
-    luaL_openlibs(L);
-    
-    int status = luaL_loadbuffer(L, source.c_str(), source.size(), name.c_str());
-    if (status != 0) {
-        const char* msg = lua_tostring(L, -1);
-        std::string err = msg ? msg : "unknown Lua compile error";
+    if (source.size() > kMaxLuaBytecodeBytes) {
+        if (error) *error = "Lua chunk exceeds the " +
+                            std::to_string(kMaxLuaBytecodeBytes / (1024 * 1024)) + " MB limit";
+        return "";
+    }
+
+    // Regulation: a chunk that is already a complete Lua 5.1 chunk for THIS
+    // build is stored as-is. Everything else beginning with the ESC signature
+    // is corrupt or built for another ABI; it must be rejected here, because
+    // the engine feeds field 2 to luaL_loadbuffer(), whose undump does no
+    // bounds checking past the 12-byte header.
+    if (looks_like_lua51_bytecode(source)) {
+        const std::string problem = lua51_header_problem(source);
+        if (!problem.empty()) {
+            if (error) *error = "invalid Lua bytecode: " + problem;
+            return "";
+        }
+        return source;
+    }
+
+    LuaCompileJob job;
+    job.source = &source;
+    job.name = &name;
+
+#ifdef __ANDROID__
+    // The Lua 5.1 parser is recursive-descent: a scene-AI chunk with deep
+    // table/expression nesting recurses straight past the 1 MB stack Android
+    // hands Java-created threads — and the editor saves on a Java executor
+    // thread. That is why only *some* scenes SIGSEGV'd on save while the same
+    // chunk compiled fine on bigger-stack threads. Give the compile the head-
+    // room the desktop/main thread has.
+    pthread_attr_t attr;
+    pthread_t thread;
+    bool spawned = false;
+    if (pthread_attr_init(&attr) == 0) {
+        pthread_attr_setstacksize(&attr, size_t(16) * 1024 * 1024);
+        spawned = (pthread_create(&thread, &attr, lua_compile_entry, &job) == 0);
+        pthread_attr_destroy(&attr);
+    }
+    if (spawned) {
+        pthread_join(thread, nullptr);
+    } else {
+        job.run();  // last resort: behave exactly as before
+    }
+#else
+    job.run();
+#endif
+
+    if (job.status != 0) {
+        const std::string err = job.error_text.empty() ? std::string("Lua dump failed")
+                                                       : job.error_text;
         if (error) *error = err;
         std::cerr << "Lua compile error: " << err << std::endl;
-        lua_close(L);
         return "";
     }
-    
-    std::string bytecode;
-    status = lua_dump(L, lua_writer_cb, &bytecode);
-    lua_close(L);
-    
-    if (status != 0) {
-        if (error) *error = "Lua dump failed";
-        std::cerr << "Lua dump failed" << std::endl;
+
+    // Never hand a chunk we cannot account for back to the caller: a dump that
+    // fails its own header check would already be unusable at runtime.
+    const std::string dumped_problem =
+        (job.bytecode.size() < kLua51HeaderSize)
+            ? std::string("truncated Lua dump")
+            : lua51_header_problem(job.bytecode);
+    if (!dumped_problem.empty() || job.bytecode.size() > kMaxLuaBytecodeBytes) {
+        if (error) *error = "Lua dump produced a chunk this build cannot load: " +
+                            (dumped_problem.empty() ? std::string("oversized") : dumped_problem);
         return "";
     }
-    
-    return bytecode;
+
+    return job.bytecode;
 }
 
-static std::map<std::string, std::vector<FieldSchema>> schemas;
-static bool schemas_initialized = false;
+static std::map<std::string, std::vector<FieldSchema>> build_schemas() {
+    std::map<std::string, std::vector<FieldSchema>> schemas;
 
-static void init_schemas() {
-    if (schemas_initialized) return;
-
-    auto add = [](const std::string& msg, uint32_t f, proto::WireType w, const std::string& name, const std::string& cls) {
+    auto add = [&schemas](const std::string& msg, uint32_t f, proto::WireType w, const std::string& name, const std::string& cls) {
         schemas[msg].push_back({f, w, name, cls});
     };
 
@@ -982,70 +1174,88 @@ static void init_schemas() {
 
     add("SpellComponent", 1, proto::WIRE_LEN, "OnCast", "Program");
 
-    schemas_initialized = true;
+    return schemas;
 }
 
-static FieldSchema g_temp_find_field_result;
-static FieldSchema g_temp_find_field_by_name_result;
+// Function-local static initialization is thread-safe (C++11), and the map is
+// immutable afterwards. The previous lazy `schemas_initialized` flag let two
+// Ruby Touch editors insert into the same std::map concurrently, which is
+// undefined behavior.
+static const std::map<std::string, std::vector<FieldSchema>>& schema_map() {
+    static const std::map<std::string, std::vector<FieldSchema>> instance =
+        build_schemas();
+    return instance;
+}
 
-static const FieldSchema* find_field(const std::string& parent_msg_type, uint32_t field_number) {
+// Return the schema by value. The old implementation returned pointers into
+// two mutable global slots, so concurrent decode/recode calls could overwrite
+// another thread's field name and wire type mid-use.
+static bool find_field(const std::string& parent_msg_type, uint32_t field_number,
+                       FieldSchema& result) {
     // 1. Try av::g_schemas lookup (contains perfect auto-generated scene and component schemas)
     auto it_av = av::g_schemas.find(parent_msg_type);
     if (it_av != av::g_schemas.end()) {
         for (const auto& pair : it_av->second.fields) {
-            uint32_t tag = pair.first;
-            uint32_t f_num = tag >> 3;
+            const uint32_t tag = pair.first;
+            const uint32_t f_num = tag >> 3;
             if (f_num == field_number) {
-                g_temp_find_field_result.field_number = f_num;
-                g_temp_find_field_result.wire_type = static_cast<proto::WireType>(tag & 7);
-                g_temp_find_field_result.name = pair.second.name;
-                g_temp_find_field_result.classname = pair.second.class_name;
-                return &g_temp_find_field_result;
+                result.field_number = f_num;
+                result.wire_type = static_cast<proto::WireType>(tag & 7);
+                result.name = pair.second.name;
+                result.classname = pair.second.class_name;
+                return true;
             }
         }
     }
 
     // 2. Try manual schemas lookup
-    init_schemas();
+    const auto& schemas = schema_map();
     auto it = schemas.find(parent_msg_type);
     if (it != schemas.end()) {
         for (const auto& fs : it->second) {
-            if (fs.field_number == field_number) return &fs;
+            if (fs.field_number == field_number) {
+                result = fs;
+                return true;
+            }
         }
     }
 
     // "All" is a real FileRift root type, not a fallback schema. Field
     // numbers overlap heavily between Swordigo messages, so consulting it for
     // another class can silently rename and reinterpret unknown fields.
-    return nullptr;
+    return false;
 }
 
-static const FieldSchema* find_field_by_name(const std::string& parent_msg_type, const std::string& name) {
+static bool find_field_by_name(const std::string& parent_msg_type,
+                               const std::string& name, FieldSchema& result) {
     // 1. Try av::g_schemas lookup
     auto it_av = av::g_schemas.find(parent_msg_type);
     if (it_av != av::g_schemas.end()) {
         for (const auto& pair : it_av->second.fields) {
             if (pair.second.name == name) {
-                uint32_t tag = pair.first;
-                g_temp_find_field_by_name_result.field_number = tag >> 3;
-                g_temp_find_field_by_name_result.wire_type = static_cast<proto::WireType>(tag & 7);
-                g_temp_find_field_by_name_result.name = pair.second.name;
-                g_temp_find_field_by_name_result.classname = pair.second.class_name;
-                return &g_temp_find_field_by_name_result;
+                const uint32_t tag = pair.first;
+                result.field_number = tag >> 3;
+                result.wire_type = static_cast<proto::WireType>(tag & 7);
+                result.name = pair.second.name;
+                result.classname = pair.second.class_name;
+                return true;
             }
         }
     }
 
     // 2. Try manual schemas lookup
-    init_schemas();
+    const auto& schemas = schema_map();
     auto it = schemas.find(parent_msg_type);
     if (it != schemas.end()) {
         for (const auto& fs : it->second) {
-            if (fs.name == name) return &fs;
+            if (fs.name == name) {
+                result = fs;
+                return true;
+            }
         }
     }
 
-    return nullptr;
+    return false;
 }
 
 const std::vector<std::string>& supported_filetypes() {
@@ -1196,17 +1406,26 @@ static std::string unknown_tag_name(uint32_t field_number, proto::WireType wire_
     return "Tag_" + std::to_string(field_number) + "_" + suffix;
 }
 
-static void decode_message(const std::string& bytes, const std::string& classname, int indent, std::stringstream& out) {
-    std::string tabs(indent * 4, ' ');
-    try {
+// Recursive itself; `depth` is bounded so a crafted file (or a hand-written
+// `Subview { Subview { ... } }` chain) cannot exhaust the thread stack. Every
+// error propagates to decode_protobuf(), which discards the partial document.
+static void decode_message(const std::string& bytes, const std::string& classname,
+                           int indent, int depth, std::stringstream& out) {
+    if (depth > kMaxMessageNesting) {
+        throw std::runtime_error("message nesting exceeds " +
+                                 std::to_string(kMaxMessageNesting) + " levels");
+    }
+    const std::string tabs(indent * 4, ' ');
+    {
         proto::Reader reader(bytes);
         proto::Field f;
         bool preserve_compile = false;
+        bool program_has_source = false;
         std::string preserved_degrees;
         while (reader.read_field(f)) {
             // FileRift preservation records live outside the game schemas.
             if (f.field_number == 513 && f.wire_type == proto::WIRE_LEN) {
-                out << tabs << f.bytes_val << "\n";
+                out << tabs << sanitize_comment_line(f.bytes_val) << "\n";
                 continue;
             }
             if (f.field_number == 514 && f.wire_type == proto::WIRE_VARINT) {
@@ -1218,12 +1437,13 @@ static void decode_message(const std::string& bytes, const std::string& classnam
                 continue;
             }
 
-            const FieldSchema* fs = find_field(classname, f.field_number);
+            FieldSchema schema{};
+            const bool known = find_field(classname, f.field_number, schema);
             std::string tagname;
             std::string sub_classname;
-            if (fs) {
-                tagname = fs->name;
-                sub_classname = fs->classname;
+            if (known) {
+                tagname = schema.name;
+                sub_classname = schema.classname;
             } else {
                 tagname = unknown_tag_name(f.field_number, f.wire_type);
             }
@@ -1233,7 +1453,7 @@ static void decode_message(const std::string& bytes, const std::string& classnam
             if (f.wire_type == proto::WIRE_LEN) {
                 if (!sub_classname.empty()) {
                     out << "{\n";
-                    decode_message(f.bytes_val, sub_classname, indent + 1, out);
+                    decode_message(f.bytes_val, sub_classname, indent + 1, depth + 1, out);
                     out << tabs << "}\n";
                 } else if (preserve_compile) {
                     out << " : @compile\n";
@@ -1241,6 +1461,17 @@ static void decode_message(const std::string& bytes, const std::string& classnam
                     std::string body = f.bytes_val;
                     if (!body.empty() && body.front() == '\n') body.erase(body.begin());
                     out << " : $\n" << body << "\n$end\n";
+                    if (classname == "Program") program_has_source = true;
+                } else if (classname == "Program" && tagname == "Bytes" && program_has_source) {
+                    // Swordigo stores every Program chunk twice — plaintext
+                    // source (field 1) and Lua 5.1 bytecode (field 2) — and the
+                    // shipped engine ignores field 1 entirely, executing only
+                    // field 2. When the source is present, emit the bytecode
+                    // field as `@compile` so a save regenerates it from the
+                    // (possibly edited) source; otherwise every edit through
+                    // this editor would be dead at runtime. Bytecode-only
+                    // Programs (no source) keep the escaped-blob passthrough.
+                    out << " : @compile\n";
                 } else {
                     out << " : " << escape_bytes(f.bytes_val) << "\n";
                 }
@@ -1256,18 +1487,41 @@ static void decode_message(const std::string& bytes, const std::string& classnam
             preserve_compile = false;
             preserved_degrees.clear();
         }
-    } catch (const std::exception& e) {
-        out << tabs << "# [Decode Error: " << e.what() << "]\n";
     }
 }
 
-std::string decode_protobuf(const std::string& bytes, const std::string& filetype) {
+std::string decode_protobuf(const std::string& bytes, const std::string& filetype,
+                            std::string* error) {
+    if (error) error->clear();
+
     const std::string norm = normalize_filetype(filetype);
-    const std::string root_class = root_class_for_filetype(norm);
+    auto fail = [&](const std::string& message) -> std::string {
+        // Passing `error` opts into a status code; without it the historical
+        // throwing behaviour is kept, so no existing caller (which relied on
+        // catching to avoid writing an empty document) silently continues with
+        // an empty markup string.
+        if (error) {
+            *error = message;
+            return "";
+        }
+        throw std::runtime_error(message);
+    };
+
+    if (!is_supported_filetype(norm)) return fail("unsupported FileRift file type: " + filetype);
+
+    // Decode into a private buffer. Emitting straight into the returned string
+    // used to leave half a document (plus an inline "# [Decode Error]" marker)
+    // that an editor could save back over the original file; now a failed
+    // decode yields nothing at all.
+    std::stringstream body;
+    try {
+        decode_message(bytes, root_class_for_filetype(norm), 0, 0, body);
+    } catch (const std::exception& e) {
+        return fail(e.what());
+    }
 
     std::stringstream out;
-    out << "## FileRift decoded Swordigo file type: " << norm << "\n\n";
-    decode_message(bytes, root_class, 0, out);
+    out << "## FileRift decoded Swordigo file type: " << norm << "\n\n" << body.str();
     return out.str();
 }
 
@@ -1457,8 +1711,44 @@ static uint64_t parse_integer(const MarkupToken& token) {
     throw std::runtime_error("FileRift line " + std::to_string(token.line) + ": integer out of range");
 }
 
-static std::string recode_message(const std::vector<MarkupToken>& tokens, size_t& idx, const std::string& classname, std::string& last_chunk) {
+static std::string recode_message(const std::vector<MarkupToken>& tokens, size_t& idx,
+                                  const std::string& classname, int depth) {
+    if (depth > kMaxMessageNesting) {
+        throw std::runtime_error("FileRift: message nesting exceeds " +
+                                 std::to_string(kMaxMessageNesting) + " levels");
+    }
+
     proto::Writer writer;
+    const bool is_program = (classname == "Program");
+    // Most recent `$...$end` chunk in THIS message. It used to be shared with
+    // every nested message, so an @compile inside one Program could silently
+    // compile the source of a sibling or child message instead of its own.
+    std::string last_chunk;
+    // Program source (field 1) that has no bytecode (field 2) behind it yet.
+    std::string pending_source;
+    bool program_bytecode_written = false;
+
+    // The shipped engine ignores Program field 1 and executes only field 2, so
+    // every Program that carries source must also carry bytecode. When the
+    // markup has no explicit `@compile`, the source is compiled as the message
+    // closes — this is the "keep both formats" rule, and it repairs files
+    // whose bytecode was never written (or was dropped by an older port).
+    auto flush_program_bytecode = [&](size_t error_line) {
+        if (!is_program || pending_source.empty() || program_bytecode_written) return;
+        std::string compile_error;
+        const std::string bytecode =
+            compile_lua_to_bytecode(pending_source, "program", &compile_error);
+        if (bytecode.empty()) {
+            throw std::runtime_error("FileRift line " + std::to_string(error_line) +
+                ": Lua compilation failed: " +
+                (compile_error.empty() ? std::string("unknown error") : compile_error));
+        }
+        // Same record the explicit `@compile` path writes, so an auto-paired
+        // Program is byte-identical to a hand-annotated one.
+        writer.write_varint_field(514, 0);
+        writer.write_bytes_field(2, bytecode);
+        program_bytecode_written = true;
+    };
 
     while (idx < tokens.size()) {
         const MarkupToken tag_token = tokens[idx];
@@ -1491,11 +1781,11 @@ static std::string recode_message(const std::vector<MarkupToken>& tokens, size_t
         std::string sub_classname;
 
         if (!parse_unknown_tag(tagname, f_num, w_type)) {
-            const FieldSchema* fs = find_field_by_name(classname, tagname);
-            if (fs) {
-                f_num = fs->field_number;
-                w_type = fs->wire_type;
-                sub_classname = fs->classname;
+            FieldSchema schema{};
+            if (find_field_by_name(classname, tagname, schema)) {
+                f_num = schema.field_number;
+                w_type = schema.wire_type;
+                sub_classname = schema.classname;
             }
         }
         if (f_num == 0)
@@ -1505,7 +1795,7 @@ static std::string recode_message(const std::vector<MarkupToken>& tokens, size_t
             if (w_type != proto::WIRE_LEN || sub_classname.empty())
                 throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": tag '" + tagname + "' is not a message");
             idx++; // skip '{'
-            std::string sub_bytes = recode_message(tokens, idx, sub_classname, last_chunk);
+            std::string sub_bytes = recode_message(tokens, idx, sub_classname, depth + 1);
             if (idx < tokens.size() && tokens[idx].text == "}") {
                 idx++; // skip '}'
             } else throw std::runtime_error("FileRift line " + std::to_string(tag_token.line) + ": missing closing brace for " + tagname);
@@ -1547,6 +1837,10 @@ static std::string recode_message(const std::vector<MarkupToken>& tokens, size_t
             } else {
                 writer.write_bytes_field(f_num, unescaped);
             }
+            if (is_program) {
+                if (f_num == 1 && w_type == proto::WIRE_LEN) pending_source = unescaped;
+                else if (f_num == 2 && w_type == proto::WIRE_LEN) program_bytecode_written = true;
+            }
             idx++;
         } else if (val_tok == "$") {
             if (w_type != proto::WIRE_LEN)
@@ -1565,16 +1859,31 @@ static std::string recode_message(const std::vector<MarkupToken>& tokens, size_t
             if (!last_chunk.empty() && last_chunk.back() == '\n')
                 last_chunk.pop_back();
             writer.write_bytes_field(f_num, last_chunk);
+            if (is_program) {
+                if (f_num == 1) pending_source = last_chunk;
+                else if (f_num == 2) program_bytecode_written = true;
+            }
         } else if (val_tok == "@compile" || val_tok == "@comp") {
             if (w_type != proto::WIRE_LEN)
                 throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": @compile requires a bytes field");
-            if (last_chunk.empty())
-                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": @compile has no preceding Lua chunk");
-            const std::string bytecode = compile_lua_to_bytecode(last_chunk);
+            // Compile the source of THIS message: the most recent $ chunk, or
+            // the string form of field 1 when the author used quotes.
+            const std::string& source = !last_chunk.empty() ? last_chunk : pending_source;
+            if (source.empty()) {
+                // An empty program has nothing to compile. Skipping keeps an
+                // empty `Program {}` (or source-less legacy markup) writable.
+                ++idx;
+                continue;
+            }
+            std::string compile_error;
+            const std::string bytecode = compile_lua_to_bytecode(source, "program", &compile_error);
             if (bytecode.empty())
-                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) + ": Lua compilation failed");
+                throw std::runtime_error("FileRift line " + std::to_string(val_token.line) +
+                    ": Lua compilation failed: " +
+                    (compile_error.empty() ? std::string("unknown error") : compile_error));
             writer.write_varint_field(514, 0);
             writer.write_bytes_field(f_num, bytecode);
+            if (f_num == 2) program_bytecode_written = true;
             ++idx;
         } else {
             const bool degrees = !val_tok.empty() && val_tok.back() == 'd' &&
@@ -1593,7 +1902,11 @@ static std::string recode_message(const std::vector<MarkupToken>& tokens, size_t
             idx++;
         }
     }
-    
+
+    const size_t end_line = tokens.empty() ? 1
+        : (idx < tokens.size() ? tokens[idx].line : tokens.back().line);
+    flush_program_bytecode(end_line);
+
     return writer.to_string();
 }
 
@@ -1606,40 +1919,53 @@ std::string recode_markup(const std::string& text, const std::string& filetype) 
     const std::string root_class = root_class_for_filetype(actual_filetype);
     const std::vector<MarkupToken> tokens = lex(text);
     size_t idx = 0;
-    std::string last_chunk;
-    const std::string result = recode_message(tokens, idx, root_class, last_chunk);
+    const std::string result = recode_message(tokens, idx, root_class, 0);
     if (idx < tokens.size() && tokens[idx].text == "}")
         throw std::runtime_error("FileRift line " + std::to_string(tokens[idx].line) + ": unmatched closing brace");
     return result;
 }
 
-std::string extract_lua_generic(const std::string& bytes) {
-    if (bytes.size() >= 4 && bytes[0] == '\x1b' && bytes[1] == 'L' && bytes[2] == 'u' && bytes[3] == 'a') {
-        return bytes;
+static std::string extract_lua_at_depth(const std::string& bytes, int depth) {
+    if (depth > kMaxLuaSearchDepth) return "";
+    if (looks_like_lua51_bytecode(bytes)) {
+        // Only hand back a chunk the engine could actually undump; a foreign
+        // header used to be exported as if it were runnable Lua.
+        if (lua51_header_problem(bytes).empty()) return bytes;
+        return "";
     }
-    
+
     try {
         proto::Reader reader(bytes);
         proto::Field f;
         while (reader.read_field(f)) {
             if (f.wire_type == proto::WIRE_LEN) {
-                if (f.bytes_val.size() >= 4 && f.bytes_val[0] == '\x1b' && f.bytes_val[1] == 'L' && f.bytes_val[2] == 'u' && f.bytes_val[3] == 'a') {
-                    return f.bytes_val;
+                if (looks_like_lua51_bytecode(f.bytes_val)) {
+                    if (lua51_header_problem(f.bytes_val).empty()) return f.bytes_val;
+                    continue;
                 }
-                if (f.bytes_val.find("function ") != std::string::npos || 
+                if (f.bytes_val.find("function ") != std::string::npos ||
                     f.bytes_val.find("local ") != std::string::npos ||
                     f.bytes_val.find("end") != std::string::npos ||
                     f.bytes_val.find("--") != std::string::npos) {
                     return f.bytes_val;
                 }
-                
-                std::string res = extract_lua_generic(f.bytes_val);
+
+                std::string res = extract_lua_at_depth(f.bytes_val, depth + 1);
                 if (!res.empty()) return res;
             }
         }
     } catch (...) {}
-    
+
     return "";
+}
+
+std::string extract_lua_generic(const std::string& bytes) {
+    return extract_lua_at_depth(bytes, 0);
+}
+
+std::string lua_bytecode_problem(const std::string& chunk) {
+    if (!looks_like_lua51_bytecode(chunk)) return "not a Lua bytecode chunk";
+    return lua51_header_problem(chunk);
 }
 
 } // namespace filerift

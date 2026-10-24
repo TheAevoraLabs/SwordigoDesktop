@@ -852,7 +852,11 @@ public class RubyActivity extends QtActivity {
     }
 
     public static void launchGameActivity(String resourceDir) {
-        launchGameActivity(resourceDir, null);
+        launchGameActivity(resourceDir, null, null);
+    }
+
+    public static void launchGameActivity(String resourceDir, String bootScene) {
+        launchGameActivity(resourceDir, bootScene, null);
     }
 
     /**
@@ -860,8 +864,10 @@ public class RubyActivity extends QtActivity {
      * main menu and boots straight into {@code <bootScene>.scene} using its built-in test
      * profile ("testplayer") — the scene name must be a basename WITHOUT the .scene
      * extension, and it must resolve inside {@code resourceDir}.
+     * When {@code runtimePlugin} is non-null ("luajit", "swdbg"), extracts and loads the
+     * selected mod plugin.
      */
-    public static void launchGameActivity(String resourceDir, String bootScene) {
+    public static void launchGameActivity(String resourceDir, String bootScene, String runtimePlugin) {
         if (sInstance == null) return;
         sInstance.runOnUiThread(() -> {
             try {
@@ -869,6 +875,9 @@ public class RubyActivity extends QtActivity {
                 intent.putExtra("resource_dir", resourceDir);
                 if (bootScene != null && !bootScene.isEmpty()) {
                     intent.putExtra("boot_scene", bootScene);
+                }
+                if (runtimePlugin != null && !runtimePlugin.isEmpty()) {
+                    intent.putExtra("runtime_plugin", runtimePlugin);
                 }
                 sInstance.startActivity(intent);
             } catch (Exception e) {

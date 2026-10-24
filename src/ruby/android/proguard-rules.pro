@@ -68,6 +68,7 @@
 # string (scene_orientation.cpp, the GlossHook runner). Keep wholesale — it is
 # only 87 classes, so there is nothing to win by being clever here.
 -keep class in.aevora.ruby.** { *; }
+-keep class net.kiwi.** { *; }
 -keep class com.openswordigo.** { *; }
 -keep class com.L.SwordigoRuntime.** { *; }
 -keep class com.touchfoo.** { *; }

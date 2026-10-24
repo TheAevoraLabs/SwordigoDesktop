@@ -48,6 +48,7 @@ class RubySettingsBridge : public QObject {
     // and "zypher"; the default is "zypher" (Gen 3).
     Q_PROPERTY(QString groundGenerator READ groundGenerator WRITE setGroundGenerator
                    NOTIFY groundGeneratorChanged)
+    Q_PROPERTY(QString runtimePlugin READ runtimePlugin WRITE setRuntimePlugin NOTIFY runtimePluginChanged)
     Q_PROPERTY(QString themeId READ themeId WRITE setThemeId NOTIFY themeIdChanged)
     Q_PROPERTY(int nameDatabaseCount READ nameDatabaseCount CONSTANT)
     Q_PROPERTY(QString appName READ appName CONSTANT)
@@ -108,6 +109,9 @@ public:
     QString groundGenerator() const;
     void setGroundGenerator(const QString& id);
 
+    QString runtimePlugin() const;
+    void setRuntimePlugin(const QString& id);
+
     QString themeId() const;
     void setThemeId(const QString& id);
 
@@ -116,7 +120,7 @@ public:
 #ifdef RUBY_BUILD_VERSION
     QString appVersion() const { return QStringLiteral(RUBY_BUILD_VERSION); }
 #else
-    QString appVersion() const { return QStringLiteral("v1.4.5 (Ruby Mobile)"); }
+    QString appVersion() const { return QStringLiteral("v1.4.5b (Ruby Mobile)"); }
 #endif
 
     QString copyrightHolder() const { return QStringLiteral("MrSinup"); }
@@ -159,6 +163,7 @@ signals:
     void hapticsEnabledChanged(bool val);
     void holdToSelectChanged(bool val);
     void groundGeneratorChanged(const QString& id);
+    void runtimePluginChanged(const QString& id);
     void themeIdChanged(const QString& id);
     void customMeshPresetsChanged();
 };

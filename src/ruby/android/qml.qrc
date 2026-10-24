@@ -72,5 +72,7 @@
         <file>qml/components/MeshStyleBar.qml</file>
         <file>qml/components/BubbleStepper.qml</file>
         <file>qml/components/WaterMeshStudioPanel.qml</file>
+        <file>qml/components/ProjectWorkcenter.qml</file>
+        <file>qml/components/NewProjectDialog.qml</file>
     </qresource>
 </RCC>

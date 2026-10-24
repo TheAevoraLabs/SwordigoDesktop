@@ -429,7 +429,88 @@ Item {
                 }
             }
 
-            // ── 5. Workspace & Storage ──────────────────────────────────────
+            // ── 5. Runtime Plugins (Mod Loader) ─────────────────────────────
+            SectionCard {
+                width: parent.width
+                label: qsTr("Runtime Plugins (Mod Loader)")
+                accentIcon: "chip"
+
+                SettingRow {
+                    title: qsTr("Active Game Plugin")
+                    description: qsTr("Select runtime mod library loaded into the engine")
+                    leadingIcon: "terminal"
+                    choiceOptions: [
+                        { value: "none", label: qsTr("Vanilla (Off)") },
+                        { value: "luajit", label: qsTr("LuaJIT CLI") },
+                        { value: "swdbg", label: qsTr("SwDbg") }
+                    ]
+                    choiceValue: (typeof rubySettings !== "undefined" && rubySettings)
+                                 ? rubySettings.runtimePlugin : "none"
+                    onChoiceSelected: (value) => {
+                        if (typeof rubySettings !== "undefined" && rubySettings) {
+                            rubySettings.runtimePlugin = value
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: parent.width
+                    implicitHeight: pluginInfoCol.implicitHeight + Theme.dp(Theme.spacingMd) * 2
+                    radius: Theme.radiusSm
+                    color: Theme.surface2
+                    border.width: 1
+                    border.color: Theme.borderSubtle
+
+                    Column {
+                        id: pluginInfoCol
+                        anchors.fill: parent
+                        anchors.margins: Theme.dp(Theme.spacingMd)
+                        spacing: Theme.dp(Theme.spacingXs)
+
+                        Row {
+                            spacing: Theme.dp(Theme.spacingSm)
+                            Icon {
+                                name: ((typeof rubySettings !== "undefined" && rubySettings ? rubySettings.runtimePlugin : "none") === "none") ? "check" : "terminal"
+                                size: Theme.dp(16)
+                                color: Theme.accentInk
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                            Text {
+                                text: {
+                                    var p = (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.runtimePlugin : "none"
+                                    if (p === "luajit") return qsTr("LuaJIT CLI v0.60 (SRE13 Developer Console)")
+                                    if (p === "swdbg") return qsTr("SwDbg v0.8.0 (Live Debug Overlay & Telemetry)")
+                                    return qsTr("Vanilla Engine (Default)")
+                                }
+                                font.pixelSize: Theme.dp(Theme.fontSm)
+                                font.weight: Font.DemiBold
+                                color: Theme.textPrimary
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                        }
+
+                        Text {
+                            width: parent.width
+                            wrapMode: Text.WordWrap
+                            font.pixelSize: Theme.dp(Theme.fontXs)
+                            lineHeight: 1.25
+                            color: Theme.textSecondary
+                            text: {
+                                var p = (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.runtimePlugin : "none"
+                                if (p === "luajit") {
+                                    return qsTr("Replaces Swordigo's built-in Lua 5.1 with pure ARM64 LuaJIT 2.1 across the entire game engine. Adds an interactive SRE13 developer terminal overlay (>_ CLI) with live memory object tracking, FFI structs, and a background TCP Telnet console server on port 1337.")
+                                }
+                                if (p === "swdbg") {
+                                    return qsTr("Native developer debug overlay and mod menu. Features egui-rendered tabs, real-time FPS/frametime telemetry, hero HP/mana manipulation, game speed toggles, in-process log buffer capture, and OpenGL ES fixed-function rendering.")
+                                }
+                                return qsTr("No mod library is injected into the game process. Swordigo runs purely vanilla with standard Lua 5.1 and official game state.")
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── 6. Workspace & Storage ──────────────────────────────────────
             SectionCard {
                 width: parent.width
                 label: qsTr("Workspace & Storage")
@@ -541,7 +622,7 @@ Item {
 
                         Text {
                             text: (typeof rubySettings !== "undefined" && rubySettings)
-                                  ? (rubySettings.appVersion + " • Qt 6.6.3 Android C++20") : "v1.4.5"
+                                  ? (rubySettings.appVersion + " • Qt 6.6.3 Android C++20") : "v1.4.5b"
                             font.pixelSize: Theme.dp(11)
                             font.family: Theme.monoFamily
                             color: Theme.textMuted

@@ -62,6 +62,10 @@ public:
         uint64_t tag = read_varint();
         f.wire_type = static_cast<WireType>(tag & 0x07);
         f.field_number = static_cast<uint32_t>(tag >> 3);
+        // Field number 0 is not a legal protobuf tag. Treating it as data used
+        // to let a corrupt payload decode as a stream of unknown fields.
+        if (f.field_number == 0)
+            throw std::runtime_error("Protobuf: field number 0");
         f.varint_val = 0;
         f.double_val = 0;
         f.float_val = 0;
@@ -79,9 +83,9 @@ public:
                 break;
             case WIRE_LEN: {
                 uint64_t length = read_varint();
-                if (pos_ + length > len_) 
+                if (length > len_ - pos_)
                     throw std::runtime_error("Protobuf: length exceeds buffer");
-                f.bytes_val.assign((const char*)(data_ + pos_), length);
+                f.bytes_val.assign((const char*)(data_ + pos_), static_cast<size_t>(length));
                 pos_ += length;
                 break;
             }
@@ -122,11 +126,13 @@ private:
         while (pos_ < len_) {
             uint8_t b = data_[pos_++];
             value |= (uint64_t)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0) break;
+            if ((b & 0x80) == 0) return value;
             shift += 7;
             if (shift > 63) throw std::runtime_error("Protobuf: varint too long");
         }
-        return value;
+        // A payload ending in a continuation byte used to return the partial
+        // value silently, shifting every following field by one byte.
+        throw std::runtime_error("Protobuf: truncated varint");
     }
 
     double read_double() {

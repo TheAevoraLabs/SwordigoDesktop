@@ -155,6 +155,23 @@ size_t luaC_separateudata (lua_State *L, int all) {
 }
 
 
+/*
+** Does the string hold the given character? Scans the *stored length*, never a
+** libc string call: a Lua string's payload sits right after the TString header,
+** so fortified strchr()/memchr() see `(ts)+1` as a 0-byte object and abort with
+** "FORTIFY: strchr: prevented read past end of buffer" on Android (clang +
+** _FORTIFY_SOURCE). That fired deterministically the first time a GC step
+** walked a table with a weak `__mode` metatable - which luaL_openlibs() creates
+** in the base library - taking down every Lua compile on the save path.
+*/
+static int stringhaschar (const char *s, size_t l, int c) {
+  while (l-- > 0) {
+    if (cast_byte(*s++) == cast_byte(c)) return 1;
+  }
+  return 0;
+}
+
+
 static int traversetable (global_State *g, Table *h) {
   int i;
   int weakkey = 0;
@@ -164,8 +181,8 @@ static int traversetable (global_State *g, Table *h) {
     markobject(g, h->metatable);
   mode = gfasttm(g, h->metatable, TM_MODE);
   if (mode && ttisstring(mode)) {  /* is there a weak mode? */
-    weakkey = (strchr(svalue(mode), 'k') != NULL);
-    weakvalue = (strchr(svalue(mode), 'v') != NULL);
+    weakkey = (stringhaschar(svalue(mode), tsvalue(mode)->len, 'k'));
+    weakvalue = (stringhaschar(svalue(mode), tsvalue(mode)->len, 'v'));
     if (weakkey || weakvalue) {  /* is really weak? */
       h->marked &= ~(KEYWEAK | VALUEWEAK);  /* clear bits */
       h->marked |= cast_byte((weakkey << KEYWEAKBIT) |

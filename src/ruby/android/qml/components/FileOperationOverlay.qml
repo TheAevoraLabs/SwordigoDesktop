@@ -10,6 +10,11 @@ import ".."
 // progress card with a cancel button, a collision prompt that pauses the
 // worker, and a transient result banner. Modelled on KIO's job progress +
 // overwrite dialog that Index FM gets from MauiKit.
+//
+// Every card uses FIXED heights and plain Rows/Columns. Deriving a card's
+// height from ColumnLayout.implicitHeight while the layout fills the card is a
+// QML binding loop (and a 100% Qt thread spin) on Qt 6.6, so the metrics below
+// are explicit numbers.
 Item {
     id: root
     anchors.fill: parent
@@ -27,6 +32,7 @@ Item {
 
     // ── Scrim ──────────────────────────────────────────────────────────────
     Rectangle {
+        id: scrim
         anchors.fill: parent
         visible: root.busy || root.conflict
         color: "#B3000000"
@@ -46,26 +52,31 @@ Item {
         anchors.bottom: parent.bottom
         anchors.bottomMargin: Theme.dp(24) + root.safeBottom
         width: parent.width - Theme.dp(Theme.paddingScreen * 2)
-        height: progressColumn.implicitHeight + Theme.dp(Theme.spacingLg * 2)
+        height: progressColumn.height + Theme.dp(Theme.spacingLg * 2)
         radius: Theme.radiusLg
         color: Theme.surface1
         border.color: Theme.border
         border.width: 1
 
-        ColumnLayout {
+        Column {
             id: progressColumn
-            anchors.fill: parent
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
             anchors.margins: Theme.dp(Theme.spacingLg)
+            height: Theme.dp(112)
             spacing: Theme.dp(Theme.spacingMd)
 
-            RowLayout {
-                Layout.fillWidth: true
+            Row {
+                id: progressHeader
+                width: parent.width
+                height: Theme.dp(36)
                 spacing: Theme.dp(Theme.spacingMd)
 
                 Rectangle {
-                    Layout.alignment: Qt.AlignVCenter
+                    anchors.verticalCenter: parent.verticalCenter
                     width: Theme.dp(36)
-                    height: width
+                    height: Theme.dp(36)
                     radius: Theme.radiusMd
                     color: Theme.alpha(Theme.accentInk, 0.14)
                     border.color: Theme.alpha(Theme.accentInk, 0.28)
@@ -79,33 +90,38 @@ Item {
                     }
                 }
 
-                ColumnLayout {
-                    Layout.fillWidth: true
+                Column {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: progressHeader.width - Theme.dp(36) - Theme.dp(32)
+                            - Theme.dp(Theme.spacingMd)
                     spacing: Theme.dp(2)
 
                     Text {
-                        Layout.fillWidth: true
+                        width: parent.width
                         text: (typeof rubyFileModel !== "undefined" && rubyFileModel)
                               ? rubyFileModel.operationTitle : ""
                         font.pixelSize: Theme.dp(Theme.fontLg)
                         font.weight: Font.DemiBold
                         color: Theme.textPrimary
                         elide: Text.ElideRight
+                        height: Theme.dp(18)
                     }
 
                     Text {
-                        Layout.fillWidth: true
+                        width: parent.width
                         text: (typeof rubyFileModel !== "undefined" && rubyFileModel)
                               ? rubyFileModel.operationDetail : ""
                         font.pixelSize: Theme.dp(Theme.fontSm)
                         color: Theme.textMuted
                         elide: Text.ElideMiddle
+                        height: visible ? Theme.dp(15) : 0
                         visible: text.length > 0
                     }
                 }
 
                 IconButton {
-                    Layout.alignment: Qt.AlignVCenter
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.right: parent.right
                     iconName: "close"
                     iconSize: Theme.dp(16)
                     buttonSize: Theme.dp(32)
@@ -115,12 +131,13 @@ Item {
 
             Rectangle {
                 id: progressTrack
-                Layout.fillWidth: true
-                Layout.preferredHeight: Theme.dp(6)
+                width: progressColumn.width
+                height: Theme.dp(6)
                 radius: height / 2
                 color: Theme.surface3
 
                 Rectangle {
+                    id: progressFill
                     visible: (typeof rubyFileModel !== "undefined" && rubyFileModel)
                              && rubyFileModel.operationProgress >= 0
                     width: Math.max(0, Math.min(1,
@@ -137,6 +154,7 @@ Item {
 
                 // Indeterminate shimmer while the worker is still planning.
                 Rectangle {
+                    id: progressSweep
                     visible: (typeof rubyFileModel !== "undefined" && rubyFileModel)
                              && rubyFileModel.operationProgress < 0
                     width: progressTrack.width * 0.3
@@ -146,7 +164,7 @@ Item {
                     opacity: 0.85
 
                     SequentialAnimation on x {
-                        running: visible
+                        running: progressSweep.visible
                         loops: Animation.Infinite
                         NumberAnimation {
                             from: 0
@@ -164,24 +182,23 @@ Item {
                 }
             }
 
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: Theme.dp(Theme.spacingSm)
+            Row {
+                width: progressColumn.width
+                height: Theme.dp(14)
 
                 Text {
-                    text: (typeof rubyFileModel !== "undefined" && rubyFileModel)
-                          ? rubyFileModel.operationItemsStr : ""
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: {
+                        if (typeof rubyFileModel === "undefined" || !rubyFileModel) return ""
+                        var items = rubyFileModel.operationItemsStr
+                        var bytes = rubyFileModel.operationBytesStr
+                        if (items.length > 0 && bytes.length > 0) return items + "  ·  " + bytes
+                        return items.length > 0 ? items : bytes
+                    }
                     font.pixelSize: Theme.dp(Theme.fontXs)
                     color: Theme.textSecondary
-                }
-
-                Item { Layout.fillWidth: true }
-
-                Text {
-                    text: (typeof rubyFileModel !== "undefined" && rubyFileModel)
-                          ? rubyFileModel.operationBytesStr : ""
-                    font.pixelSize: Theme.dp(Theme.fontXs)
-                    color: Theme.textMuted
+                    elide: Text.ElideRight
+                    width: parent.width
                 }
             }
         }
@@ -193,26 +210,33 @@ Item {
         visible: root.conflict
         anchors.centerIn: parent
         width: parent.width - Theme.dp(Theme.paddingScreen * 2)
-        height: conflictColumn.implicitHeight + Theme.dp(Theme.spacingLg * 2)
+        height: conflictColumn.height + Theme.dp(Theme.spacingLg * 2)
         radius: Theme.radiusSheet
         color: Theme.surface1
         border.color: Theme.border
         border.width: 1
 
-        ColumnLayout {
+        Column {
             id: conflictColumn
-            anchors.fill: parent
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
             anchors.margins: Theme.dp(Theme.spacingLg)
+            height: Theme.dp(76) + Theme.dp(Theme.spacingSm)
+                    + 4 * Theme.dp(48) + 2 * Theme.dp(Theme.spacingSm)
+                    + Theme.dp(Theme.spacingXs) + Theme.dp(40)
             spacing: Theme.dp(Theme.spacingSm)
 
-            RowLayout {
-                Layout.fillWidth: true
+            Row {
+                id: conflictHeader
+                width: conflictColumn.width
+                height: Theme.dp(76)
                 spacing: Theme.dp(Theme.spacingMd)
 
                 Rectangle {
-                    Layout.alignment: Qt.AlignTop
+                    anchors.top: parent.top
                     width: Theme.dp(36)
-                    height: width
+                    height: Theme.dp(36)
                     radius: Theme.radiusMd
                     color: Theme.alpha(Theme.colorWarning, 0.18)
                     border.color: Theme.alpha(Theme.colorWarning, 0.4)
@@ -226,37 +250,38 @@ Item {
                     }
                 }
 
-                ColumnLayout {
-                    Layout.fillWidth: true
-                    spacing: Theme.dp(2)
+                Column {
+                    width: conflictHeader.width - Theme.dp(36) - Theme.dp(Theme.spacingMd)
+                    spacing: Theme.dp(4)
 
                     Text {
-                        Layout.fillWidth: true
+                        width: parent.width
                         text: qsTr("“%1” already exists").arg(
                                   (typeof rubyFileModel !== "undefined" && rubyFileModel)
                                   ? rubyFileModel.conflictTargetName : "")
                         font.pixelSize: Theme.dp(Theme.fontLg)
                         font.weight: Font.DemiBold
                         color: Theme.textPrimary
-                        wrapMode: Text.WordWrap
+                        elide: Text.ElideRight
+                        height: Theme.dp(18)
                     }
 
                     Text {
-                        Layout.fillWidth: true
-                        text: qsTr("Choose what to do with the existing item in %1.")
+                        width: parent.width
+                        text: qsTr("In %1. Choose what to do with the existing item.")
                               .arg((typeof rubyFileModel !== "undefined" && rubyFileModel)
                                    ? rubyFileModel.conflictTargetDir : "")
                         font.pixelSize: Theme.dp(Theme.fontSm)
                         color: Theme.textMuted
-                        wrapMode: Text.WordWrap
+                        elide: Text.ElideMiddle
+                        height: Theme.dp(15)
                     }
                 }
             }
 
             MenuRow {
-                Layout.fillWidth: true
-                Layout.preferredHeight: Theme.dp(48)
-                Layout.topMargin: Theme.dp(Theme.spacingSm)
+                width: conflictColumn.width
+                height: Theme.dp(48)
                 iconName: "refresh"
                 accent: true
                 text: qsTr("Replace the existing item")
@@ -264,24 +289,24 @@ Item {
             }
 
             MenuRow {
-                Layout.fillWidth: true
-                Layout.preferredHeight: Theme.dp(48)
+                width: conflictColumn.width
+                height: Theme.dp(48)
                 iconName: "copy"
                 text: qsTr("Keep both (add “ (1)” to the new name)")
                 onClicked: root.choose(2)
             }
 
             MenuRow {
-                Layout.fillWidth: true
-                Layout.preferredHeight: Theme.dp(48)
+                width: conflictColumn.width
+                height: Theme.dp(48)
                 iconName: "arrow-right"
                 text: qsTr("Skip this item")
                 onClicked: root.choose(1)
             }
 
             MenuRow {
-                Layout.fillWidth: true
-                Layout.preferredHeight: Theme.dp(48)
+                width: conflictColumn.width
+                height: Theme.dp(48)
                 iconName: "close"
                 danger: true
                 text: qsTr("Cancel the whole operation")
@@ -289,20 +314,23 @@ Item {
             }
 
             // Apply-to-all toggle
-            RowLayout {
-                Layout.fillWidth: true
-                Layout.topMargin: Theme.dp(Theme.spacingXs)
+            Row {
+                width: conflictColumn.width
+                height: Theme.dp(40)
+                spacing: Theme.dp(Theme.spacingMd)
 
                 Text {
-                    Layout.fillWidth: true
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - Theme.dp(40) - Theme.dp(Theme.spacingMd)
                     text: qsTr("Remember this choice for the rest of the operation")
                     font.pixelSize: Theme.dp(Theme.fontSm)
                     color: Theme.textSecondary
-                    wrapMode: Text.WordWrap
+                    elide: Text.ElideRight
                 }
 
                 Rectangle {
                     id: applyToggle
+                    anchors.verticalCenter: parent.verticalCenter
                     width: Theme.dp(40)
                     height: Theme.dp(22)
                     radius: height / 2
@@ -314,8 +342,8 @@ Item {
 
                     Rectangle {
                         width: Theme.dp(18)
-                        height: width
-                        radius: width / 2
+                        height: Theme.dp(18)
+                        radius: Theme.dp(9)
                         y: Theme.dp(2)
                         x: root.applyAll ? applyToggle.width - width - Theme.dp(2) : Theme.dp(2)
                         color: root.applyAll ? Theme.onAccent : Theme.textMuted
@@ -337,6 +365,7 @@ Item {
     // ── Result banner ──────────────────────────────────────────────────────
     Rectangle {
         id: resultBanner
+        property string message: ""
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.bottom: parent.bottom
         anchors.bottomMargin: Theme.dp(24) + root.safeBottom
@@ -347,11 +376,9 @@ Item {
         border.color: Theme.borderStrong
         border.width: 1
         opacity: 0
-        visible: opacity > 0
+        visible: opacity > 0.01
 
         Behavior on opacity { NumberAnimation { duration: Theme.durMed } }
-
-        property string message: ""
 
         Text {
             anchors.verticalCenter: parent.verticalCenter

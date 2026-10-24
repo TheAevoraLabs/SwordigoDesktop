@@ -143,12 +143,10 @@ bool MobileCodeEditor::load_file(const QString& file_path) {
     QByteArray bytes = f.readAll();
     f.close();
 
-    // Check if FileRift transcoding is needed for binary .scene/.scl
-    bool is_already_text = bytes.startsWith("## FileRift") ||
-                           bytes.startsWith("syntax =") ||
-                           bytes.startsWith("scl ") ||
-                           bytes.startsWith("scene ") ||
-                           bytes.startsWith("Object{");
+    // Text vs binary is decided by content (valid UTF-8, no NULs), not by a
+    // short prefix list — see filerift::looks_like_markup_text().
+    const std::string raw(bytes.constData(), static_cast<size_t>(bytes.size()));
+    const bool is_already_text = filerift::looks_like_markup_text(raw);
 
     if (is_scl_or_scene) {
         const std::string schema_type = (ext == QStringLiteral("scene")) ? "scene" : "scl";
@@ -156,20 +154,23 @@ bool MobileCodeEditor::load_file(const QString& file_path) {
             m_text_edit->setPlainText(QString::fromUtf8(bytes));
             m_is_filerift_transcoded = true;
         } else {
-            try {
-                std::string decoded_text = filerift::decode_protobuf(std::string(bytes.constData(), bytes.size()), schema_type);
-                if (!decoded_text.empty()) {
-                    m_text_edit->setPlainText(QString::fromStdString(decoded_text));
-                    m_is_filerift_transcoded = true;
-                } else {
-                    m_text_edit->setPlainText(QString::fromUtf8(bytes));
-                    m_is_filerift_transcoded = false;
-                }
-            } catch (...) {
-                m_text_edit->setPlainText(QString::fromUtf8(bytes));
-                m_is_filerift_transcoded = false;
+            // A binary asset that cannot be decoded must not be shown as text:
+            // every NUL becomes U+FFFD and the next save writes that back.
+            std::string decode_error;
+            std::string decoded_text = filerift::decode_protobuf(raw, schema_type, &decode_error);
+            if (decoded_text.empty()) {
+                m_is_loading = false;
+                emit statusMessage(QStringLiteral("Cannot decode %1: %2")
+                    .arg(fi.fileName(), QString::fromStdString(decode_error)));
+                return false;
             }
+            m_text_edit->setPlainText(QString::fromStdString(decoded_text));
+            m_is_filerift_transcoded = true;
         }
+    } else if (!is_already_text) {
+        m_is_loading = false;
+        emit statusMessage(QStringLiteral("%1 is not a text file").arg(fi.fileName()));
+        return false;
     } else {
         m_text_edit->setPlainText(QString::fromUtf8(bytes));
         m_is_filerift_transcoded = false;

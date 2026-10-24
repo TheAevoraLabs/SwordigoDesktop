@@ -3,6 +3,17 @@ import QtQuick.Controls
 import ".."
 import "../components"
 
+// ============================================================================
+// HomeView.qml - Ruby Touch home surface.
+//
+// Two states share this component:
+//   - No active project: the main menu (project onboarding, quick actions,
+//     recent assets, tools and guides).
+//   - Active project: the interactive Project Workcenter.
+//
+// The public contract consumed by Main.qml is unchanged. Everything here is
+// built from the shared Theme tokens and the existing vector Icon set.
+// ============================================================================
 Item {
     id: root
 
@@ -13,164 +24,989 @@ Item {
     signal openSettingsRequested()
     signal newFileWizardRequested()
 
+    readonly property bool hasActiveProject: (typeof rubyProject !== "undefined" && rubyProject && rubyProject.hasActiveProject)
+    readonly property bool creatingProject: (typeof rubyProject !== "undefined" && rubyProject && rubyProject.isCreating)
+
+    readonly property var recentItems: {
+        if (typeof rubyFileModel === "undefined" || !rubyFileModel || !rubyFileModel.recentFiles)
+            return []
+        return rubyFileModel.recentFiles.slice(0, 8)
+    }
+    readonly property int recentCount: recentItems.length
+
+    readonly property var quickActions: [
+        { key: "new",    icon: "plus",   label: qsTr("New") },
+        { key: "files",  icon: "folder", label: qsTr("Files") },
+        { key: "recent", icon: "play",   label: qsTr("Continue") },
+        { key: "tools",  icon: "tune",   label: qsTr("Tools") }
+    ]
+
+    readonly property var projectSteps: [
+        { n: "01", title: qsTr("Author"), body: qsTr("Build scenes, models, textures and scripts under project/.") },
+        { n: "02", title: qsTr("Diff"), body: qsTr("Ruby hashes every asset against the vanilla baseline.") },
+        { n: "03", title: qsTr("Ship"), body: qsTr("Export a Launcher-ready zip with only your changes.") }
+    ]
+
+    readonly property var toolbox: [
+        { key: "converter", icon: "cube",   title: qsTr("POD 2.0"),  body: qsTr("Convert classic Swordigo models"), color: Theme.colorModel },
+        { key: "recoder",   icon: "braces", title: qsTr("FileRift"), body: qsTr("Decompile and rebuild game data"),  color: Theme.colorCode },
+        { key: "ground",    icon: "layers", title: qsTr("Zypher"),   body: qsTr("Sculpt ground meshes"),            color: Theme.colorScene },
+        { key: "audio",     icon: "volume", title: qsTr("Audio Lab"), body: qsTr("Preview music and sound effects"), color: Theme.colorAudio }
+    ]
+
+    property real intro: 0
+
+    NumberAnimation on intro {
+        from: 0
+        to: 1
+        duration: 680
+        easing.type: Easing.OutCubic
+    }
+
+    function haptic(ms) {
+        if (typeof rubySettings !== "undefined" && rubySettings && rubySettings.hapticsEnabled
+                && typeof androidContext !== "undefined" && androidContext
+                && typeof androidContext.vibrate === "function") {
+            androidContext.vibrate(ms || 12)
+        }
+    }
+
+    function sectionOpacity(index) {
+        var value = (root.intro - index * 0.07) / 0.30
+        return 0.05 + 0.95 * Math.max(0, Math.min(1, value))
+    }
+
+    function sectionShift(index) {
+        var value = (root.intro - index * 0.07) / 0.30
+        return (1 - Math.max(0, Math.min(1, value))) * 18
+    }
+
+    function quickTint(key) {
+        switch (key) {
+        case "new":    return Theme.accentInk
+        case "files":  return Theme.colorModel
+        case "recent": return Theme.colorSuccessBright
+        default:       return Theme.colorCode
+        }
+    }
+
+    function runQuickAction(key) {
+        root.haptic()
+        switch (key) {
+        case "new":
+            newProjectDialog.open()
+            break
+        case "recent":
+            root.jumpToRecents()
+            break
+        case "tools":
+            root.openToolsRequested("")
+            break
+        default:
+            root.openFilesRequested()
+            break
+        }
+    }
+
+    function jumpToRecents() {
+        var target = Math.max(0, homeColumn.y + recentsSection.y - Theme.dp(10))
+        scrollAnim.stop()
+        scrollAnim.from = scroller.contentY
+        scrollAnim.to = target
+        scrollAnim.start()
+    }
+
+    function openTool(item) {
+        root.haptic()
+        if (item.key === "audio") {
+            if (typeof rubyFileModel !== "undefined" && rubyFileModel)
+                rubyFileModel.setCategory("audio")
+            root.openFilesRequested()
+        } else {
+            root.openToolsRequested(item.key)
+        }
+    }
+
     function handleBack() {
         if (guideReader.visible) {
             guideReader.close()
             return true
         }
+        if (recentOptionsSheet.isOpen) {
+            recentOptionsSheet.close()
+            return true
+        }
+        if (newProjectDialog.visible) {
+            newProjectDialog.close()
+            return true
+        }
+        if (root.hasActiveProject && projectWorkcenter.handleBack())
+            return true
         return false
     }
 
+    NumberAnimation {
+        id: scrollAnim
+        target: scroller
+        property: "contentY"
+        duration: 340
+        easing.type: Easing.OutCubic
+    }
+
+    onHasActiveProjectChanged: {
+        // Opening or closing a project replaces the whole surface; start the
+        // new one from the top instead of inheriting the previous scroll.
+        scrollAnim.stop()
+        scroller.contentY = 0
+    }
+
+    NewProjectDialog {
+        id: newProjectDialog
+    }
+
     Flickable {
+        id: scroller
         anchors.fill: parent
-        contentHeight: contentCol.implicitHeight + Theme.dp(40)
+        contentWidth: width
+        contentHeight: (root.hasActiveProject
+                        ? projectWorkcenter.implicitHeight + Theme.dp(24)
+                        : homeColumn.implicitHeight + Theme.dp(28))
         clip: true
         boundsBehavior: Flickable.StopAtBounds
 
-        Column {
-            id: contentCol
+        ProjectWorkcenter {
+            id: projectWorkcenter
             x: Theme.dp(Theme.paddingScreen)
+            y: Theme.dp(Theme.spacingSm)
             width: parent.width - Theme.dp(Theme.paddingScreen) * 2
-            topPadding: Theme.dp(Theme.spacingMd)
-            bottomPadding: Theme.dp(Theme.spacingXl)
-            spacing: Theme.dp(Theme.spacingLg)
+            visible: root.hasActiveProject
+            onOpenFilesRequested: root.openFilesRequested()
+            onExitProjectRequested: {}
+        }
 
-            // ── Tier 1: Local Identity / Workspace Header ───────────────────
-            IdentityHeader {
-                id: identityHeader
+        Column {
+            id: homeColumn
+            x: Theme.dp(Theme.paddingScreen)
+            y: Theme.dp(Theme.spacingSm)
+            width: parent.width - Theme.dp(Theme.paddingScreen) * 2
+            spacing: Theme.dp(Theme.spacingXl)
+            visible: !root.hasActiveProject
+
+            // ── Brand bar ──────────────────────────────────────────────────
+            Item {
+                id: brandBar
                 width: parent.width
-                userName: (typeof rubySettings !== "undefined" && rubySettings) ? rubySettings.userName : "Ruby Dev"
-                avatarImg: (typeof rubySettings !== "undefined" && rubySettings && rubySettings.avatarImage) ? rubySettings.avatarImage : ""
-                workspaceName: {
-                    var count = (typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.recentFiles) ? rubyFileModel.recentFiles.length : 0
-                    if (count > 0) return qsTr("%1 Files").arg(count)
-                    return (typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.folderName && rubyFileModel.folderName.length > 0 && rubyFileModel.folderName !== "0")
-                           ? rubyFileModel.folderName
-                           : qsTr("Local Storage")
+                implicitHeight: Theme.dp(46)
+                opacity: root.sectionOpacity(0)
+                transform: Translate { y: root.sectionShift(0) }
+
+                Row {
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.dp(Theme.spacingMd)
+
+                    Rectangle {
+                        width: Theme.dp(42)
+                        height: Theme.dp(42)
+                        radius: Theme.radiusMd
+                        gradient: Gradient {
+                            GradientStop { position: 0.0; color: Theme.accentStart }
+                            GradientStop { position: 1.0; color: Theme.accentEnd }
+                        }
+
+                        Icon {
+                            anchors.centerIn: parent
+                            name: "gem"
+                            size: Theme.dp(22)
+                            color: Theme.onAccent
+                            weight: 1.7
+                        }
+                    }
+
+                    Column {
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: Theme.dp(1)
+
+                        Text {
+                            text: qsTr("RUBY")
+                            color: Theme.textPrimary
+                            font.pixelSize: Theme.dp(15)
+                            font.weight: Font.Bold
+                            font.letterSpacing: Theme.dp(2.6)
+                        }
+
+                        Text {
+                            text: qsTr("Swordigo Mod Studio")
+                            color: Theme.textMuted
+                            font.pixelSize: Theme.dp(Theme.fontXs)
+                            font.family: Theme.monoFamily
+                        }
+                    }
                 }
-                statusText: qsTr("Local Active")
-                onSearchClicked: root.openFilesRequested()
-                onProfileClicked: root.openSettingsRequested()
+
+                Row {
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Theme.dp(8)
+
+                    IconButton {
+                        iconName: "search"
+                        variant: "plain"
+                        buttonSize: Theme.dp(38)
+                        iconSize: Theme.dp(19)
+                        tint: Theme.textSecondary
+                        onClicked: {
+                            root.haptic()
+                            root.openFilesRequested()
+                        }
+                    }
+
+                    Rectangle {
+                        width: Theme.dp(40)
+                        height: Theme.dp(40)
+                        radius: width / 2
+                        color: Theme.surface2
+                        border.color: Theme.borderSubtle
+                        border.width: 1
+                        clip: true
+
+                        Image {
+                            anchors.fill: parent
+                            anchors.margins: Theme.dp(3)
+                            source: (typeof rubySettings !== "undefined" && rubySettings && rubySettings.avatarImage)
+                                    ? rubySettings.avatarImage : ""
+                            visible: source.toString().length > 0
+                            fillMode: Image.PreserveAspectFit
+                            smooth: true
+                        }
+
+                        Text {
+                            anchors.centerIn: parent
+                            visible: (typeof rubySettings === "undefined" || !rubySettings
+                                      || !rubySettings.avatarImage || rubySettings.avatarImage.length === 0)
+                            text: (typeof rubySettings !== "undefined" && rubySettings && rubySettings.userName.length > 0)
+                                  ? rubySettings.userName.charAt(0).toUpperCase() : "R"
+                            color: Theme.accentInk
+                            font.pixelSize: Theme.dp(15)
+                            font.weight: Font.Bold
+                            font.family: Theme.monoFamily
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                root.haptic()
+                                root.openSettingsRequested()
+                            }
+                        }
+                    }
+                }
             }
 
-            // ── Tier 2: Active Workspace & Session Card (No Marketing Fluff) ─
+            // ── Hero: start a project ──────────────────────────────────────
             Rectangle {
-                id: activeSessionCard
+                id: heroCard
                 width: parent.width
-                implicitHeight: sessionCol.implicitHeight + Theme.dp(Theme.spacingLg) * 2
-                radius: Theme.radiusCard
-                color: Theme.surface1
+                implicitHeight: heroColumn.implicitHeight + Theme.dp(20) * 2
+                radius: Theme.radiusSheet
+                border.color: Theme.alpha(Theme.accentInk, 0.28)
+                border.width: 1
+                clip: true
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: Theme.accentDeep }
+                    GradientStop { position: 0.62; color: Theme.surface1 }
+                    GradientStop { position: 1.0; color: Theme.surface1 }
+                }
+                opacity: root.sectionOpacity(1)
+                transform: Translate { y: root.sectionShift(1) }
 
-                property var latestItem: (typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.recentFiles && rubyFileModel.recentFiles.length > 0)
-                                         ? rubyFileModel.recentFiles[0] : null
-                property string latestPath: (typeof latestItem === "string") ? latestItem : ((latestItem && latestItem.filePath) ? latestItem.filePath : "")
-                property string latestFn: {
-                    if (typeof latestItem === "string") {
-                        var parts = latestPath.split("/")
-                        return parts[parts.length - 1]
-                    }
-                    return (latestItem && latestItem.fileName) ? latestItem.fileName : ""
-                }
-                property string latestSize: (typeof latestItem === "object" && latestItem && latestItem.fileSizeStr) ? latestItem.fileSizeStr : ""
-                property string latestExt: {
-                    var idx = latestFn.lastIndexOf(".")
-                    return idx >= 0 ? latestFn.substring(idx + 1).toLowerCase() : ""
-                }
-                property string eyebrowLabel: {
-                    if (latestPath.length === 0) return qsTr("ACTIVE WORKSPACE")
-                    if (latestExt === "scene" || latestExt === "scl") return qsTr("ACTIVE SCENE")
-                    if (latestExt === "png" || latestExt === "pvr" || latestExt === "ktx" || latestExt === "jpg") return qsTr("ACTIVE TEXTURE")
-                    if (latestExt === "pod" || latestExt === "glb" || latestExt === "fbx" || latestExt === "obj") return qsTr("ACTIVE MODEL")
-                    if (latestExt === "lua" || latestExt === "txt") return qsTr("ACTIVE SCRIPT")
-                    if (latestExt === "zip" || latestExt === "pak") return qsTr("ACTIVE ARCHIVE")
-                    return qsTr("ACTIVE ASSET")
-                }
-                property string buttonLabel: {
-                    if (latestPath.length === 0) return qsTr("Open Workspace")
-                    if (latestExt === "scene" || latestExt === "scl") return qsTr("Resume Scene")
-                    if (latestExt === "pod" || latestExt === "glb") return qsTr("Inspect Model")
-                    if (latestExt === "png" || latestExt === "pvr") return qsTr("View Texture")
-                    if (latestExt === "lua") return qsTr("Edit Script")
-                    return qsTr("Open Asset")
+                Icon {
+                    anchors.right: parent.right
+                    anchors.rightMargin: -Theme.dp(34)
+                    anchors.verticalCenter: parent.verticalCenter
+                    name: "gem"
+                    size: Theme.dp(176)
+                    weight: 1.1
+                    color: Theme.alpha(Theme.onAccent, 0.07)
+                    rotation: 14
                 }
 
                 Column {
-                    id: sessionCol
-                    anchors.fill: parent
-                    anchors.margins: Theme.dp(Theme.spacingLg)
-                    spacing: Theme.dp(6)
+                    id: heroColumn
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Theme.dp(20)
+                    spacing: Theme.dp(10)
 
-                    // Eyebrow Tag
                     Row {
-                        spacing: Theme.dp(6)
-                        Text {
-                            text: activeSessionCard.eyebrowLabel
+                        spacing: Theme.dp(7)
+
+                        Rectangle {
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: Theme.dp(6)
+                            height: Theme.dp(6)
+                            radius: width / 2
                             color: Theme.accentInk
-                            font.pixelSize: Theme.dp(10)
+                        }
+
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: qsTr("RUBY PROJECT SYSTEM")
+                            color: Theme.accentInk
+                            font.pixelSize: Theme.dp(Theme.fontXs)
                             font.weight: Font.Bold
-                            font.letterSpacing: 1.1
+                            font.letterSpacing: Theme.dp(1.3)
                             font.family: Theme.monoFamily
                         }
                     }
 
-                    // Main Asset / Workspace Name
                     Text {
                         width: parent.width
-                        text: activeSessionCard.latestFn.length > 0
-                              ? activeSessionCard.latestFn
-                              : ((typeof rubyFileModel !== "undefined" && rubyFileModel && rubyFileModel.folderName && rubyFileModel.folderName.length > 0 && rubyFileModel.folderName !== "0")
-                                 ? rubyFileModel.folderName : "Swordigo Studio Workspace")
-                        font.pixelSize: Theme.dp(20)
-                        font.weight: Font.Bold
+                        text: qsTr("Build worlds.\nShip them as mods.")
                         color: Theme.textPrimary
-                        elide: Text.ElideRight
+                        font.pixelSize: Theme.dp(25)
+                        font.weight: Font.Bold
+                        lineHeight: 0.94
                     }
 
-                    // Technical Monospace Metadata (Stripped parent directory, elided on left)
                     Text {
                         width: parent.width
-                        text: {
-                            if (activeSessionCard.latestPath.length > 0) {
-                                var rel = activeSessionCard.latestPath
-                                if (rel.indexOf("/storage/emulated/0/") === 0) {
-                                    rel = rel.substring(19)
-                                }
-                                var dirIdx = rel.lastIndexOf("/")
-                                var pDir = dirIdx > 0 ? rel.substring(0, dirIdx) : "Root directory"
-                                return (activeSessionCard.latestSize.length > 0 ? (activeSessionCard.latestSize + "  •  ") : "") + pDir
-                            }
-                            return (typeof rubyFileModel !== "undefined" && rubyFileModel) ? rubyFileModel.currentPath : "/storage/emulated/0"
-                        }
-                        font.pixelSize: Theme.dp(Theme.fontXs)
-                        font.family: Theme.monoFamily
+                        text: qsTr("Author Swordigo assets in an isolated project, diff them against the vanilla baseline, then export a Launcher-ready package.")
                         color: Theme.textSecondary
-                        elide: Text.ElideLeft
+                        font.pixelSize: Theme.dp(12)
+                        lineHeight: 1.25
+                        wrapMode: Text.WordWrap
                     }
 
-                    Item { height: Theme.dp(6); width: 1 }
+                    Item { width: 1; height: Theme.dp(4) }
 
-                    // Action Row (Single clean icon, no double bookended arrows)
                     Row {
-                        spacing: Theme.dp(Theme.spacingMd)
+                        spacing: Theme.dp(10)
 
                         PrimaryButton {
-                            height: Theme.dp(40)
-                            text: activeSessionCard.buttonLabel
-                            iconName: activeSessionCard.latestPath.length > 0 ? "play" : "folder"
+                            height: Theme.dp(44)
+                            text: qsTr("New project")
+                            iconName: "plus"
+                            enabled: !root.creatingProject
                             onClicked: {
-                                if (activeSessionCard.latestPath.length > 0) {
-                                    root.openPathRequested(activeSessionCard.latestPath)
-                                } else {
-                                    root.openFilesRequested()
-                                }
+                                root.haptic()
+                                newProjectDialog.open()
                             }
                         }
 
                         Rectangle {
-                            height: Theme.dp(40)
-                            width: Theme.dp(120)
+                            width: browseLabel.implicitWidth + Theme.dp(32)
+                            height: Theme.dp(44)
                             radius: Theme.radiusSm
-                            color: browseMouse.pressed ? Theme.surface3 : Theme.surface2
+                            color: browseArea.pressed ? Theme.surface3 : Theme.alpha(Theme.surface2, 0.86)
+                            border.color: Theme.borderStrong
+                            border.width: 1
+
+                            Row {
+                                anchors.centerIn: parent
+                                spacing: Theme.dp(7)
+
+                                Icon {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    name: "folder"
+                                    size: Theme.dp(16)
+                                    color: Theme.textPrimary
+                                }
+
+                                Text {
+                                    id: browseLabel
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: qsTr("Browse assets")
+                                    color: Theme.textPrimary
+                                    font.pixelSize: Theme.dp(Theme.fontMd)
+                                    font.weight: Font.DemiBold
+                                }
+                            }
+
+                            MouseArea {
+                                id: browseArea
+                                anchors.fill: parent
+                                onClicked: {
+                                    root.haptic()
+                                    root.openFilesRequested()
+                                }
+                            }
+                        }
+                    }
+
+                    Column {
+                        width: parent.width
+                        spacing: Theme.dp(6)
+                        visible: root.creatingProject
+
+                        Row {
+                            width: parent.width
+
+                            Text {
+                                width: parent.width - progressText.width - Theme.dp(6)
+                                text: (typeof rubyProject !== "undefined" && rubyProject)
+                                      ? rubyProject.creationStatus : qsTr("Creating project...")
+                                color: Theme.accentInk
+                                font.pixelSize: Theme.dp(Theme.fontSm)
+                                elide: Text.ElideRight
+                            }
+
+                            Text {
+                                id: progressText
+                                text: (typeof rubyProject !== "undefined" && rubyProject)
+                                      ? (rubyProject.creationProgress + "%") : "0%"
+                                color: Theme.accentInk
+                                font.pixelSize: Theme.dp(Theme.fontSm)
+                                font.weight: Font.Bold
+                                font.family: Theme.monoFamily
+                            }
+                        }
+
+                        Rectangle {
+                            width: parent.width
+                            height: Theme.dp(4)
+                            radius: height / 2
+                            color: Theme.alpha(Theme.onAccent, 0.14)
+                            clip: true
+
+                            Rectangle {
+                                height: parent.height
+                                radius: parent.radius
+                                color: Theme.accentInk
+                                width: parent.width * (Math.max(3, (typeof rubyProject !== "undefined" && rubyProject)
+                                                                   ? rubyProject.creationProgress : 0) / 100.0)
+                                Behavior on width { NumberAnimation { duration: 180 } }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Quick actions ──────────────────────────────────────────────
+            Row {
+                id: quickRow
+                width: parent.width
+                spacing: Theme.dp(Theme.spacingSm)
+                opacity: root.sectionOpacity(2)
+                transform: Translate { y: root.sectionShift(2) }
+
+                Repeater {
+                    model: root.quickActions
+
+                    Rectangle {
+                        id: quickTile
+                        width: (quickRow.width - Theme.dp(Theme.spacingSm) * 3) / 4
+                        height: Theme.dp(74)
+                        radius: Theme.radiusMd
+                        color: quickArea.pressed ? Theme.surface2 : Theme.surface1
+                        border.color: Theme.borderSubtle
+                        border.width: 1
+                        scale: quickArea.pressed ? 0.95 : 1.0
+                        Behavior on scale { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
+
+                        Column {
+                            anchors.centerIn: parent
+                            spacing: Theme.dp(6)
+
+                            Rectangle {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                width: Theme.dp(32)
+                                height: Theme.dp(32)
+                                radius: Theme.radiusSm
+                                color: Theme.alpha(root.quickTint(modelData.key), 0.15)
+
+                                Icon {
+                                    anchors.centerIn: parent
+                                    name: modelData.icon
+                                    size: Theme.dp(17)
+                                    color: root.quickTint(modelData.key)
+                                }
+                            }
+
+                            Text {
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                text: modelData.label
+                                color: Theme.textSecondary
+                                font.pixelSize: Theme.dp(Theme.fontXs)
+                                font.weight: Font.Medium
+                            }
+                        }
+
+                        MouseArea {
+                            id: quickArea
+                            anchors.fill: parent
+                            onClicked: root.runQuickAction(modelData.key)
+                        }
+                    }
+                }
+            }
+
+            // ── Recent assets ──────────────────────────────────────────────
+            Item {
+                id: recentsSection
+                width: parent.width
+                implicitHeight: recentsColumn.implicitHeight
+                opacity: root.sectionOpacity(3)
+                transform: Translate { y: root.sectionShift(3) }
+
+                Column {
+                    id: recentsColumn
+                    width: parent.width
+                    spacing: Theme.dp(Theme.spacingSm)
+
+                    Item {
+                        width: parent.width
+                        height: Theme.dp(24)
+
+                        Text {
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: qsTr("Continue working")
+                            color: Theme.textPrimary
+                            font.pixelSize: Theme.dp(16)
+                            font.weight: Font.Bold
+                        }
+
+                        Item {
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: viewAllRow.implicitWidth
+                            height: Theme.dp(20)
+
+                            Row {
+                                id: viewAllRow
+                                anchors.centerIn: parent
+                                spacing: Theme.dp(3)
+
+                                Text {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: qsTr("View all")
+                                    color: viewAllMouse.pressed ? Theme.accentEnd : Theme.accentInk
+                                    font.pixelSize: Theme.dp(Theme.fontSm)
+                                    font.weight: Font.DemiBold
+                                }
+
+                                Icon {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    name: "chevron-right"
+                                    size: Theme.dp(13)
+                                    color: Theme.accentInk
+                                }
+                            }
+
+                            MouseArea {
+                                id: viewAllMouse
+                                anchors.fill: parent
+                                anchors.margins: -Theme.dp(8)
+                                onClicked: {
+                                    root.haptic()
+                                    root.openFilesRequested()
+                                }
+                            }
+                        }
+                    }
+
+                    ListView {
+                        id: recentsList
+                        width: parent.width
+                        height: root.recentCount > 0 ? Theme.dp(152) : 0
+                        visible: root.recentCount > 0
+                        orientation: ListView.Horizontal
+                        spacing: Theme.dp(Theme.spacingSm)
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        flickableDirection: Flickable.HorizontalFlick
+                        model: root.recentItems
+
+                        delegate: Rectangle {
+                            id: recentCard
+                            width: Theme.dp(238)
+                            height: Theme.dp(150)
+                            radius: Theme.radiusCard
+                            color: recentArea.pressed ? Theme.surface2 : Theme.surface1
+                            border.color: Theme.borderSubtle
+                            border.width: 1
+                            clip: true
+                            scale: recentArea.pressed ? 0.97 : 1.0
+                            Behavior on scale { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
+                            property var itemObj: modelData
+                            property string rawPath: (typeof itemObj === "string")
+                                                     ? itemObj
+                                                     : ((itemObj && itemObj.filePath) ? itemObj.filePath : "")
+                            property string fileName: {
+                                if (typeof itemObj === "string") {
+                                    var parts = rawPath.split("/")
+                                    return parts[parts.length - 1]
+                                }
+                                return (itemObj && itemObj.fileName) ? itemObj.fileName : ""
+                            }
+                            property string fileType: (typeof itemObj === "object" && itemObj && itemObj.fileType)
+                                                      ? itemObj.fileType : ""
+                            property string fileSize: (typeof itemObj === "object" && itemObj && itemObj.fileSizeStr)
+                                                      ? itemObj.fileSizeStr : ""
+                            property string ext: {
+                                var index = fileName.lastIndexOf(".")
+                                return index >= 0 ? fileName.substring(index + 1).toLowerCase() : ""
+                            }
+                            property string typeKey: Theme.normalizeType(fileType.length > 0 ? fileType : ext)
+                            property color accent: Theme.colorForType(typeKey)
+                            property string iconName: Theme.iconForType(typeKey)
+
+                            function parentDir(fullPath) {
+                                if (!fullPath || fullPath.length === 0)
+                                    return qsTr("Workspace")
+                                var path = fullPath
+                                if (typeof rubyProject !== "undefined" && rubyProject && rubyProject.hasActiveProject) {
+                                    var projectRoot = rubyProject.projectRoot
+                                    if (projectRoot.length > 0 && path.indexOf(projectRoot) === 0)
+                                        return "[" + rubyProject.projectName + "] " + path.substring(projectRoot.length)
+                                }
+                                if (path.indexOf("/storage/emulated/0/") === 0)
+                                    path = path.substring(19)
+                                var index = path.lastIndexOf("/")
+                                return index > 0 ? path.substring(0, index) : qsTr("Root directory")
+                            }
+
+                            Rectangle {
+                                anchors.top: parent.top
+                                anchors.left: parent.left
+                                width: Theme.dp(42)
+                                height: Theme.dp(3)
+                                radius: height / 2
+                                color: recentCard.accent
+                            }
+
+                            Column {
+                                anchors.fill: parent
+                                anchors.margins: Theme.dp(14)
+                                spacing: Theme.dp(7)
+
+                                Row {
+                                    width: parent.width
+                                    spacing: Theme.dp(9)
+
+                                    Rectangle {
+                                        width: Theme.dp(34)
+                                        height: Theme.dp(34)
+                                        radius: Theme.radiusSm
+                                        color: Theme.alpha(recentCard.accent, 0.15)
+
+                                        Icon {
+                                            anchors.centerIn: parent
+                                            name: recentCard.iconName
+                                            size: Theme.dp(17)
+                                            color: recentCard.accent
+                                        }
+                                    }
+
+                                    Column {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: parent.width - Theme.dp(34) - Theme.dp(9)
+                                        spacing: Theme.dp(1)
+
+                                        Text {
+                                            width: parent.width
+                                            text: recentCard.fileName
+                                            color: Theme.textPrimary
+                                            font.pixelSize: Theme.dp(13)
+                                            font.weight: Font.DemiBold
+                                            elide: Text.ElideMiddle
+                                            maximumLineCount: 2
+                                        }
+
+                                        Text {
+                                            width: parent.width
+                                            text: recentCard.ext.length > 0
+                                                  ? ("." + recentCard.ext) : qsTr("asset")
+                                            color: Theme.textMuted
+                                            font.pixelSize: Theme.dp(Theme.fontXs)
+                                            font.family: Theme.monoFamily
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    width: parent.width
+                                    text: recentCard.parentDir(recentCard.rawPath)
+                                    color: Theme.textSecondary
+                                    font.pixelSize: Theme.dp(Theme.fontXs)
+                                    font.family: Theme.monoFamily
+                                    elide: Text.ElideLeft
+                                }
+
+                                Item { width: 1; height: 1 }
+
+                                Item {
+                                    width: parent.width
+                                    height: Theme.dp(16)
+
+                                    Text {
+                                        anchors.left: parent.left
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: recentCard.typeKey.toUpperCase()
+                                        color: Theme.textMuted
+                                        font.pixelSize: Theme.dp(8)
+                                        font.family: Theme.monoFamily
+                                    }
+
+                                    Row {
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        spacing: Theme.dp(5)
+
+                                        Text {
+                                            visible: recentCard.fileSize.length > 0
+                                            text: recentCard.fileSize
+                                            color: Theme.textMuted
+                                            font.pixelSize: Theme.dp(8.5)
+                                            font.family: Theme.monoFamily
+                                        }
+
+                                        Text {
+                                            text: qsTr("Open")
+                                            color: recentCard.accent
+                                            font.pixelSize: Theme.dp(Theme.fontSm)
+                                            font.weight: Font.DemiBold
+                                        }
+
+                                        Icon {
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            name: "arrow-right"
+                                            size: Theme.dp(12)
+                                            color: recentCard.accent
+                                        }
+                                    }
+                                }
+                            }
+
+                            MouseArea {
+                                id: recentArea
+                                anchors.fill: parent
+                                onClicked: root.openPathRequested(recentCard.rawPath)
+                                onPressAndHold: {
+                                    recentOptionsSheet.targetFilePath = recentCard.rawPath
+                                    recentOptionsSheet.targetFileName = recentCard.fileName
+                                    recentOptionsSheet.open()
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: parent.width
+                        height: Theme.dp(112)
+                        radius: Theme.radiusCard
+                        color: Theme.surface1
+                        border.color: Theme.borderSubtle
+                        border.width: 1
+                        visible: root.recentCount === 0
+
+                        Row {
+                            anchors.fill: parent
+                            anchors.margins: Theme.dp(14)
+                            spacing: Theme.dp(12)
+
+                            Rectangle {
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: Theme.dp(40)
+                                height: Theme.dp(40)
+                                radius: Theme.radiusSm
+                                color: Theme.alpha(Theme.colorModel, 0.14)
+
+                                Icon {
+                                    anchors.centerIn: parent
+                                    name: "folder-open"
+                                    size: Theme.dp(19)
+                                    color: Theme.colorModel
+                                }
+                            }
+
+                            Column {
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: parent.width - Theme.dp(40) - Theme.dp(12) - emptyAction.width - Theme.dp(12)
+                                spacing: Theme.dp(3)
+
+                                Text {
+                                    text: qsTr("No recent assets yet")
+                                    color: Theme.textPrimary
+                                    font.pixelSize: Theme.dp(13)
+                                    font.weight: Font.DemiBold
+                                }
+
+                                Text {
+                                    width: parent.width
+                                    text: qsTr("Files you open are pinned here for a one-tap return.")
+                                    color: Theme.textMuted
+                                    font.pixelSize: Theme.dp(Theme.fontXs)
+                                    wrapMode: Text.WordWrap
+                                }
+                            }
+
+                            Rectangle {
+                                id: emptyAction
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: Theme.dp(78)
+                                height: Theme.dp(36)
+                                radius: Theme.radiusSm
+                                color: emptyArea.pressed ? Theme.surface3 : Theme.alpha(Theme.accentInk, 0.14)
+                                border.color: Theme.alpha(Theme.accentInk, 0.30)
+                                border.width: 1
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: qsTr("Browse")
+                                    color: Theme.accentInk
+                                    font.pixelSize: Theme.dp(Theme.fontSm)
+                                    font.weight: Font.DemiBold
+                                }
+
+                                MouseArea {
+                                    id: emptyArea
+                                    anchors.fill: parent
+                                    onClicked: root.openFilesRequested()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Project onboarding ─────────────────────────────────────────
+            Rectangle {
+                id: projectSection
+                width: parent.width
+                implicitHeight: projectColumn.implicitHeight + Theme.dp(18) * 2
+                radius: Theme.radiusLg
+                color: Theme.surface1
+                border.color: Theme.borderSubtle
+                border.width: 1
+                opacity: root.sectionOpacity(4)
+                transform: Translate { y: root.sectionShift(4) }
+
+                Column {
+                    id: projectColumn
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Theme.dp(18)
+                    spacing: Theme.dp(12)
+
+                    Row {
+                        width: parent.width
+                        spacing: Theme.dp(10)
+
+                        Rectangle {
+                            width: Theme.dp(36)
+                            height: Theme.dp(36)
+                            radius: Theme.radiusSm
+                            color: Theme.alpha(Theme.accentInk, 0.14)
+
+                            Icon {
+                                anchors.centerIn: parent
+                                name: "gem"
+                                size: Theme.dp(18)
+                                color: Theme.accentInk
+                            }
+                        }
+
+                        Column {
+                            width: parent.width - Theme.dp(36) - Theme.dp(10)
+                            spacing: Theme.dp(1)
+
+                            Text {
+                                text: qsTr("Projects, end to end")
+                                color: Theme.textPrimary
+                                font.pixelSize: Theme.dp(15)
+                                font.weight: Font.Bold
+                            }
+
+                            Text {
+                                text: qsTr("One folder, one descriptor, no extracted APK required.")
+                                color: Theme.textMuted
+                                font.pixelSize: Theme.dp(Theme.fontXs)
+                                elide: Text.ElideRight
+                            }
+                        }
+                    }
+
+                    Column {
+                        id: stepsColumn
+                        width: parent.width
+                        spacing: Theme.dp(5)
+
+                        Repeater {
+                            model: root.projectSteps
+
+                            Row {
+                                width: stepsColumn.width
+                                spacing: Theme.dp(9)
+
+                                Rectangle {
+                                    width: Theme.dp(24)
+                                    height: Theme.dp(24)
+                                    radius: Theme.dp(12)
+                                    color: Theme.alpha(Theme.accentInk, 0.14)
+                                    border.color: Theme.alpha(Theme.accentInk, 0.26)
+                                    border.width: 1
+
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: modelData.n
+                                        color: Theme.accentInk
+                                        font.pixelSize: Theme.dp(9)
+                                        font.weight: Font.Bold
+                                        font.family: Theme.monoFamily
+                                    }
+                                }
+
+                                Column {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: parent.width - Theme.dp(24) - Theme.dp(9)
+                                    spacing: Theme.dp(1)
+
+                                    Text {
+                                        text: modelData.title
+                                        color: Theme.textPrimary
+                                        font.pixelSize: Theme.dp(11.5)
+                                        font.weight: Font.DemiBold
+                                    }
+
+                                    Text {
+                                        width: parent.width
+                                        text: modelData.body
+                                        color: Theme.textMuted
+                                        font.pixelSize: Theme.dp(9.5)
+                                        wrapMode: Text.WordWrap
+                                        lineHeight: 1.12
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Row {
+                        width: parent.width
+                        spacing: Theme.dp(10)
+
+                        PrimaryButton {
+                            height: Theme.dp(40)
+                            text: qsTr("Create project")
+                            iconName: "plus"
+                            onClicked: {
+                                root.haptic()
+                                newProjectDialog.open()
+                            }
+                        }
+
+                        Rectangle {
+                            width: openLabel.implicitWidth + Theme.dp(28)
+                            height: Theme.dp(40)
+                            radius: Theme.radiusSm
+                            color: openArea.pressed ? Theme.surface2 : "transparent"
+                            border.color: Theme.borderSubtle
+                            border.width: 1
 
                             Row {
                                 anchors.centerIn: parent
@@ -180,20 +1016,21 @@ Item {
                                     anchors.verticalCenter: parent.verticalCenter
                                     name: "folder"
                                     size: Theme.dp(15)
-                                    color: Theme.accentInk
+                                    color: Theme.textSecondary
                                 }
 
                                 Text {
+                                    id: openLabel
                                     anchors.verticalCenter: parent.verticalCenter
-                                    text: qsTr("Browse Files")
-                                    font.pixelSize: Theme.dp(12)
+                                    text: qsTr("Browse files")
+                                    color: Theme.textSecondary
+                                    font.pixelSize: Theme.dp(Theme.fontSm)
                                     font.weight: Font.DemiBold
-                                    color: Theme.textPrimary
                                 }
                             }
 
                             MouseArea {
-                                id: browseMouse
+                                id: openArea
                                 anchors.fill: parent
                                 onClicked: root.openFilesRequested()
                             }
@@ -202,461 +1039,145 @@ Item {
                 }
             }
 
-            // ── Tier 3: 2x2 Quick Asset Category Tiles ──────────────────────
-            Grid {
+            // ── Toolbox ────────────────────────────────────────────────────
+            Item {
+                id: toolboxSection
                 width: parent.width
-                columns: 2
-                spacing: Theme.dp(Theme.spacingSm)
+                implicitHeight: toolboxColumn.implicitHeight
+                opacity: root.sectionOpacity(5)
+                transform: Translate { y: root.sectionShift(5) }
 
-                // 1: Scenes
-                Rectangle {
-                    width: (parent.width - Theme.dp(Theme.spacingSm)) / 2
-                    height: Theme.dp(62)
-                    radius: Theme.radiusMd
-                    color: scenesMouse.pressed ? Theme.surface2 : Theme.surface1
-
-                    Row {
-                        anchors.fill: parent
-                        anchors.margins: Theme.dp(10)
-                        spacing: Theme.dp(10)
-
-                        Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: Theme.dp(36)
-                            height: Theme.dp(36)
-                            radius: Theme.radiusSm
-                            color: Theme.alpha(Theme.colorScene, 0.15)
-
-                            Icon {
-                                anchors.centerIn: parent
-                                name: "map"
-                                size: Theme.dp(18)
-                                color: Theme.colorScene
-                            }
-                        }
-
-                        Column {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - Theme.dp(46)
-                            spacing: Theme.dp(1)
-
-                            Text {
-                                text: qsTr("Scenes")
-                                font.pixelSize: Theme.dp(13)
-                                font.weight: Font.DemiBold
-                                color: Theme.textPrimary
-                            }
-
-                            Text {
-                                text: ".scene / .scl"
-                                font.pixelSize: Theme.dp(10)
-                                font.family: Theme.monoFamily
-                                color: Theme.textMuted
-                            }
-                        }
-                    }
-
-                    MouseArea {
-                        id: scenesMouse
-                        anchors.fill: parent
-                        onClicked: {
-                            if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
-                                rubyFileModel.setCategory("scene")
-                            }
-                            root.openFilesRequested()
-                        }
-                    }
-                }
-
-                // 2: Models
-                Rectangle {
-                    width: (parent.width - Theme.dp(Theme.spacingSm)) / 2
-                    height: Theme.dp(62)
-                    radius: Theme.radiusMd
-                    color: modelsMouse.pressed ? Theme.surface2 : Theme.surface1
-
-                    Row {
-                        anchors.fill: parent
-                        anchors.margins: Theme.dp(10)
-                        spacing: Theme.dp(10)
-
-                        Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: Theme.dp(36)
-                            height: Theme.dp(36)
-                            radius: Theme.radiusSm
-                            color: Theme.alpha(Theme.colorModel, 0.15)
-
-                            Icon {
-                                anchors.centerIn: parent
-                                name: "cube"
-                                size: Theme.dp(18)
-                                color: Theme.colorModel
-                            }
-                        }
-
-                        Column {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - Theme.dp(46)
-                            spacing: Theme.dp(1)
-
-                            Text {
-                                text: qsTr("Models")
-                                font.pixelSize: Theme.dp(13)
-                                font.weight: Font.DemiBold
-                                color: Theme.textPrimary
-                            }
-
-                            Text {
-                                text: ".pod / .glb"
-                                font.pixelSize: Theme.dp(10)
-                                font.family: Theme.monoFamily
-                                color: Theme.textMuted
-                            }
-                        }
-                    }
-
-                    MouseArea {
-                        id: modelsMouse
-                        anchors.fill: parent
-                        onClicked: {
-                            if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
-                                rubyFileModel.setCategory("models")
-                            }
-                            root.openFilesRequested()
-                        }
-                    }
-                }
-
-                // 3: Scripts
-                Rectangle {
-                    width: (parent.width - Theme.dp(Theme.spacingSm)) / 2
-                    height: Theme.dp(62)
-                    radius: Theme.radiusMd
-                    color: scriptsMouse.pressed ? Theme.surface2 : Theme.surface1
-
-                    Row {
-                        anchors.fill: parent
-                        anchors.margins: Theme.dp(10)
-                        spacing: Theme.dp(10)
-
-                        Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: Theme.dp(36)
-                            height: Theme.dp(36)
-                            radius: Theme.radiusSm
-                            color: Theme.alpha(Theme.colorCode, 0.15)
-
-                            Icon {
-                                anchors.centerIn: parent
-                                name: "braces"
-                                size: Theme.dp(18)
-                                color: Theme.colorCode
-                            }
-                        }
-
-                        Column {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - Theme.dp(46)
-                            spacing: Theme.dp(1)
-
-                            Text {
-                                text: qsTr("Scripts")
-                                font.pixelSize: Theme.dp(13)
-                                font.weight: Font.DemiBold
-                                color: Theme.textPrimary
-                            }
-
-                            Text {
-                                text: ".lua / .txt"
-                                font.pixelSize: Theme.dp(10)
-                                font.family: Theme.monoFamily
-                                color: Theme.textMuted
-                            }
-                        }
-                    }
-
-                    MouseArea {
-                        id: scriptsMouse
-                        anchors.fill: parent
-                        onClicked: {
-                            if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
-                                rubyFileModel.setCategory("lua")
-                            }
-                            root.openFilesRequested()
-                        }
-                    }
-                }
-
-                // 4: Archives
-                Rectangle {
-                    width: (parent.width - Theme.dp(Theme.spacingSm)) / 2
-                    height: Theme.dp(62)
-                    radius: Theme.radiusMd
-                    color: archivesMouse.pressed ? Theme.surface2 : Theme.surface1
-
-                    Row {
-                        anchors.fill: parent
-                        anchors.margins: Theme.dp(10)
-                        spacing: Theme.dp(10)
-
-                        Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: Theme.dp(36)
-                            height: Theme.dp(36)
-                            radius: Theme.radiusSm
-                            color: Theme.alpha(Theme.colorArchive, 0.15)
-
-                            Icon {
-                                anchors.centerIn: parent
-                                name: "archive"
-                                size: Theme.dp(18)
-                                color: Theme.colorArchive
-                            }
-                        }
-
-                        Column {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - Theme.dp(46)
-                            spacing: Theme.dp(1)
-
-                            Text {
-                                text: qsTr("Archives")
-                                font.pixelSize: Theme.dp(13)
-                                font.weight: Font.DemiBold
-                                color: Theme.textPrimary
-                            }
-
-                            Text {
-                                text: ".zip / .pak"
-                                font.pixelSize: Theme.dp(10)
-                                font.family: Theme.monoFamily
-                                color: Theme.textMuted
-                            }
-                        }
-                    }
-
-                    MouseArea {
-                        id: archivesMouse
-                        anchors.fill: parent
-                        onClicked: {
-                            if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
-                                rubyFileModel.setCategory("archives")
-                            }
-                            root.openFilesRequested()
-                        }
-                    }
-                }
-            }
-
-            // ── Tier 4: Continue Working (PROMOTED ABOVE GUIDES!) ───────────
-            Column {
-                width: parent.width
-                spacing: Theme.dp(Theme.spacingSm)
-
-                // Section Header
-                Item {
+                Column {
+                    id: toolboxColumn
                     width: parent.width
-                    height: Theme.dp(26)
+                    spacing: Theme.dp(Theme.spacingSm)
 
-                    Text {
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: qsTr("Recent Files")
-                        font.pixelSize: Theme.dp(16)
-                        font.weight: Font.Bold
-                        color: Theme.textPrimary
-                    }
-
-                    Text {
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: qsTr("View All")
-                        font.pixelSize: Theme.dp(Theme.fontSm)
-                        font.weight: Font.Medium
-                        color: filesMoreMouse.pressed ? Theme.accentEnd : Theme.accentInk
-
-                        MouseArea {
-                            id: filesMoreMouse
-                            anchors.fill: parent
-                            anchors.margins: -Theme.dp(8)
-                            onClicked: root.openFilesRequested()
-                        }
-                    }
-                }
-
-                // Grouped Container (Zero individual row borders)
-                Rectangle {
-                    width: parent.width
-                    implicitHeight: recentsListCol.implicitHeight
-                    radius: Theme.radiusCard
-                    color: Theme.surface1
-
-                    Column {
-                        id: recentsListCol
+                    Item {
                         width: parent.width
+                        height: Theme.dp(24)
+
+                        Text {
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: qsTr("Toolbox")
+                            color: Theme.textPrimary
+                            font.pixelSize: Theme.dp(16)
+                            font.weight: Font.Bold
+                        }
+
+                        Item {
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: allToolsRow.implicitWidth
+                            height: Theme.dp(20)
+
+                            Row {
+                                id: allToolsRow
+                                anchors.centerIn: parent
+                                spacing: Theme.dp(3)
+
+                                Text {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    text: qsTr("All tools")
+                                    color: allToolsArea.pressed ? Theme.accentEnd : Theme.accentInk
+                                    font.pixelSize: Theme.dp(Theme.fontSm)
+                                    font.weight: Font.DemiBold
+                                }
+
+                                Icon {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    name: "chevron-right"
+                                    size: Theme.dp(13)
+                                    color: Theme.accentInk
+                                }
+                            }
+
+                            MouseArea {
+                                id: allToolsArea
+                                anchors.fill: parent
+                                anchors.margins: -Theme.dp(8)
+                                onClicked: root.openToolsRequested("")
+                            }
+                        }
+                    }
+
+                    Grid {
+                        id: toolGrid
+                        width: parent.width
+                        columns: 2
+                        spacing: Theme.dp(Theme.spacingSm)
 
                         Repeater {
-                            id: recentFilesRepeater
-                            model: {
-                                if (typeof rubyFileModel === "undefined" || !rubyFileModel || !rubyFileModel.recentFiles) return []
-                                var recents = rubyFileModel.recentFiles
-                                if (activeSessionCard.latestPath.length > 0 && recents.length > 1) {
-                                    return recents.slice(1, 5)
-                                }
-                                return recents.slice(0, 4)
-                            }
+                            model: root.toolbox
 
-                            delegate: Rectangle {
-                                width: parent.width
-                                height: Theme.dp(58)
-                                color: recentRowMouse.pressed ? Theme.surface2 : "transparent"
-
-                                property var itemObj: modelData
-                                property string rawPath: (typeof itemObj === "string") ? itemObj : ((itemObj && itemObj.filePath) ? itemObj.filePath : "")
-                                property string fn: {
-                                    if (typeof itemObj === "string") {
-                                        var parts = rawPath.split("/")
-                                        return parts[parts.length - 1]
-                                    }
-                                    return (itemObj && itemObj.fileName) ? itemObj.fileName : ""
-                                }
-                                property string fType: (typeof itemObj === "object" && itemObj && itemObj.fileType) ? itemObj.fileType : ""
-                                property string fSize: (typeof itemObj === "object" && itemObj && itemObj.fileSizeStr) ? itemObj.fileSizeStr : ""
-                                property string ext: {
-                                    var idx = fn.lastIndexOf(".")
-                                    return idx >= 0 ? fn.substring(idx + 1).toLowerCase() : ""
-                                }
-                                property string iconStr: {
-                                    if (fType === "scene" || ext === "scene" || ext === "scl") return "map"
-                                    if (fType === "model" || ext === "pod" || ext === "glb" || ext === "fbx" || ext === "obj") return "cube"
-                                    if (fType === "texture" || ext === "pvr" || ext === "png" || ext === "tex") return "image"
-                                    if (fType === "code" || ext === "lua" || ext === "filerift") return "code"
-                                    if (fType === "audio" || ext === "wav" || ext === "ogg" || ext === "mp3") return "volume"
-                                    return "file"
-                                }
-                                property color accentColor: {
-                                    if (fType === "scene" || ext === "scene" || ext === "scl") return Theme.colorScene
-                                    if (fType === "model" || ext === "pod" || ext === "glb" || ext === "fbx" || ext === "obj") return Theme.colorModel
-                                    if (fType === "texture" || ext === "pvr" || ext === "png") return Theme.colorTexture
-                                    if (fType === "code" || ext === "lua") return Theme.colorCode
-                                    if (fType === "audio" || ext === "wav" || ext === "ogg") return Theme.colorAudio
-                                    return Theme.accentInk
-                                }
-
-                                function parentDir(fullPath) {
-                                    if (!fullPath || fullPath.length === 0) return "Root directory"
-                                    var p = fullPath
-                                    if (p.indexOf("/storage/emulated/0/") === 0) p = p.substring(19)
-                                    var idx = p.lastIndexOf("/")
-                                    if (idx <= 0) return "Root directory"
-                                    return p.substring(0, idx)
-                                }
+                            Rectangle {
+                                id: toolCard
+                                width: (toolGrid.width - Theme.dp(Theme.spacingSm)) / 2
+                                height: Theme.dp(82)
+                                radius: Theme.radiusMd
+                                color: toolArea.pressed ? Theme.surface2 : Theme.surface1
+                                border.color: Theme.borderSubtle
+                                border.width: 1
+                                scale: toolArea.pressed ? 0.97 : 1.0
+                                Behavior on scale { NumberAnimation { duration: 110; easing.type: Easing.OutCubic } }
 
                                 Row {
                                     anchors.fill: parent
-                                    anchors.leftMargin: Theme.dp(Theme.spacingMd)
-                                    anchors.rightMargin: Theme.dp(Theme.spacingMd)
-                                    spacing: Theme.dp(12)
+                                    anchors.margins: Theme.dp(11)
+                                    spacing: Theme.dp(9)
 
-                                    // Type Icon Square
                                     Rectangle {
                                         anchors.verticalCenter: parent.verticalCenter
-                                        width: Theme.dp(36)
-                                        height: Theme.dp(36)
+                                        width: Theme.dp(34)
+                                        height: Theme.dp(34)
                                         radius: Theme.radiusSm
-                                        color: Theme.alpha(parent.parent.accentColor, 0.15)
+                                        color: Theme.alpha(modelData.color, 0.14)
 
                                         Icon {
                                             anchors.centerIn: parent
-                                            name: parent.parent.parent.iconStr
+                                            name: modelData.icon
                                             size: Theme.dp(17)
-                                            color: parent.parent.parent.accentColor
+                                            color: modelData.color
                                         }
                                     }
 
-                                    // File Details
                                     Column {
                                         anchors.verticalCenter: parent.verticalCenter
-                                        width: parent.width - Theme.dp(36) - Theme.dp(24) - Theme.dp(12) * 2
+                                        width: parent.width - Theme.dp(34) - Theme.dp(9) - Theme.dp(16)
                                         spacing: Theme.dp(2)
 
                                         Text {
                                             width: parent.width
-                                            text: parent.parent.parent.fn
-                                            font.pixelSize: Theme.dp(14)
-                                            font.weight: Font.Medium
+                                            text: modelData.title
                                             color: Theme.textPrimary
+                                            font.pixelSize: Theme.dp(12)
+                                            font.weight: Font.DemiBold
                                             elide: Text.ElideRight
                                         }
 
                                         Text {
                                             width: parent.width
-                                            text: (parent.parent.parent.fSize.length > 0 ? (parent.parent.parent.fSize + "  •  ") : "") + parent.parent.parent.parentDir(parent.parent.parent.rawPath)
-                                            font.pixelSize: Theme.dp(11)
-                                            font.family: Theme.monoFamily
+                                            text: modelData.body
                                             color: Theme.textMuted
-                                            elide: Text.ElideLeft
+                                            font.pixelSize: Theme.dp(9)
+                                            wrapMode: Text.WordWrap
+                                            maximumLineCount: 2
+                                            elide: Text.ElideRight
                                         }
                                     }
 
-                                    // Clean subtle chevron ›
-                                    Text {
+                                    Icon {
                                         anchors.verticalCenter: parent.verticalCenter
-                                        text: "›"
-                                        font.pixelSize: Theme.dp(22)
-                                        font.weight: Font.Light
+                                        name: "chevron-right"
+                                        size: Theme.dp(13)
                                         color: Theme.textMuted
                                     }
                                 }
 
-                                // Hairline separator between rows (inset to text, not icon)
-                                Rectangle {
-                                    anchors.bottom: parent.bottom
-                                    anchors.left: parent.left
-                                    anchors.leftMargin: Theme.dp(64)
-                                    anchors.right: parent.right
-                                    anchors.rightMargin: Theme.dp(12)
-                                    height: 1
-                                    color: Theme.borderSubtle
-                                    visible: index < (recentFilesRepeater.count - 1)
-                                }
-
                                 MouseArea {
-                                    id: recentRowMouse
+                                    id: toolArea
                                     anchors.fill: parent
-                                    onClicked: root.openPathRequested(parent.rawPath)
-                                    onPressAndHold: {
-                                        recentOptionsSheet.targetFilePath = parent.rawPath
-                                        recentOptionsSheet.targetFileName = parent.fn
-                                        recentOptionsSheet.open()
-                                    }
-                                }
-                            }
-                        }
-
-                        // Empty State if no recents
-                        Item {
-                            width: parent.width
-                            height: Theme.dp(72)
-                            visible: recentFilesRepeater.count === 0 && activeSessionCard.latestPath.length === 0
-
-                            Row {
-                                anchors.centerIn: parent
-                                spacing: Theme.dp(Theme.spacingMd)
-
-                                Icon {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    name: "folder-open"
-                                    size: Theme.dp(20)
-                                    color: Theme.textMuted
-                                }
-
-                                Text {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: qsTr("No recent files yet • Open an asset in Files tab")
-                                    font.pixelSize: Theme.dp(12)
-                                    color: Theme.textMuted
+                                    onClicked: root.openTool(modelData)
                                 }
                             }
                         }
@@ -664,245 +1185,92 @@ Item {
                 }
             }
 
-            // ── Tier 5: Modding Guides (Compact Horizontal Carousel) ────────
-            Column {
+            // ── Guides ─────────────────────────────────────────────────────
+            Item {
+                id: guidesSection
                 width: parent.width
-                spacing: Theme.dp(Theme.spacingSm)
+                implicitHeight: guidesColumn.implicitHeight
+                opacity: root.sectionOpacity(6)
+                transform: Translate { y: root.sectionShift(6) }
 
-                Item {
-                    width: parent.width
-                    height: Theme.dp(26)
-
-                    Text {
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: qsTr("Modding Guides")
-                        font.pixelSize: Theme.dp(16)
-                        font.weight: Font.Bold
-                        color: Theme.textPrimary
-                    }
-                }
-
-                ListView {
-                    id: guidesCarousel
-                    width: parent.width
-                    height: Theme.dp(88)
-                    orientation: ListView.Horizontal
-                    spacing: Theme.dp(Theme.spacingSm)
-                    clip: true
-                    boundsBehavior: Flickable.StopAtBounds
-                    flickableDirection: Flickable.HorizontalFlick
-
-                    model: (typeof rubyToolsBridge !== "undefined" && rubyToolsBridge)
-                           ? rubyToolsBridge.getModdingGuides()
-                           : ((typeof toolsBridge !== "undefined" && toolsBridge) ? toolsBridge.getModdingGuides() : [])
-
-                    delegate: GuideCard {
-                        title: modelData.title
-                        category: modelData.category
-                        tag: modelData.tag
-                        description: modelData.desc
-                        readTime: modelData.readTime
-                        svgSource: modelData.svg
-                        qrcPath: modelData.qrcPath
-                        onClicked: {
-                            guideReader.open(modelData.id, modelData.title, modelData.category, modelData.svg, modelData.qrcPath)
-                        }
-                    }
-                }
-            }
-
-            // ── Tier 6: Quick Tools ─────────────────────────────────────────
-            Column {
-                width: parent.width
-                spacing: Theme.dp(Theme.spacingSm)
-
-                Item {
-                    width: parent.width
-                    height: Theme.dp(26)
-
-                    Text {
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: qsTr("Quick Tools")
-                        font.pixelSize: Theme.dp(16)
-                        font.weight: Font.Bold
-                        color: Theme.textPrimary
-                    }
-
-                    Text {
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        text: qsTr("Tools tab")
-                        font.pixelSize: Theme.dp(Theme.fontSm)
-                        font.weight: Font.Medium
-                        color: toolsMoreMouse.pressed ? Theme.accentEnd : Theme.accentInk
-
-                        MouseArea {
-                            id: toolsMoreMouse
-                            anchors.fill: parent
-                            anchors.margins: -Theme.dp(8)
-                            onClicked: root.openToolsRequested("")
-                        }
-                    }
-                }
-
-                Row {
+                Column {
+                    id: guidesColumn
                     width: parent.width
                     spacing: Theme.dp(Theme.spacingSm)
 
-                    // 1: POD Convert
-                    Rectangle {
-                        width: (parent.width - Theme.dp(Theme.spacingSm) * 3) / 4
-                        height: Theme.dp(66)
-                        radius: Theme.radiusMd
-                        color: podToolMouse.pressed ? Theme.surface2 : Theme.surface1
+                    Item {
+                        width: parent.width
+                        height: Theme.dp(24)
 
-                        Column {
-                            anchors.centerIn: parent
-                            spacing: Theme.dp(4)
-
-                            Icon {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                name: "cube"
-                                size: Theme.dp(18)
-                                color: "#38BDF8"
-                            }
-
-                            Text {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                text: qsTr("POD 2.0")
-                                font.pixelSize: Theme.dp(11)
-                                font.weight: Font.DemiBold
-                                color: Theme.textPrimary
-                            }
+                        Text {
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: qsTr("Field notes")
+                            color: Theme.textPrimary
+                            font.pixelSize: Theme.dp(16)
+                            font.weight: Font.Bold
                         }
 
-                        MouseArea {
-                            id: podToolMouse
-                            anchors.fill: parent
-                            onClicked: root.openToolsRequested("converter")
+                        Text {
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: qsTr("Modding guides")
+                            color: Theme.textMuted
+                            font.pixelSize: Theme.dp(Theme.fontSm)
                         }
                     }
 
-                    // 2: FileRift
-                    Rectangle {
-                        width: (parent.width - Theme.dp(Theme.spacingSm) * 3) / 4
-                        height: Theme.dp(66)
-                        radius: Theme.radiusMd
-                        color: riftToolMouse.pressed ? Theme.surface2 : Theme.surface1
+                    ListView {
+                        id: guidesCarousel
+                        width: parent.width
+                        height: Theme.dp(88)
+                        orientation: ListView.Horizontal
+                        spacing: Theme.dp(Theme.spacingSm)
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        flickableDirection: Flickable.HorizontalFlick
 
-                        Column {
-                            anchors.centerIn: parent
-                            spacing: Theme.dp(4)
+                        model: (typeof rubyToolsBridge !== "undefined" && rubyToolsBridge)
+                               ? rubyToolsBridge.getModdingGuides()
+                               : ((typeof toolsBridge !== "undefined" && toolsBridge)
+                                  ? toolsBridge.getModdingGuides() : [])
 
-                            Icon {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                name: "braces"
-                                size: Theme.dp(18)
-                                color: "#34D399"
-                            }
-
-                            Text {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                text: qsTr("FileRift")
-                                font.pixelSize: Theme.dp(11)
-                                font.weight: Font.DemiBold
-                                color: Theme.textPrimary
-                            }
-                        }
-
-                        MouseArea {
-                            id: riftToolMouse
-                            anchors.fill: parent
-                            onClicked: root.openToolsRequested("recoder")
-                        }
-                    }
-
-                    // 3: Ground Mesh
-                    Rectangle {
-                        width: (parent.width - Theme.dp(Theme.spacingSm) * 3) / 4
-                        height: Theme.dp(66)
-                        radius: Theme.radiusMd
-                        color: groundToolMouse.pressed ? Theme.surface2 : Theme.surface1
-
-                        Column {
-                            anchors.centerIn: parent
-                            spacing: Theme.dp(4)
-
-                            Icon {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                name: "layers"
-                                size: Theme.dp(18)
-                                color: "#F59E0B"
-                            }
-
-                            Text {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                text: qsTr("Zypher")
-                                font.pixelSize: Theme.dp(11)
-                                font.weight: Font.DemiBold
-                                color: Theme.textPrimary
-                            }
-                        }
-
-                        MouseArea {
-                            id: groundToolMouse
-                            anchors.fill: parent
-                            onClicked: root.openToolsRequested("ground")
-                        }
-                    }
-
-                    // 4: Audio Player
-                    Rectangle {
-                        width: (parent.width - Theme.dp(Theme.spacingSm) * 3) / 4
-                        height: Theme.dp(66)
-                        radius: Theme.radiusMd
-                        color: audioToolMouse.pressed ? Theme.surface2 : Theme.surface1
-
-                        Column {
-                            anchors.centerIn: parent
-                            spacing: Theme.dp(4)
-
-                            Icon {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                name: "volume"
-                                size: Theme.dp(18)
-                                color: "#F43F5E"
-                            }
-
-                            Text {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                text: qsTr("Audio")
-                                font.pixelSize: Theme.dp(11)
-                                font.weight: Font.DemiBold
-                                color: Theme.textPrimary
-                            }
-                        }
-
-                        MouseArea {
-                            id: audioToolMouse
-                            anchors.fill: parent
+                        delegate: GuideCard {
+                            title: modelData.title
+                            category: modelData.category
+                            tag: modelData.tag
+                            description: modelData.desc
+                            readTime: modelData.readTime
+                            svgSource: modelData.svg
+                            qrcPath: modelData.qrcPath
                             onClicked: {
-                                if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
-                                    rubyFileModel.setCategory("audio")
-                                }
-                                root.openFilesRequested()
+                                guideReader.open(modelData.id, modelData.title, modelData.category,
+                                                 modelData.svg, modelData.qrcPath)
                             }
                         }
                     }
                 }
             }
 
-            // Bottom breathing spacer so content clears comfortably above bottom bar
+            // ── Footer ─────────────────────────────────────────────────────
             Item {
                 width: parent.width
-                height: Theme.dp(36)
+                height: Theme.dp(28)
+                opacity: root.sectionOpacity(7)
+
+                Text {
+                    anchors.centerIn: parent
+                    text: qsTr("RUBY TOUCH  /  PROJECT SPEC v2.1")
+                    color: Theme.textMuted
+                    font.pixelSize: Theme.dp(8.5)
+                    font.family: Theme.monoFamily
+                    font.letterSpacing: Theme.dp(0.8)
+                }
             }
         }
     }
 
-    // ── Context Actions for Recent File ────────────────────────────────────
+    // ── Context actions for a recent asset ─────────────────────────────────
     BottomSheet {
         id: recentOptionsSheet
         property string targetFilePath: ""
@@ -932,9 +1300,9 @@ Item {
                 text: qsTr("Open Containing Folder")
                 onClicked: {
                     recentOptionsSheet.close()
-                    var p = recentOptionsSheet.targetFilePath
-                    var lastSlash = p.lastIndexOf("/")
-                    var folder = lastSlash > 0 ? p.substring(0, lastSlash) : "/storage/emulated/0"
+                    var path = recentOptionsSheet.targetFilePath
+                    var lastSlash = path.lastIndexOf("/")
+                    var folder = lastSlash > 0 ? path.substring(0, lastSlash) : "/storage/emulated/0"
                     root.openFolderRequested(folder)
                 }
             }
@@ -944,9 +1312,8 @@ Item {
                 iconName: "link"
                 text: qsTr("Copy Full Path")
                 onClicked: {
-                    if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
+                    if (typeof rubyFileModel !== "undefined" && rubyFileModel)
                         rubyFileModel.copyToClipboard(recentOptionsSheet.targetFilePath)
-                    }
                     recentOptionsSheet.close()
                 }
             }
@@ -957,16 +1324,15 @@ Item {
                 text: qsTr("Remove from Recents")
                 danger: true
                 onClicked: {
-                    if (typeof rubyFileModel !== "undefined" && rubyFileModel) {
+                    if (typeof rubyFileModel !== "undefined" && rubyFileModel)
                         rubyFileModel.removeRecentFile(recentOptionsSheet.targetFilePath)
-                    }
                     recentOptionsSheet.close()
                 }
             }
         }
     }
 
-    // ── Dedicated Modular Markdown Guide Reader Modal ──────────────────────
+    // ── Markdown guide reader ───────────────────────────────────────────────
     GuideReaderView {
         id: guideReader
         anchors.fill: parent

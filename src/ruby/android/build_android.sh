@@ -347,7 +347,7 @@ for ABI in "${ABIS[@]}"; do
         -DCMAKE_PREFIX_PATH="${QT_ABI_DIR}" \
         -DQT_HOST_PATH="${QT_HOST_DIR}" \
         -DQt6_DIR="${QT_ABI_DIR}/lib/cmake/Qt6" \
-        -DRUBY_BUILD_VERSION="${RUBY_VERSION_NAME:-v1.4.5}" \
+        -DRUBY_BUILD_VERSION="${RUBY_VERSION_NAME:-v1.4.5b}" \
         "${FOSS_CMAKE_FLAG}"
 
     cmake --build "${ABI_BUILD_DIR}" --config Release -j"$(nproc)"
@@ -384,6 +384,11 @@ for ABI in "${ABIS[@]}"; do
     if [ -n "${LIBRUBY_RUNNER_SO}" ] && [ -f "${LIBRUBY_RUNNER_SO}" ]; then
         cp "${LIBRUBY_RUNNER_SO}" "${PACKAGE_DIR}/lib/${ABI}/libruby_runner.so"
         echo "[✓] Copied libruby_runner.so for ${ABI}"
+    fi
+    LIBLAUNCHER_SO="$(find "${BUILD_ROOT}/${ABI}" -name "liblauncher.so" | head -n 1)"
+    if [ -n "${LIBLAUNCHER_SO}" ] && [ -f "${LIBLAUNCHER_SO}" ]; then
+        cp "${LIBLAUNCHER_SO}" "${PACKAGE_DIR}/lib/${ABI}/liblauncher.so"
+        echo "[✓] Copied liblauncher.so for ${ABI}"
     fi
     if [ -f "${ANDROID_SRC_DIR}/libs/${ABI}/libGlossHook.so" ]; then
         cp "${ANDROID_SRC_DIR}/libs/${ABI}/libGlossHook.so" "${PACKAGE_DIR}/lib/${ABI}/libGlossHook.so"
@@ -472,6 +477,12 @@ if [ -d "${QT_QML_DIR}" ]; then
     find "${QML_ASSET_DIR}" -name "*.qmltypes" -delete
     find "${QML_ASSET_DIR}" -name "*.metainfo" -delete
     find "${QML_ASSET_DIR}" -type d -name designer -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# Package static assets (e.g. runtime plugins) from android/assets
+if [ -d "${ANDROID_SRC_DIR}/assets" ]; then
+    echo "Packaging app assets from ${ANDROID_SRC_DIR}/assets into assets/..."
+    cp -r "${ANDROID_SRC_DIR}/assets/." "${PACKAGE_DIR}/assets/"
 fi
 
 # Compile resources using aapt2
@@ -595,11 +606,11 @@ if [ "${R8_DONE}" -ne 1 ]; then
     "${D8}" --output "${DEX_DIR}" --lib "${ANDROID_JAR}" "${CLASS_FILES[@]}" "${QT_JAR_DIR}"/*.jar "${D8_EXTRA_ARGS[@]}"
 fi
 
-# Add classes.dex to APK
-(cd "${DEX_DIR}" && zip -u "${BUILD_ROOT}/unaligned.apk" classes*.dex)
+# Add classes.dex to APK with maximum compression
+(cd "${DEX_DIR}" && zip -9 -u "${BUILD_ROOT}/unaligned.apk" classes*.dex)
 
-# Add native libraries and assets to APK
-(cd "${PACKAGE_DIR}" && zip -r -u "${BUILD_ROOT}/unaligned.apk" lib assets)
+# Add native libraries and assets to APK with maximum compression
+(cd "${PACKAGE_DIR}" && zip -9 -r -u "${BUILD_ROOT}/unaligned.apk" lib assets)
 
 # Align APK
 FINAL_APK_NAME="${RUBY_APK_NAME:-RubyTouch${FOSS_APK_SUFFIX}-${ABIS[0]}.apk}"

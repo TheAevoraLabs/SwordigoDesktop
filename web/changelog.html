@@ -35,8 +35,24 @@
 
         <section class="glass-panel" style="margin-bottom: 2rem;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                <h2 style="margin: 0;">v8.0 Beta 2</h2>
+                <span style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--primary); background: rgba(56,189,248,0.1); padding: 4px 12px; border-radius: 20px;">Latest Release</span>
+            </div>
+            <p>RakNet UDP networking framework integration, 9-library modular shared object (.so) build system, Swordfare Editor (IntelliJ) overhaul with stateful multiline tokenization (LexState), quote-aware .styx theme parsing, Swordigo SDK autocomplete &amp; symbol metadata, 10 OptiX architectural research specifications, and ARM64 JIT stability enhancements.</p>
+            <ul style="padding-left: 1.25rem; color: var(--text-body); font-size: 0.95rem; margin-top: 0.75rem;">
+                <li>Integrated RakNet cross-platform UDP networking framework with low-level packet serialization and GUID session handshakes.</li>
+                <li>Re-architected build mode into 9 modular shared objects under <code>bin/libs/</code> with <code>swordfare</code> primary executable.</li>
+                <li>Overhauled Swordfare Editor with stateful multiline tokenization (LexState) and line-level token caching.</li>
+                <li>Integrated Swordigo SDK Autocomplete &amp; Symbol Metadata for Game, Character, Scene, PhysicsObject, Vector3, and Shardshi.</li>
+                <li>Completed 10 OptiX master technical research specifications in docs/optiX/ for high-performance graphics and PBR lighting.</li>
+                <li>Stabilized Dynarmic ARM64 JIT runtime and fixed quote-aware configuration comment stripping.</li>
+            </ul>
+        </section>
+
+        <section class="glass-panel" style="margin-bottom: 2rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
                 <h2 style="margin: 0;">v8.0 Beta 1</h2>
-                <span style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--primary); background: rgba(56,189,248,0.1); padding: 4px 12px; border-radius: 20px;">Current Stable</span>
+                <span style="font-family: var(--font-mono); font-size: 0.85rem; color: var(--text-muted); background: rgba(255,255,255,0.05); padding: 4px 12px; border-radius: 20px;">Previous Release</span>
             </div>
             <p>Dynarmic A64 JIT integration, 512MB code cache allocation, unified documentation architecture, AMD FSR 1.0 post-processing upscaling, and complete SwKiwi modloader API compatibility.</p>
             <ul style="padding-left: 1.25rem; color: var(--text-body); font-size: 0.95rem; margin-top: 0.75rem;">

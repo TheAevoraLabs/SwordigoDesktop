@@ -62,6 +62,15 @@ if (SWORDIGO_BUILD_RUBY_GG)
         ${SRC_DIR}/ruby/panels/local_history_panel.cpp
         ${SRC_DIR}/ruby/panels/lighting_panel.cpp
         ${SRC_DIR}/ruby/core/project_context.cpp
+        # Ruby Project System: .rbp descriptor serialization and the
+        # Launcher-owned properties.toml [mod] contract.
+        ${SRC_DIR}/ruby/core/project/rbp_format.cpp
+        ${SRC_DIR}/ruby/core/project/toml_sync.cpp
+        # Async asset diff engine (xxHash64, vanilla baseline, DCAC cache).
+        ${SRC_DIR}/ruby/core/diff/diff_hash.cpp
+        ${SRC_DIR}/ruby/core/diff/vanilla_manifest.cpp
+        ${SRC_DIR}/ruby/core/diff/diff_cache.cpp
+        ${SRC_DIR}/ruby/core/diff/diff_scanner_worker.cpp
         ${SRC_DIR}/ruby/tools/ruby_tools_workspace.cpp
         ${SRC_DIR}/ruby/tools/ground_mesh_studio.cpp
         ${SRC_DIR}/ruby/graph/graphy.cpp
@@ -282,6 +291,15 @@ if (SWORDIGO_BUILD_RUBY_GG)
         ${SRC_DIR}/ruby/viewport/ruby_picking.cpp
         ${SRC_DIR}/ruby/viewport/camera_bounds_gizmo.cpp
         ${SRC_DIR}/ruby/core/project_context.cpp
+        # Ruby Project System: .rbp descriptor serialization and the
+        # Launcher-owned properties.toml [mod] contract.
+        ${SRC_DIR}/ruby/core/project/rbp_format.cpp
+        ${SRC_DIR}/ruby/core/project/toml_sync.cpp
+        # Async asset diff engine (xxHash64, vanilla baseline, DCAC cache).
+        ${SRC_DIR}/ruby/core/diff/diff_hash.cpp
+        ${SRC_DIR}/ruby/core/diff/vanilla_manifest.cpp
+        ${SRC_DIR}/ruby/core/diff/diff_cache.cpp
+        ${SRC_DIR}/ruby/core/diff/diff_scanner_worker.cpp
         ${SRC_DIR}/tools/pod_loader.cpp
         ${SRC_DIR}/tools/pod_writer.cpp
         ${SRC_DIR}/tools/pod_convert.cpp

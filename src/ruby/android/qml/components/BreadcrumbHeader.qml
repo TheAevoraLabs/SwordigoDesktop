@@ -47,6 +47,35 @@ Rectangle {
         var out = []
         var i
 
+        // ── Active Project Root Anchor ─────────────────────────────────
+        if (typeof rubyProject !== "undefined" && rubyProject && rubyProject.hasActiveProject) {
+            var projRoot = rubyProject.projectRoot
+            if (p === projRoot || p.indexOf(projRoot + "/") === 0) {
+                out.push({
+                    name: rubyProject.projectName,
+                    path: projRoot,
+                    isLast: p === projRoot,
+                    isStorage: true
+                })
+                var relParts = p.substring(projRoot.length).split("/")
+                var subParts = []
+                for (i = 0; i < relParts.length; ++i) {
+                    if (relParts[i].length > 0) subParts.push(relParts[i])
+                }
+                var pAccum = projRoot
+                for (i = 0; i < subParts.length; ++i) {
+                    pAccum += "/" + subParts[i]
+                    out.push({
+                        name: subParts[i],
+                        path: pAccum,
+                        isLast: i === subParts.length - 1,
+                        isStorage: false
+                    })
+                }
+                return out
+            }
+        }
+
         if (p === volume || p.indexOf(volume + "/") === 0) {
             out.push({
                 name: qsTr("Internal Storage"),
@@ -488,7 +517,16 @@ Rectangle {
 
     onSearchVisibleChanged: {
         if (searchVisible) {
-            searchField.forceActiveFocus()
+            // Focus must be deferred: `searchContainer.visible` is driven by a
+            // binding on searchVisible that re-evaluates *after* this change
+            // handler. Qt 6.6's Android-only ImEnterKeyType probe walks the
+            // tab-focus chain and cannot terminate when the focus item is
+            // still invisible (it loops forever and pegs the GUI thread), so
+            // wait until the row is actually on screen before focusing.
+            Qt.callLater(function() {
+                if (searchField)
+                    searchField.forceActiveFocus()
+            })
         }
     }
 }

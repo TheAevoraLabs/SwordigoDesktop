@@ -757,6 +757,13 @@ if (BUILD_TESTING)
         # and silently showed up as "Not Run" in ctest.
         ${SRC_DIR}/ruby/render/glb_model.cpp
         ${SRC_DIR}/ruby/core/project_context.cpp
+        ${SRC_DIR}/ruby/core/project/ruby_project.cpp
+        ${SRC_DIR}/ruby/core/project/rbp_format.cpp
+        ${SRC_DIR}/ruby/core/project/toml_sync.cpp
+        ${SRC_DIR}/ruby/core/diff/diff_hash.cpp
+        ${SRC_DIR}/ruby/core/diff/vanilla_manifest.cpp
+        ${SRC_DIR}/ruby/core/diff/diff_cache.cpp
+        ${SRC_DIR}/ruby/core/diff/diff_scanner_worker.cpp
         ${SRC_DIR}/tools/pod_loader.cpp
         ${SRC_DIR}/tools/pod_writer.cpp
         ${SRC_DIR}/tools/pod_convert.cpp

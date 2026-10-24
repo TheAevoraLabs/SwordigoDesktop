@@ -18,6 +18,7 @@
 #include "platform/pvr_loader.h"
 #include "tools/filerift.h"
 #include "ruby_quick_viewport.h"
+#include "ruby/core/project/ruby_project.h"
 #include <algorithm>
 #include <QDebug>
 #if defined(Q_OS_ANDROID)
@@ -67,6 +68,15 @@ RubyFileModel::RubyFileModel(QObject* parent)
         reload();
         if (!summary.isEmpty()) emit statusMessage(summary);
         emit operationFinished(kind, ok, cancelled, summary);
+    });
+
+    // Auto-lock / navigate when active project changes
+    connect(&ruby::core::RubyProject::instance(), &ruby::core::RubyProject::activeProjectChanged,
+            this, [this]() {
+        if (ruby::core::RubyProject::instance().hasActiveProject()) {
+            QString projRoot = ruby::core::RubyProject::instance().projectRoot();
+            navigateTo(projRoot);
+        }
     });
 
     refreshStorageInfo();
@@ -171,6 +181,14 @@ QHash<int, QByteArray> RubyFileModel::roleNames() const {
 }
 
 void RubyFileModel::navigateTo(const QString& path) {
+    if (ruby::core::RubyProject::instance().hasActiveProject()) {
+        QString cleanTarget = QDir::cleanPath(path);
+        QString projRoot = QDir::cleanPath(ruby::core::RubyProject::instance().projectRoot());
+        // Disallow navigating outside the active project root
+        if (cleanTarget != projRoot && !cleanTarget.startsWith(projRoot + "/")) {
+            return;
+        }
+    }
     QDir dir(path);
     if (dir.exists()) {
         m_currentDir = dir;
@@ -187,6 +205,13 @@ void RubyFileModel::navigateTo(const QString& path) {
 }
 
 void RubyFileModel::navigateUp() {
+    if (ruby::core::RubyProject::instance().hasActiveProject()) {
+        QString current = QDir::cleanPath(m_currentDir.absolutePath());
+        QString projRoot = QDir::cleanPath(ruby::core::RubyProject::instance().projectRoot());
+        if (current == projRoot || !current.startsWith(projRoot)) {
+            return; // Locked inside project root! Cannot go above project root
+        }
+    }
     if (m_currentDir.cdUp()) {
         m_filter.clear();
         m_allItems.clear();
@@ -874,12 +899,17 @@ void RubyFileModel::launchGame() {
     }
 
 #if defined(Q_OS_ANDROID)
+    QSettings settings;
+    const QString runtimePlugin = settings.value(QStringLiteral("ruby_mobile/runtime_plugin"), QStringLiteral("none")).toString();
     QJniObject jPath = QJniObject::fromString(resDir);
+    QJniObject jPlugin = QJniObject::fromString(runtimePlugin);
     QJniObject::callStaticMethod<void>(
         "in/aevora/ruby/RubyActivity",
         "launchGameActivity",
-        "(Ljava/lang/String;)V",
-        jPath.object<jstring>()
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+        jPath.object<jstring>(),
+        nullptr,
+        jPlugin.object<jstring>()
     );
 #else
     qDebug() << "[RubyFileModel] launchGame for" << resDir;
@@ -956,14 +986,18 @@ bool RubyFileModel::startSceneInGame(const QString& scenePath) {
     if (resDir.isEmpty()) resDir = fi.absolutePath();
 
 #if defined(Q_OS_ANDROID)
+    QSettings settings;
+    const QString runtimePlugin = settings.value(QStringLiteral("ruby_mobile/runtime_plugin"), QStringLiteral("none")).toString();
     QJniObject jRes = QJniObject::fromString(resDir);
     QJniObject jScene = QJniObject::fromString(sceneName);
+    QJniObject jPlugin = QJniObject::fromString(runtimePlugin);
     QJniObject::callStaticMethod<void>(
         "in/aevora/ruby/RubyActivity",
         "launchGameActivity",
-        "(Ljava/lang/String;Ljava/lang/String;)V",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
         jRes.object<jstring>(),
-        jScene.object<jstring>()
+        jScene.object<jstring>(),
+        jPlugin.object<jstring>()
     );
     emit statusMessage(QStringLiteral("Booting ") + sceneName + QStringLiteral(" from ") + resDir);
 #else
@@ -1735,8 +1769,16 @@ void RubyFileModel::searchRecursive(const QString& query) {
     QString rootPath = m_currentDir.absolutePath();
     bool showHidden = m_showHidden;
     QString cat = m_category;
+    // Snapshot the selection state on the GUI thread (same as reload()): the
+    // worker must never touch m_pinnedPaths/m_selectedPaths directly, since the
+    // GUI thread mutates those QSets concurrently and implicit sharing makes
+    // that a use-after-free waiting to happen mid-search.
+    QSet<QString> pinned = m_pinnedPaths;
+    QSet<QString> selected = m_selectedPaths;
 
-    QThreadPool::globalInstance()->start([self, gen, rootPath, q, showHidden, cat]() {
+    QThreadPool::globalInstance()->start([self, gen, rootPath, q, showHidden, cat,
+                                          pinned = std::move(pinned),
+                                          selected = std::move(selected)]() {
         if (!self || self->m_searchGeneration.load() != gen) return;
 
         QDir::Filters filters = QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot;
@@ -1780,8 +1822,8 @@ void RubyFileModel::searchRecursive(const QString& query) {
             item.filePath = fi.absoluteFilePath();
             item.isDir = fi.isDir();
             item.fileType = detectFileType(fi);
-            item.isPinned = self->m_pinnedPaths.contains(item.filePath);
-            item.isSelected = self->m_selectedPaths.contains(item.filePath);
+            item.isPinned = pinned.contains(item.filePath);
+            item.isSelected = selected.contains(item.filePath);
             item.bytes = fi.isDir() ? 0 : fi.size();
             item.modified = fi.lastModified();
             item.suffix = fi.suffix();

@@ -8,5 +8,6 @@
         <file>components_catalog.md</file>
         <file>enums_and_constants.md</file>
         <file>filerift_format_specification.md</file>
+        <file>RUBY_PROJECT_SPECIFICATION.md</file>
     </qresource>
 </RCC>

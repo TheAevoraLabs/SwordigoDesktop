@@ -88,10 +88,14 @@ Item {
                 rubyFileModel.navigateUp()
             }
             onStorageRootsClicked: {
-                placesDrawer.open()
+                if (typeof rubyProject === "undefined" || !rubyProject || !rubyProject.hasActiveProject) {
+                    placesDrawer.open()
+                }
             }
             onStoragePickerRequested: {
-                placesDrawer.open()
+                if (typeof rubyProject === "undefined" || !rubyProject || !rubyProject.hasActiveProject) {
+                    placesDrawer.open()
+                }
             }
             onSearchFilterChanged: (filterText) => {
                 rubyFileModel.setFilter(filterText)

@@ -53,6 +53,8 @@ public class GameActivity extends Activity {
     public static native void loadHooks();
     public static native void unloadHooks();
     public static native void setCrashLogPath(String path);
+    public static native boolean loadRuntimePlugin(String pluginPath);
+    public static native void unloadRuntimePlugin();
 
     /**
      * Arm a direct boot into a specific scene. Pass the scene BASENAME without the
@@ -122,6 +124,27 @@ public class GameActivity extends Activity {
         throw new java.io.FileNotFoundException("missing " + zipEntryPath + " in split APKs");
     }
 
+    @SuppressLint("SetWorldReadable")
+    private void extractAssetToFile(String assetPath, File destFile) throws IOException {
+        File parent = destFile.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs() && !parent.isDirectory()) {
+            Log.w(TAG, "Failed to create directory for " + destFile.getAbsolutePath());
+        }
+        if (destFile.exists() && destFile.length() > 0) {
+            destFile.setReadable(true, false);
+            destFile.setExecutable(true, false);
+            return;
+        }
+        try (InputStream in = getAssets().open(assetPath);
+             FileOutputStream out = new FileOutputStream(destFile)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+        }
+        destFile.setReadable(true, false);
+        destFile.setExecutable(true, false);
+    }
+
     @Override
     @SuppressLint("UnsafeDynamicallyLoadedCode")
     protected void onCreate(Bundle savedInstanceState) {
@@ -134,8 +157,14 @@ public class GameActivity extends Activity {
 
         String resourceDir = getIntent().getStringExtra("resource_dir");
         String bootScene = getIntent().getStringExtra("boot_scene");
+        String runtimePlugin = getIntent().getStringExtra("runtime_plugin");
+        if (runtimePlugin == null || runtimePlugin.isEmpty()) {
+            android.content.SharedPreferences prefs = getSharedPreferences("RubySettings", MODE_PRIVATE);
+            runtimePlugin = prefs.getString("ruby_mobile/runtime_plugin", "none");
+        }
         Log.i(TAG, "Starting GameActivity with resource_dir: " + resourceDir
-                + (bootScene != null ? (", boot_scene: " + bootScene) : ""));
+                + (bootScene != null ? (", boot_scene: " + bootScene) : "")
+                + (runtimePlugin != null ? (", runtime_plugin: " + runtimePlugin) : ""));
 
         currentActivity = this;
 
@@ -171,6 +200,12 @@ public class GameActivity extends Activity {
             Log.i(TAG, "libswordigo.so loaded successfully");
             System.loadLibrary("ruby_runner");
             Log.i(TAG, "ruby_runner loaded successfully");
+            try {
+                System.loadLibrary("launcher");
+                Log.i(TAG, "liblauncher.so loaded successfully");
+            } catch (Throwable t) {
+                Log.w(TAG, "liblauncher.so optional load note: " + t.getMessage());
+            }
 
             File crashLogFile = new File(getFilesDir(), "crash.log");
             setCrashLogPath(crashLogFile.getAbsolutePath());
@@ -213,6 +248,34 @@ public class GameActivity extends Activity {
         glSurfaceView.setPreserveEGLContextOnPause(true);
         glSurfaceView.setRenderer(new GameRenderer());
         gameRoot.addView(glSurfaceView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        // Initialize runtime mod / plugin environment if selected
+        if (runtimePlugin != null && !"none".equalsIgnoreCase(runtimePlugin) && "arm64-v8a".equals(abi)) {
+            String soName = null;
+            if ("luajit".equalsIgnoreCase(runtimePlugin)) {
+                soName = "libluajitcli.so";
+            } else if ("swdbg".equalsIgnoreCase(runtimePlugin)) {
+                soName = "libswdbg.so";
+            }
+            if (soName != null) {
+                try {
+                    File pluginDir = new File(getCacheDir(), "plugins/" + abi);
+                    File pluginFile = new File(pluginDir, soName);
+                    extractAssetToFile("plugins/" + abi + "/" + soName, pluginFile);
+                    Log.i(TAG, "Extracted runtime plugin: " + pluginFile.getAbsolutePath() + " (" + pluginFile.length() + " bytes)");
+
+                    // Initialize Kiwi overlay host on gameRoot
+                    net.kiwi.overlay.Controller.init(this, gameRoot);
+                    net.kiwi.launcher.MainActivity.setCurrentMod(runtimePlugin);
+
+                    boolean ok = loadRuntimePlugin(pluginFile.getAbsolutePath());
+                    Log.i(TAG, "loadRuntimePlugin result: " + ok);
+                } catch (Throwable t) {
+                    Log.e(TAG, "Failed loading runtime plugin: " + runtimePlugin, t);
+                    Toast.makeText(this, "Runtime plugin failed: " + t.getMessage(), Toast.LENGTH_SHORT).show();
+                }
+            }
+        }
 
         // Floating top-center return overlay button
         addOverlayReturnButton(gameRoot);
@@ -409,6 +472,14 @@ public class GameActivity extends Activity {
             currentActivity = null;
         }
         if (hooksLoaded) {
+            try {
+                unloadRuntimePlugin();
+            } catch (Throwable t) {
+                Log.e(TAG, "unloadRuntimePlugin failed", t);
+            }
+            try {
+                net.kiwi.overlay.Controller.removeAll();
+            } catch (Throwable ignored) {}
             try {
                 unloadHooks();
             } catch (Throwable t) {

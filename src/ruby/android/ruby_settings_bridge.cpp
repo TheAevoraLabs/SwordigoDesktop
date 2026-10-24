@@ -139,6 +139,27 @@ void RubySettingsBridge::setGroundGenerator(const QString& id) {
     if (changed) emit groundGeneratorChanged(resolved);
 }
 
+QString RubySettingsBridge::runtimePlugin() const {
+    QSettings s;
+    QString id = s.value(QStringLiteral("ruby_mobile/runtime_plugin"), QStringLiteral("none")).toString().trimmed().toLower();
+    if (id != QLatin1String("none") && id != QLatin1String("luajit") && id != QLatin1String("swdbg")) {
+        return QStringLiteral("none");
+    }
+    return id;
+}
+
+void RubySettingsBridge::setRuntimePlugin(const QString& id) {
+    QString norm = id.trimmed().toLower();
+    if (norm != QLatin1String("none") && norm != QLatin1String("luajit") && norm != QLatin1String("swdbg")) {
+        norm = QStringLiteral("none");
+    }
+    QSettings s;
+    if (runtimePlugin() != norm) {
+        s.setValue(QStringLiteral("ruby_mobile/runtime_plugin"), norm);
+        emit runtimePluginChanged(norm);
+    }
+}
+
 QString RubySettingsBridge::themeId() const {
     QSettings s;
     QString id = s.value(QStringLiteral("ruby_mobile/theme_id"), QStringLiteral("oled")).toString().trimmed().toLower();
@@ -418,6 +439,7 @@ void RubySettingsBridge::resetToDefaults() {
     setEditorFontSize(13);
     setHapticsEnabled(true);
     setGroundGenerator(QStringLiteral("zypher"));
+    setRuntimePlugin(QStringLiteral("none"));
     setThemeId(QStringLiteral("oled"));
     setUserTitle(QStringLiteral("Swordigo Modder"));
     setAvatarImage(QStringLiteral("qrc:/svg/avatar_ruby_gem.svg"));

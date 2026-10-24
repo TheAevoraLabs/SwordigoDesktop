@@ -58,6 +58,13 @@ set(RUBY_MOBILE_SOURCES
     ${SRC_DIR}/ruby/viewport/ruby_picking.cpp
     ${SRC_DIR}/ruby/viewport/camera_bounds_gizmo.cpp
     ${SRC_DIR}/ruby/core/project_context.cpp
+    ${SRC_DIR}/ruby/core/project/ruby_project.cpp
+    ${SRC_DIR}/ruby/core/project/rbp_format.cpp
+    ${SRC_DIR}/ruby/core/project/toml_sync.cpp
+    ${SRC_DIR}/ruby/core/diff/diff_hash.cpp
+    ${SRC_DIR}/ruby/core/diff/vanilla_manifest.cpp
+    ${SRC_DIR}/ruby/core/diff/diff_cache.cpp
+    ${SRC_DIR}/ruby/core/diff/diff_scanner_worker.cpp
 
     # Headless Swordigo backends (no ImGui / no desktop dock dependencies)
     ${SRC_DIR}/tools/pod_loader.cpp
@@ -207,6 +214,7 @@ if (ANDROID)
         ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_scene.c
         ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_music.c
         ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_crasher.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_plugins.c
         ${CMAKE_CURRENT_SOURCE_DIR}/runner/runner_jni.c
         ${CMAKE_CURRENT_SOURCE_DIR}/runner/stdstring.c
         ${CMAKE_CURRENT_SOURCE_DIR}/runner/gloss_foss_stub.c
@@ -215,8 +223,17 @@ if (ANDROID)
     target_include_directories(ruby_runner PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/runner
     )
+
+    # Launcher mod compatibility target: exports java_get_env, java_release_env,
+    # java_get_vm, g_btn_cls for mods that dlopen("liblauncher.so").
+    add_library(launcher SHARED ${RUBY_RUNNER_SOURCES})
+    target_include_directories(launcher PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/runner
+    )
+
     if (RUBY_FOSS_COMPLIANT)
         target_compile_definitions(ruby_runner PRIVATE RUBY_FOSS_COMPLIANT)
+        target_compile_definitions(launcher PRIVATE RUBY_FOSS_COMPLIANT)
         target_compile_definitions(ruby PRIVATE RUBY_FOSS_COMPLIANT)
         target_link_libraries(ruby_runner PRIVATE
             ZLIB::ZLIB
@@ -224,8 +241,21 @@ if (ANDROID)
             log
             dl
         )
+        target_link_libraries(launcher PRIVATE
+            ZLIB::ZLIB
+            android
+            log
+            dl
+        )
     else()
         target_link_libraries(ruby_runner PRIVATE
+            GlossHook
+            ZLIB::ZLIB
+            android
+            log
+            dl
+        )
+        target_link_libraries(launcher PRIVATE
             GlossHook
             ZLIB::ZLIB
             android

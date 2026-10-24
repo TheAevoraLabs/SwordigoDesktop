@@ -16,8 +16,14 @@ Rectangle {
 
     signal tabSelected(int index)
 
+    readonly property bool inProject: (typeof rubyProject !== "undefined" && rubyProject && rubyProject.hasActiveProject)
+
+    // Tab 0 hosts the workcenter once a project is open (HomeView swaps its
+    // content for ProjectWorkcenter), so its label follows that state. Files
+    // is always Files; the old mapping labelled the file browser "Project"
+    // while the actual project surface was still called "Home".
     readonly property var tabs: [
-        { name: qsTr("Home"),     icon: "home"   },
+        { name: inProject ? qsTr("Project") : qsTr("Home"), icon: inProject ? "cube" : "home" },
         { name: qsTr("Files"),    icon: "folder" },
         { name: qsTr("Tools"),    icon: "tune"   },
         { name: qsTr("Settings"), icon: "gear"   }
